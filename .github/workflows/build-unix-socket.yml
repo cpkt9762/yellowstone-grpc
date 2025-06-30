@@ -1,0 +1,104 @@
+name: Build Unix Socket Edition
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - 'yellowstone-grpc-geyser/**'
+      - '.github/workflows/build-unix-socket.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build and Test Unix Socket Features
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-gnu
+        
+    - name: Install cargo-zigbuild
+      run: cargo install cargo-zigbuild
+      
+    - name: Install zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.11.0
+        
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: build-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          build-${{ runner.os }}-cargo-
+          
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libsasl2-dev protobuf-compiler
+          
+    - name: Check code formatting
+      run: |
+        cd yellowstone-grpc-geyser
+        cargo fmt --check
+        
+    - name: Run clippy
+      run: |
+        cd yellowstone-grpc-geyser
+        cargo clippy --target x86_64-unknown-linux-gnu -- -D warnings
+        
+    - name: Build geyser plugin
+      run: |
+        cd yellowstone-grpc-geyser
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release
+        
+    - name: Build examples
+      run: |
+        cd yellowstone-grpc-geyser
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release --example unix_socket_test_client
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release --example unix_socket_server_test
+        
+    - name: Run tests
+      run: |
+        cd yellowstone-grpc-geyser
+        cargo test --target x86_64-unknown-linux-gnu
+        
+    - name: Verify binary files
+      run: |
+        file target/x86_64-unknown-linux-gnu/release/libyellowstone_grpc_geyser.so
+        file target/x86_64-unknown-linux-gnu/release/examples/unix_socket_test_client
+        file target/x86_64-unknown-linux-gnu/release/examples/unix_socket_server_test
+        
+    - name: Test configuration validation
+      run: |
+        cd yellowstone-grpc-geyser
+        # Test TCP config
+        cargo run --target x86_64-unknown-linux-gnu --bin config-check -- deploy/geyser-config-tcp.json
+        # Test Unix config  
+        cargo run --target x86_64-unknown-linux-gnu --bin config-check -- deploy/geyser-config-unix.json
+        # Test dual config
+        cargo run --target x86_64-unknown-linux-gnu --bin config-check -- deploy/geyser-config-dual.json
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: unix-socket-build-${{ github.sha }}
+        path: |
+          target/x86_64-unknown-linux-gnu/release/libyellowstone_grpc_geyser.so
+          target/x86_64-unknown-linux-gnu/release/examples/unix_socket_test_client
+          target/x86_64-unknown-linux-gnu/release/examples/unix_socket_server_test
+          yellowstone-grpc-geyser/deploy/
+        retention-days: 7

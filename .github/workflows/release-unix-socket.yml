@@ -1,0 +1,265 @@
+name: Release Unix Socket Edition
+
+on:
+  push:
+    tags:
+      - 'unix-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., unix-v1.0.0)'
+        required: true
+        default: 'unix-v1.0.0'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux-unix:
+    name: Build Linux x86_64 with Unix Socket Support
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-gnu
+        
+    - name: Install cargo-zigbuild
+      run: cargo install cargo-zigbuild
+      
+    - name: Install zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.11.0
+        
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: unix-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          unix-${{ runner.os }}-cargo-
+          
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libsasl2-dev protobuf-compiler
+          
+    - name: Build geyser plugin with Unix socket support
+      run: |
+        cd yellowstone-grpc-geyser
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release
+        
+    - name: Build test clients
+      run: |
+        cd yellowstone-grpc-geyser
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release --example unix_socket_test_client
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release --example unix_socket_server_test
+        
+    - name: Build client and config-check
+      run: |
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release --bin client
+        cargo zigbuild --target x86_64-unknown-linux-gnu --release --bin config-check
+        
+    - name: Strip debug information
+      run: |
+        strip target/x86_64-unknown-linux-gnu/release/libyellowstone_grpc_geyser.so
+        strip target/x86_64-unknown-linux-gnu/release/examples/unix_socket_test_client
+        strip target/x86_64-unknown-linux-gnu/release/examples/unix_socket_server_test
+        strip target/x86_64-unknown-linux-gnu/release/client
+        strip target/x86_64-unknown-linux-gnu/release/config-check
+        
+    - name: Prepare release artifacts
+      run: |
+        mkdir -p release/linux-x86_64
+        mkdir -p release/configs
+        mkdir -p release/docs
+        
+        # Copy binaries
+        cp target/x86_64-unknown-linux-gnu/release/libyellowstone_grpc_geyser.so release/linux-x86_64/
+        cp target/x86_64-unknown-linux-gnu/release/examples/unix_socket_test_client release/linux-x86_64/
+        cp target/x86_64-unknown-linux-gnu/release/examples/unix_socket_server_test release/linux-x86_64/
+        cp target/x86_64-unknown-linux-gnu/release/client release/linux-x86_64/
+        cp target/x86_64-unknown-linux-gnu/release/config-check release/linux-x86_64/
+        
+        # Copy configuration files
+        cp yellowstone-grpc-geyser/deploy/geyser-config-*.json release/configs/
+        cp yellowstone-grpc-geyser/config-unix.json release/configs/
+        
+        # Copy documentation and scripts
+        cp yellowstone-grpc-geyser/deploy/README.md release/docs/
+        cp yellowstone-grpc-geyser/deploy/deploy.sh release/
+        
+        # Make scripts executable
+        chmod +x release/deploy.sh
+        chmod +x release/linux-x86_64/*
+        
+    - name: Create deployment package
+      run: |
+        cd release
+        tar -czf yellowstone-grpc-unix-socket-linux-x86_64.tar.gz linux-x86_64/ configs/ docs/ deploy.sh
+        
+    - name: Generate checksums
+      run: |
+        cd release
+        sha256sum yellowstone-grpc-unix-socket-linux-x86_64.tar.gz > checksums.txt
+        sha256sum linux-x86_64/* >> checksums.txt
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: unix-socket-linux-x86_64-release
+        path: |
+          release/yellowstone-grpc-unix-socket-linux-x86_64.tar.gz
+          release/checksums.txt
+          release/linux-x86_64/
+          release/configs/
+          release/docs/
+          release/deploy.sh
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-linux-unix
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/unix-v') || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: unix-socket-linux-x86_64-release
+        path: release/
+        
+    - name: Get tag name
+      id: tag
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+        else
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.tag.outputs.tag }}
+        name: Yellowstone gRPC Unix Socket Edition ${{ steps.tag.outputs.tag }}
+        body: |
+          ## 🚀 Yellowstone gRPC Geyser Plugin - Unix Socket Edition ${{ steps.tag.outputs.tag }}
+          
+          ### ✨ New Features
+          - **🔌 Unix Domain Socket Support**: High-performance local connections with lower latency
+          - **🌐 TCP Support**: Traditional network-based gRPC connections (unchanged)
+          - **⚡ Dual Mode**: Run both TCP and Unix socket servers simultaneously
+          - **🖥️ Cross-Platform**: Linux, macOS, Windows compatibility with conditional compilation
+          - **🎯 Smart Affinity**: CPU affinity optimization only on Linux platforms
+          
+          ### 📦 What's Included
+          
+          #### Main Plugin
+          - `libyellowstone_grpc_geyser.so` - Enhanced geyser plugin with Unix socket support
+          
+          #### Test Tools
+          - `unix_socket_test_client` - Universal test client (supports both TCP and Unix sockets)
+          - `unix_socket_server_test` - Standalone test server with fake data generation
+          
+          #### Utilities
+          - `client` - Standard yellowstone-grpc client
+          - `config-check` - Configuration validation tool
+          
+          #### Configuration Examples
+          - `geyser-config-tcp.json` - TCP-only configuration
+          - `geyser-config-unix.json` - Unix socket-only configuration
+          - `geyser-config-dual.json` - **NEW**: Both TCP and Unix socket simultaneously
+          - `config-unix.json` - Simple Unix socket example
+          
+          #### Documentation & Deployment
+          - `README.md` - Comprehensive deployment guide
+          - `deploy.sh` - Automated deployment script
+          - `checksums.txt` - SHA256 checksums for verification
+          
+          ### 🔧 Quick Start
+          
+          #### 1. Download and Extract
+          ```bash
+          wget https://github.com/cpkt9762/yellowstone-grpc/releases/download/${{ steps.tag.outputs.tag }}/yellowstone-grpc-unix-socket-linux-x86_64.tar.gz
+          tar -xzf yellowstone-grpc-unix-socket-linux-x86_64.tar.gz
+          ```
+          
+          #### 2. Deploy to Server
+          ```bash
+          ./deploy.sh user@your-server.com /opt/solana
+          ```
+          
+          #### 3. Configure Solana Validator
+          ```bash
+          # Dual mode (recommended)
+          solana-validator \
+            --geyser-plugin-config /opt/solana/config/geyser-config-dual.json \
+            [other options...]
+          
+          # Unix socket only (high performance)
+          solana-validator \
+            --geyser-plugin-config /opt/solana/config/geyser-config-unix.json \
+            [other options...]
+          ```
+          
+          #### 4. Test Connections
+          ```bash
+          # Test TCP connection
+          ./linux-x86_64/unix_socket_test_client tcp://127.0.0.1:10000
+          
+          # Test Unix socket connection
+          ./linux-x86_64/unix_socket_test_client /tmp/yellowstone-grpc.sock
+          ```
+          
+          ### 📊 Performance Benefits
+          
+          | Connection Type | Latency | Throughput | Use Case |
+          |----------------|---------|------------|----------|
+          | **Unix Socket** | **Lower** | **Higher** | Local applications |
+          | **TCP** | Higher | Good | Remote clients |
+          | **Dual Mode** | **Best of Both** | **Maximum** | Mixed environments |
+          
+          ### 🔗 Links
+          - **Repository**: https://github.com/cpkt9762/yellowstone-grpc
+          - **Original Project**: https://github.com/rpcpool/yellowstone-grpc
+          - **Issues**: https://github.com/cpkt9762/yellowstone-grpc/issues
+          
+          ### 🛡️ Verification
+          Verify download integrity:
+          ```bash
+          sha256sum -c checksums.txt
+          ```
+          
+        files: |
+          release/yellowstone-grpc-unix-socket-linux-x86_64.tar.gz
+          release/checksums.txt
+          release/linux-x86_64/libyellowstone_grpc_geyser.so
+          release/linux-x86_64/unix_socket_test_client
+          release/linux-x86_64/unix_socket_server_test
+          release/linux-x86_64/client
+          release/linux-x86_64/config-check
+          release/configs/geyser-config-tcp.json
+          release/configs/geyser-config-unix.json
+          release/configs/geyser-config-dual.json
+          release/configs/config-unix.json
+          release/docs/README.md
+          release/deploy.sh
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
