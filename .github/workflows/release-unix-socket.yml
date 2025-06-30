@@ -55,17 +55,25 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y libsasl2-dev protobuf-compiler
           
+    - name: Update Cargo.lock files
+      run: |
+        # Update all Cargo.lock files to ensure they're current
+        find . -name "Cargo.toml" -not -path "./target/*" -exec dirname {} \; | while read dir; do
+          echo "Updating $dir"
+          cd "$dir" && cargo update && cd - > /dev/null
+        done
+
     - name: Build geyser plugin with Unix socket support
       run: |
         cd yellowstone-grpc-geyser
         cargo zigbuild --target x86_64-unknown-linux-gnu --release
-        
+
     - name: Build test clients
       run: |
         cd yellowstone-grpc-geyser
         cargo zigbuild --target x86_64-unknown-linux-gnu --release --example unix_socket_test_client
         cargo zigbuild --target x86_64-unknown-linux-gnu --release --example unix_socket_server_test
-        
+
     - name: Build client and config-check
       run: |
         cargo zigbuild --target x86_64-unknown-linux-gnu --release --bin client
