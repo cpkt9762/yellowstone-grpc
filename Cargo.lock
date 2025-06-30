@@ -6163,6 +6163,7 @@ dependencies = [
  "cargo-lock",
  "clap",
  "crossbeam-channel",
+ "env_logger 0.9.3",
  "futures",
  "git-version",
  "hostname",
@@ -6187,7 +6188,9 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tonic-health",
+ "tower 0.5.2",
  "vergen",
+ "yellowstone-grpc-client",
  "yellowstone-grpc-proto",
 ]
 

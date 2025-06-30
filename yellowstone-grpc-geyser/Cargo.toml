@@ -16,8 +16,13 @@ crate-type = ["cdylib", "rlib"]
 [[bin]]
 name = "config-check"
 
+[[example]]
+name = "unix_socket_test_client"
+
+[[example]]
+name = "unix_socket_server_test"
+
 [dependencies]
-affinity = { workspace = true }
 agave-geyser-plugin-interface = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
@@ -48,7 +53,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["gzip", "zstd", "tls", "tls-roots"] }
 tonic-health = { workspace = true }
+tower = "0.5"
+env_logger = "0.9"
 yellowstone-grpc-proto = { workspace = true, features = ["convert", "plugin"] }
+yellowstone-grpc-client = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+affinity = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

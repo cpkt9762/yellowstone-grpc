@@ -4,7 +4,7 @@ use {
     },
     serde::{de, Deserialize, Deserializer},
     std::{
-        collections::HashSet, fmt, fs::read_to_string, net::SocketAddr, path::Path, str::FromStr,
+        collections::HashSet, fmt, fs::read_to_string, net::SocketAddr, path::{Path, PathBuf}, str::FromStr,
         time::Duration,
     },
     tokio::sync::Semaphore,
@@ -117,12 +117,17 @@ fn parse_taskset(taskset: &str) -> Result<Vec<usize>, String> {
     vec.sort();
 
     if let Some(set_max_index) = vec.last().copied() {
-        let max_index = affinity::get_thread_affinity()
-            .map_err(|_err| "failed to get affinity".to_owned())?
-            .into_iter()
-            .max()
-            .unwrap_or(0);
+        #[cfg(target_os = "linux")]
+        let max_index = {
+            affinity::get_thread_affinity()
+                .map_err(|_err| "failed to get affinity".to_owned())?
+                .into_iter()
+                .max()
+                .unwrap_or(0)
+        };
 
+        #[cfg(not(target_os = "linux"))]
+        let max_index = 128; // Reasonable upper limit for non-Linux platforms
         if set_max_index > max_index {
             return Err(format!("core index must be in the range [0, {max_index}]"));
         }
@@ -134,8 +139,10 @@ fn parse_taskset(taskset: &str) -> Result<Vec<usize>, String> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigGrpc {
-    /// Address of Grpc service.
-    pub address: SocketAddr,
+    /// Address of Grpc service (TCP).
+    pub address: Option<SocketAddr>,
+    /// Unix socket path for Grpc service.
+    pub unix_socket_path: Option<PathBuf>,
     /// TLS config
     pub tls_config: Option<ConfigGrpcServerTls>,
     /// Possible compression options
@@ -211,6 +218,16 @@ pub struct ConfigGrpc {
 }
 
 impl ConfigGrpc {
+    /// Validate that at least one of TCP address or Unix socket path is provided
+    pub fn validate(&self) -> PluginResult<()> {
+        match (&self.address, &self.unix_socket_path) {
+            (None, None) => Err(GeyserPluginError::ConfigFileReadError {
+                msg: "Must specify at least one of 'address' or 'unix_socket_path'.".to_string(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     const fn max_decoding_message_size_default() -> usize {
         4 * 1024 * 1024
     }

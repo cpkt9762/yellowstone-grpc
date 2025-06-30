@@ -19,6 +19,7 @@ use {
     },
     tokio::{
         fs,
+        net::UnixListener,
         runtime::Builder,
         sync::{broadcast, mpsc, oneshot, Mutex, Notify, RwLock, Semaphore},
         task::spawn_blocking,
@@ -57,6 +58,8 @@ use {
         },
     },
 };
+
+
 
 #[derive(Debug)]
 struct BlockhashStatus {
@@ -356,13 +359,10 @@ impl GrpcService {
         mpsc::UnboundedSender<Message>,
         Arc<Notify>,
     )> {
-        // Bind service address
-        let incoming = TcpIncoming::new(
-            config.address,
-            true,                          // tcp_nodelay
-            Some(Duration::from_secs(20)), // tcp_keepalive
-        )
-        .map_err(|error| anyhow::anyhow!(error))?;
+        // Validate configuration
+        if config.address.is_none() && config.unix_socket_path.is_none() {
+            return Err(anyhow::anyhow!("Must specify at least one of 'address' or 'unix_socket_path'"));
+        }
 
         // Snapshot channel
         let (snapshot_tx, snapshot_rx) = match config.snapshot_plugin_channel_capacity {
@@ -393,34 +393,36 @@ impl GrpcService {
                 (Some(Arc::new(AtomicU64::new(u64::MAX))), Some(tx), Some(rx))
             };
 
-        // gRPC server builder with optional TLS
-        let mut server_builder = Server::builder();
-        if let Some(tls_config) = &config.tls_config {
-            let (cert, key) = tokio::try_join!(
-                fs::read(&tls_config.cert_path),
-                fs::read(&tls_config.key_path)
-            )
-            .context("failed to load tls_config files")?;
-            server_builder = server_builder
-                .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
-                .context("failed to apply tls_config")?;
-        }
-        if let Some(enabled) = config.server_http2_adaptive_window {
-            server_builder = server_builder.http2_adaptive_window(Some(enabled));
-        }
-        if let Some(http2_keepalive_interval) = config.server_http2_keepalive_interval {
-            server_builder =
-                server_builder.http2_keepalive_interval(Some(http2_keepalive_interval));
-        }
-        if let Some(http2_keepalive_timeout) = config.server_http2_keepalive_timeout {
-            server_builder = server_builder.http2_keepalive_timeout(Some(http2_keepalive_timeout));
-        }
-        if let Some(sz) = config.server_initial_connection_window_size {
-            server_builder = server_builder.initial_connection_window_size(sz);
-        }
-        if let Some(sz) = config.server_initial_stream_window_size {
-            server_builder = server_builder.initial_stream_window_size(sz);
-        }
+        // Helper function to create a configured server builder
+        let create_server_builder = || -> anyhow::Result<Server> {
+            let mut server_builder = Server::builder();
+            if let Some(tls_config) = &config.tls_config {
+                let cert = std::fs::read(&tls_config.cert_path)
+                    .context("failed to load cert file")?;
+                let key = std::fs::read(&tls_config.key_path)
+                    .context("failed to load key file")?;
+                server_builder = server_builder
+                    .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
+                    .context("failed to apply tls_config")?;
+            }
+            if let Some(enabled) = config.server_http2_adaptive_window {
+                server_builder = server_builder.http2_adaptive_window(Some(enabled));
+            }
+            if let Some(http2_keepalive_interval) = config.server_http2_keepalive_interval {
+                server_builder =
+                    server_builder.http2_keepalive_interval(Some(http2_keepalive_interval));
+            }
+            if let Some(http2_keepalive_timeout) = config.server_http2_keepalive_timeout {
+                server_builder = server_builder.http2_keepalive_timeout(Some(http2_keepalive_timeout));
+            }
+            if let Some(sz) = config.server_initial_connection_window_size {
+                server_builder = server_builder.initial_connection_window_size(sz);
+            }
+            if let Some(sz) = config.server_initial_stream_window_size {
+                server_builder = server_builder.initial_stream_window_size(sz);
+            }
+            Ok(server_builder)
+        };
 
         let filter_names = Arc::new(Mutex::new(FilterNames::new(
             config.filter_name_size_limit,
@@ -458,10 +460,15 @@ impl GrpcService {
             if let Some(worker_threads) = config_tokio.worker_threads {
                 builder.worker_threads(worker_threads);
             }
+            #[cfg(target_os = "linux")]
             if let Some(tokio_cpus) = config_tokio.affinity.clone() {
                 builder.on_thread_start(move || {
                     affinity::set_thread_affinity(&tokio_cpus).expect("failed to set affinity")
                 });
+            }
+            #[cfg(not(target_os = "linux"))]
+            if let Some(_tokio_cpus) = config_tokio.affinity.clone() {
+                log::warn!("CPU affinity setting is only supported on Linux. Ignoring affinity configuration on this platform.");
             }
             builder
                 .thread_name_fn(crate::get_thread_name)
@@ -478,17 +485,93 @@ impl GrpcService {
                 ));
         });
 
-        // Run Server
         let shutdown = Arc::new(Notify::new());
-        let shutdown_grpc = Arc::clone(&shutdown);
+
+        // Start servers based on configuration - can start both TCP and Unix simultaneously
+        let mut server_tasks = Vec::new();
+
+        // Start TCP server if configured
+        if let Some(address) = config.address {
+            let incoming = TcpIncoming::new(
+                address,
+                true,                          // tcp_nodelay
+                Some(Duration::from_secs(20)), // tcp_keepalive
+            )
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+            info!("gRPC server listening on TCP address: {}", address);
+
+            // Clone service for TCP server
+            let tcp_service = service.clone();
+            let tcp_shutdown = Arc::clone(&shutdown);
+            let tcp_x_token = config.x_token.clone();
+            let tcp_server_builder = create_server_builder()?;
+
+            server_tasks.push(tokio::spawn(async move {
+                Self::start_tcp_server(
+                    tcp_server_builder,
+                    incoming,
+                    tcp_service,
+                    tcp_x_token,
+                    tcp_shutdown,
+                ).await;
+            }));
+        }
+
+        // Start Unix server if configured
+        if let Some(unix_path) = &config.unix_socket_path {
+            // Remove existing socket file if it exists
+            if unix_path.exists() {
+                fs::remove_file(unix_path).await
+                    .with_context(|| format!("Failed to remove existing Unix socket: {:?}", unix_path))?;
+            }
+
+            let unix_listener = UnixListener::bind(unix_path)
+                .with_context(|| format!("Failed to bind Unix socket: {:?}", unix_path))?;
+
+            info!("gRPC server listening on Unix socket: {:?}", unix_path);
+
+            // Clone service for Unix server
+            let unix_service = service.clone();
+            let unix_shutdown = Arc::clone(&shutdown);
+            let unix_x_token = config.x_token.clone();
+            let unix_server_builder = create_server_builder()?;
+
+            server_tasks.push(tokio::spawn(async move {
+                Self::start_unix_server(
+                    unix_server_builder,
+                    unix_listener,
+                    unix_service,
+                    unix_x_token,
+                    unix_shutdown,
+                ).await;
+            }));
+        }
+
+        // Wait for all servers to complete (they run indefinitely until shutdown)
+        if !server_tasks.is_empty() {
+            tokio::spawn(async move {
+                futures::future::join_all(server_tasks).await;
+            });
+        }
+
+        Ok((snapshot_tx, messages_tx, shutdown))
+    }
+
+    async fn start_tcp_server(
+        server_builder: Server,
+        incoming: TcpIncoming,
+        service: GeyserServer<Self>,
+        x_token: Option<String>,
+        shutdown: Arc<Notify>,
+    ) {
         tokio::spawn(async move {
-            // gRPC Health check service
             let (mut health_reporter, health_service) = health_reporter();
             health_reporter.set_serving::<GeyserServer<Self>>().await;
 
-            server_builder
+            let result = server_builder
                 .layer(interceptor(move |request: Request<()>| {
-                    if let Some(x_token) = &config.x_token {
+                    if let Some(x_token) = &x_token {
                         match request.metadata().get("x-token") {
                             Some(token) if x_token == token => Ok(request),
                             _ => Err(Status::unauthenticated("No valid auth token")),
@@ -499,11 +582,50 @@ impl GrpcService {
                 }))
                 .add_service(health_service)
                 .add_service(service)
-                .serve_with_incoming_shutdown(incoming, shutdown_grpc.notified())
-                .await
-        });
+                .serve_with_incoming_shutdown(incoming, shutdown.notified())
+                .await;
 
-        Ok((snapshot_tx, messages_tx, shutdown))
+            if let Err(e) = result {
+                error!("gRPC TCP server error: {}", e);
+            }
+        });
+    }
+
+    async fn start_unix_server(
+        server_builder: Server,
+        unix_listener: UnixListener,
+        service: GeyserServer<Self>,
+        x_token: Option<String>,
+        shutdown: Arc<Notify>,
+    ) {
+        use tokio_stream::wrappers::UnixListenerStream;
+
+        tokio::spawn(async move {
+            let (mut health_reporter, health_service) = health_reporter();
+            health_reporter.set_serving::<GeyserServer<Self>>().await;
+
+            let incoming = UnixListenerStream::new(unix_listener);
+
+            let result = server_builder
+                .layer(interceptor(move |request: Request<()>| {
+                    if let Some(x_token) = &x_token {
+                        match request.metadata().get("x-token") {
+                            Some(token) if x_token == token => Ok(request),
+                            _ => Err(Status::unauthenticated("No valid auth token")),
+                        }
+                    } else {
+                        Ok(request)
+                    }
+                }))
+                .add_service(health_service)
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, shutdown.notified())
+                .await;
+
+            if let Err(e) = result {
+                error!("gRPC Unix server error: {}", e);
+            }
+        });
     }
 
     async fn geyser_loop(

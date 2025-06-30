@@ -67,6 +67,9 @@ impl GeyserPlugin for Plugin {
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
 
+        // Validate gRPC configuration
+        config.grpc.validate()?;
+
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
 
@@ -75,10 +78,15 @@ impl GeyserPlugin for Plugin {
         if let Some(worker_threads) = config.tokio.worker_threads {
             builder.worker_threads(worker_threads);
         }
+        #[cfg(target_os = "linux")]
         if let Some(tokio_cpus) = config.tokio.affinity.clone() {
             builder.on_thread_start(move || {
                 affinity::set_thread_affinity(&tokio_cpus).expect("failed to set affinity")
             });
+        }
+        #[cfg(not(target_os = "linux"))]
+        if let Some(_tokio_cpus) = config.tokio.affinity.clone() {
+            log::warn!("CPU affinity setting is only supported on Linux. Ignoring affinity configuration on this platform.");
         }
         let runtime = builder
             .thread_name_fn(crate::get_thread_name)
