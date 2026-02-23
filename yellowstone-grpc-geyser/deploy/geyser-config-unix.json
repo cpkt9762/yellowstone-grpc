@@ -1,0 +1,18 @@
+{
+  "libpath": "/path/to/libyellowstone_grpc_geyser.so",
+  "grpc": {
+    "unix_socket_path": "/tmp/yellowstone-grpc.sock",
+    "compression": {
+      "accept": ["gzip", "zstd"],
+      "send": ["gzip", "zstd"]
+    },
+    "max_decoding_message_size": 4194304,
+    "channel_capacity": 100000,
+    "unary_concurrency_limit": 100,
+    "unary_disabled": false,
+    "filter_name_size_limit": 128,
+    "filter_names_size_limit": 4096,
+    "filter_names_cleanup_interval": 1000,
+    "replay_stored_slots": 0
+  }
+}

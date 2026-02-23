@@ -17,7 +17,7 @@ crate-type = ["cdylib", "rlib"]
 name = "config-check"
 
 [dependencies]
-affinity = { workspace = true }
+
 anyhow = { workspace = true }
 base64 = { workspace = true }
 bincode = { workspace = true }
@@ -42,9 +42,9 @@ prost-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "net"] }
 tokio-util = { workspace = true, features = ["rt"]}
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 tower-layer = { workspace = true }
 tonic = { workspace = true, features = ["gzip", "zstd", "tls-native-roots"] }
 tonic-health = { workspace = true }
@@ -107,3 +107,7 @@ solana-transaction = { workspace = true, features = ["bincode", "blake3"] }
 
 [lints]
 workspace = true
+
+# affinity is Linux-only (does not compile on macOS/Windows)
+[target.'cfg(target_os = "linux")'.dependencies]
+affinity = { workspace = true }

@@ -64,6 +64,9 @@ use {
     },
 };
 
+#[cfg(unix)]
+use tokio::net::UnixListener;
+
 #[derive(Debug)]
 struct BlockhashStatus {
     slot: u64,
@@ -499,17 +502,14 @@ impl GrpcService {
         Option<crossbeam_channel::Sender<Box<Message>>>,
         mpsc::UnboundedSender<Message>,
     )> {
-        // Bind service address
-        let incoming = TcpIncoming::bind(config.address)?
-            .with_nodelay(Some(true))
-            .with_keepalive(Some(Duration::from_secs(20)));
+        // Validate config: at least one of TCP or Unix socket must be set
+        config.validate()?;
 
         let spy_incoming_config = SpyIncomingConfig {
             traffic_reporting_threshold: config
                 .traffic_reporting_byte_threhsold
                 .unwrap_or_else(|| ByteSize::b(DEFAULT_TRAFFIC_REPORTING_THRESHOLD)),
         };
-        let spy_incoming = SpyIncoming::new(incoming, spy_incoming_config);
 
         // Snapshot channel
         let (snapshot_tx, snapshot_rx) = match config.snapshot_plugin_channel_capacity {
@@ -543,34 +543,54 @@ impl GrpcService {
                 (Some(Arc::new(AtomicU64::new(u64::MAX))), Some(tx), Some(rx))
             };
 
-        // gRPC server builder with optional TLS
-        let mut server_builder = Server::builder();
-        if let Some(tls_config) = &config.tls_config {
-            let (cert, key) = tokio::try_join!(
-                fs::read(&tls_config.cert_path),
-                fs::read(&tls_config.key_path)
-            )
-            .context("failed to load tls_config files")?;
-            server_builder = server_builder
-                .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
-                .context("failed to apply tls_config")?;
-        }
-        if let Some(enabled) = config.server_http2_adaptive_window {
-            server_builder = server_builder.http2_adaptive_window(Some(enabled));
-        }
-        if let Some(http2_keepalive_interval) = config.server_http2_keepalive_interval {
-            server_builder =
-                server_builder.http2_keepalive_interval(Some(http2_keepalive_interval));
-        }
-        if let Some(http2_keepalive_timeout) = config.server_http2_keepalive_timeout {
-            server_builder = server_builder.http2_keepalive_timeout(Some(http2_keepalive_timeout));
-        }
-        if let Some(sz) = config.server_initial_connection_window_size {
-            server_builder = server_builder.initial_connection_window_size(sz);
-        }
-        if let Some(sz) = config.server_initial_stream_window_size {
-            server_builder = server_builder.initial_stream_window_size(sz);
-        }
+        // Helper: build a server with TLS + HTTP/2 settings
+        let build_server = |config: &crate::config::ConfigGrpc| -> anyhow::Result<Server> {
+            let mut server_builder = Server::builder();
+            if let Some(tls_config) = &config.tls_config {
+                let cert =
+                    std::fs::read(&tls_config.cert_path).context("failed to load tls cert file")?;
+                let key =
+                    std::fs::read(&tls_config.key_path).context("failed to load tls key file")?;
+                server_builder = server_builder
+                    .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
+                    .context("failed to apply tls_config")?;
+            }
+            if let Some(enabled) = config.server_http2_adaptive_window {
+                server_builder = server_builder.http2_adaptive_window(Some(enabled));
+            }
+            if let Some(interval) = config.server_http2_keepalive_interval {
+                server_builder = server_builder.http2_keepalive_interval(Some(interval));
+            }
+            if let Some(timeout) = config.server_http2_keepalive_timeout {
+                server_builder = server_builder.http2_keepalive_timeout(Some(timeout));
+            }
+            if let Some(sz) = config.server_initial_connection_window_size {
+                server_builder = server_builder.initial_connection_window_size(sz);
+            }
+            if let Some(sz) = config.server_initial_stream_window_size {
+                server_builder = server_builder.initial_stream_window_size(sz);
+            }
+            Ok(server_builder)
+        };
+
+        // Pre-build server builders BEFORE config fields are moved into GeyserServer
+        let tcp_address = config.address;
+        let unix_socket_path = config.unix_socket_path.clone();
+        let x_token = config.x_token.clone();
+        let replay_stored_slots = config.replay_stored_slots;
+        let traffic_threshold = spy_incoming_config.traffic_reporting_threshold;
+
+        let tcp_server_builder = if tcp_address.is_some() {
+            Some(build_server(&config)?)
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        let unix_server_builder = if unix_socket_path.is_some() {
+            Some(build_server(&config)?)
+        } else {
+            None
+        };
 
         let filter_names = Arc::new(Mutex::new(FilterNames::new(
             config.filter_name_size_limit,
@@ -578,7 +598,7 @@ impl GrpcService {
             config.filter_names_cleanup_interval,
         )));
 
-        // Create Server
+        // Create gRPC service
         let max_decoding_message_size = config.max_decoding_message_size;
         let mut service = GeyserServer::new(Self {
             config_snapshot_client_channel_capacity: config.snapshot_client_channel_capacity,
@@ -602,6 +622,7 @@ impl GrpcService {
         for encoding in config.compression.send {
             service = service.send_compressed(encoding);
         }
+        let service = Arc::new(service);
 
         // Run geyser message loop
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
@@ -612,38 +633,81 @@ impl GrpcService {
                 broadcast_tx,
                 replay_stored_slots_rx,
                 replay_first_available_slot,
-                config.replay_stored_slots,
+                replay_stored_slots,
             )
             .await;
         });
 
-        // Run Server
-        let shutdown_grpc = service_cancellation_token.child_token();
-        task_tracker.spawn(async move {
-            // gRPC Health check service
-            let (health_reporter, health_service) = health_reporter();
-            health_reporter.set_serving::<GeyserServer<Self>>().await;
+        // Build x_token interceptor (shared, cloneable)
+        let interceptor_fn = move |request: Request<()>| {
+            if let Some(x_token) = &x_token {
+                match request.metadata().get("x-token") {
+                    Some(token) if x_token == token => Ok(request),
+                    _ => Err(Status::unauthenticated("No valid auth token")),
+                }
+            } else {
+                Ok(request)
+            }
+        };
 
-            let result = server_builder
-                .layer(MeteredLayer::new())
-                .layer(interceptor::InterceptorLayer::new(
-                    move |request: Request<()>| {
-                        if let Some(x_token) = &config.x_token {
-                            match request.metadata().get("x-token") {
-                                Some(token) if x_token == token => Ok(request),
-                                _ => Err(Status::unauthenticated("No valid auth token")),
-                            }
-                        } else {
-                            Ok(request)
-                        }
-                    },
-                ))
-                .add_service(health_service)
-                .add_service(service)
-                .serve_with_incoming_shutdown(spy_incoming, shutdown_grpc.cancelled())
-                .await;
-            info!("gRPC server shut down with result: {result:?}");
-        });
+        // --- TCP server (if address is configured) ---
+        if let (Some(address), Some(server_builder)) = (tcp_address, tcp_server_builder) {
+            let incoming = TcpIncoming::bind(address)?
+                .with_nodelay(Some(true))
+                .with_keepalive(Some(Duration::from_secs(20)));
+            let spy_incoming = SpyIncoming::new(
+                incoming,
+                SpyIncomingConfig {
+                    traffic_reporting_threshold: traffic_threshold,
+                },
+            );
+            let svc = Arc::clone(&service);
+            let interceptor_fn2 = interceptor_fn.clone();
+            let shutdown_tcp = service_cancellation_token.child_token();
+            info!("gRPC TCP server listening on {address}");
+            task_tracker.spawn(async move {
+                let (health_reporter, health_service) = health_reporter();
+                health_reporter.set_serving::<GeyserServer<Self>>().await;
+                let result = server_builder
+                    .layer(MeteredLayer::new())
+                    .layer(interceptor::InterceptorLayer::new(interceptor_fn2))
+                    .add_service(health_service)
+                    .add_service((*svc).clone())
+                    .serve_with_incoming_shutdown(spy_incoming, shutdown_tcp.cancelled())
+                    .await;
+                info!("gRPC TCP server shut down with result: {result:?}");
+            });
+        }
+
+        // --- Unix socket server (if unix_socket_path is configured, Unix platforms only) ---
+        #[cfg(unix)]
+        if let (Some(unix_path), Some(server_builder)) = (unix_socket_path, unix_server_builder) {
+            // Remove stale socket file
+            if unix_path.exists() {
+                fs::remove_file(unix_path.clone()).await.with_context(|| {
+                    format!("Failed to remove existing Unix socket: {unix_path:?}")
+                })?;
+            }
+            let unix_listener = UnixListener::bind(&unix_path)
+                .with_context(|| format!("Failed to bind Unix socket: {unix_path:?}"))?;
+            let unix_incoming = tokio_stream::wrappers::UnixListenerStream::new(unix_listener);
+            let svc = Arc::clone(&service);
+            let interceptor_fn3 = interceptor_fn.clone();
+            let shutdown_unix = service_cancellation_token.child_token();
+            info!("gRPC Unix socket server listening on {unix_path:?}");
+            task_tracker.spawn(async move {
+                let (health_reporter, health_service) = health_reporter();
+                health_reporter.set_serving::<GeyserServer<Self>>().await;
+                let result = server_builder
+                    .layer(MeteredLayer::new())
+                    .layer(interceptor::InterceptorLayer::new(interceptor_fn3))
+                    .add_service(health_service)
+                    .add_service((*svc).clone())
+                    .serve_with_incoming_shutdown(unix_incoming, shutdown_unix.cancelled())
+                    .await;
+                info!("gRPC Unix socket server shut down with result: {result:?}");
+            });
+        }
 
         Ok((snapshot_tx, messages_tx))
     }

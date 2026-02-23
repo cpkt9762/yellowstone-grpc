@@ -89,9 +89,15 @@ impl GeyserPlugin for Plugin {
             builder.worker_threads(worker_threads);
         }
         if let Some(tokio_cpus) = config.tokio.affinity.clone() {
+            #[cfg(target_os = "linux")]
             builder.on_thread_start(move || {
                 affinity::set_thread_affinity(&tokio_cpus).expect("failed to set affinity")
             });
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = tokio_cpus; // suppress unused warning
+                log::warn!("CPU affinity setting is only supported on Linux. Ignoring affinity configuration on this platform.");
+            }
         }
         let plugin_cancellation_token = CancellationToken::new();
         let plugin_task_tracker = TaskTracker::new();
