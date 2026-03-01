@@ -2,6 +2,7 @@ use {
     anyhow::{Context, Result},
     bs58,
     futures::stream::StreamExt,
+    hyper_util::rt::TokioIo,
     log::{error, info, warn},
     solana_pubkey::Pubkey,
     std::{collections::HashMap, env, str::FromStr, time::Duration},
@@ -12,13 +13,12 @@ use {
         Request,
     },
     tower::service_fn,
-    hyper_util::rt::TokioIo,
     yellowstone_grpc_proto::{
         convert_from,
         prelude::{
-            geyser_client::GeyserClient, PingRequest,
-            subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-            SubscribeRequestFilterTransactions, SubscribeUpdateTransactionInfo,
+            geyser_client::GeyserClient, subscribe_update::UpdateOneof, CommitmentLevel,
+            PingRequest, SubscribeRequest, SubscribeRequestFilterTransactions,
+            SubscribeUpdateTransactionInfo,
         },
     },
 };
@@ -45,8 +45,8 @@ async fn main() -> Result<()> {
     info!("🎯 Target account: {}", TARGET_ACCOUNT);
 
     // Validate the target account address
-    let target_pubkey = Pubkey::from_str(TARGET_ACCOUNT)
-        .context("Invalid target account address")?;
+    let target_pubkey =
+        Pubkey::from_str(TARGET_ACCOUNT).context("Invalid target account address")?;
     info!("✅ Target account validated: {}", target_pubkey);
 
     // Create gRPC channel over Unix socket
@@ -96,26 +96,33 @@ async fn test_ping(client: &mut GeyserClient<Channel>) -> Result<()> {
 }
 
 async fn subscribe_to_transactions(
-    client: &mut GeyserClient<Channel>, 
-    target_account: &Pubkey
+    client: &mut GeyserClient<Channel>,
+    target_account: &Pubkey,
 ) -> Result<()> {
     info!("🔧 Setting up transaction subscription filter...");
 
     // Create transaction filter for the specific account
     let mut transactions_filter = HashMap::new();
-    transactions_filter.insert("target_account_txs".to_string(), SubscribeRequestFilterTransactions {
-        vote: Some(false),                    // Exclude vote transactions
-        failed: Some(false),                  // Exclude failed transactions  
-        signature: None,                      // No specific signature filter
-        account_include: vec![target_account.to_string()], // Include our target account
-        account_exclude: vec![],              // No accounts to exclude
-        account_required: vec![target_account.to_string()], // Require our target account
-    });
+    transactions_filter.insert(
+        "target_account_txs".to_string(),
+        SubscribeRequestFilterTransactions {
+            vote: Some(false),                                  // Exclude vote transactions
+            failed: Some(false),                                // Exclude failed transactions
+            signature: None,                                    // No specific signature filter
+            account_include: vec![target_account.to_string()],  // Include our target account
+            account_exclude: vec![],                            // No accounts to exclude
+            account_required: vec![target_account.to_string()], // Require our target account
+            account_data_required: vec![],
+            max_messages: None,
+            account_data_source: None,
+            account_data_owner: None,
+        },
+    );
 
     let subscribe_request = SubscribeRequest {
         slots: HashMap::new(),
         accounts: HashMap::new(),
-        transactions: transactions_filter,    // Our transaction filter
+        transactions: transactions_filter, // Our transaction filter
         transactions_status: HashMap::new(),
         blocks: HashMap::new(),
         blocks_meta: HashMap::new(),
@@ -135,8 +142,11 @@ async fn subscribe_to_transactions(
     let mut stream = response.into_inner();
 
     info!("🎉 Subscription established! Waiting for transactions...");
-    info!("📋 Filter: account_include=[{}], vote=false, failed=false", target_account);
-    
+    info!(
+        "📋 Filter: account_include=[{}], vote=false, failed=false",
+        target_account
+    );
+
     let mut transaction_count = 0;
     let start_time = std::time::Instant::now();
 
@@ -148,17 +158,27 @@ async fn subscribe_to_transactions(
                         UpdateOneof::Transaction(transaction_update) => {
                             if let Some(transaction_info) = transaction_update.transaction {
                                 transaction_count += 1;
-                                handle_transaction_update(transaction_info, transaction_count, transaction_update.slot).await?;
+                                handle_transaction_update(
+                                    transaction_info,
+                                    transaction_count,
+                                    transaction_update.slot,
+                                )
+                                .await?;
                             }
                         }
                         UpdateOneof::Ping(_) => {
                             let elapsed = start_time.elapsed();
-                            info!("💓 Ping received (uptime: {:.1}s, txs: {})", 
-                                  elapsed.as_secs_f64(), transaction_count);
+                            info!(
+                                "💓 Ping received (uptime: {:.1}s, txs: {})",
+                                elapsed.as_secs_f64(),
+                                transaction_count
+                            );
                         }
                         other => {
-                            warn!("🤔 Received unexpected update type: {:?}", 
-                                  std::mem::discriminant(&other));
+                            warn!(
+                                "🤔 Received unexpected update type: {:?}",
+                                std::mem::discriminant(&other)
+                            );
                         }
                     }
                 }
@@ -170,14 +190,17 @@ async fn subscribe_to_transactions(
         }
     }
 
-    info!("📊 Subscription ended. Total transactions processed: {}", transaction_count);
+    info!(
+        "📊 Subscription ended. Total transactions processed: {}",
+        transaction_count
+    );
     Ok(())
 }
 
 async fn handle_transaction_update(
     transaction_info: SubscribeUpdateTransactionInfo,
     count: u64,
-    slot: u64
+    slot: u64,
 ) -> Result<()> {
     // Extract basic transaction information
     let signature_bytes = &transaction_info.signature;

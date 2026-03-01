@@ -13,8 +13,8 @@ use {
             name::{FilterName, FilterNameError, FilterNames},
         },
         message::{
-            CommitmentLevel, Message, MessageAccount, MessageBlock, MessageBlockMeta, MessageEntry,
-            MessageSlot, MessageTransaction, SlotStatus,
+            CommitmentLevel, Message, MessageAccount, MessageAccountInfo, MessageBlock,
+            MessageBlockMeta, MessageEntry, MessageSlot, MessageTransaction, SlotStatus,
         },
     },
     base64::{engine::general_purpose::STANDARD as base64_engine, Engine},
@@ -29,7 +29,10 @@ use {
         collections::{HashMap, HashSet},
         ops::Range,
         str::FromStr,
-        sync::Arc,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
     },
     yellowstone_grpc_proto::geyser::{
         subscribe_request_filter_accounts_filter::Filter as AccountsFilterDataOneof,
@@ -241,8 +244,14 @@ impl Filter {
                 .get_updates(message, &self.accounts_data_slice),
             Message::Slot(message) => self.slots.get_updates(message, commitment),
             Message::Transaction(message) => {
-                let mut updates = self.transactions.get_updates(message);
-                updates.append(&mut self.transactions_status.get_updates(message));
+                let mut updates = self
+                    .transactions
+                    .get_updates(message, &self.accounts_data_slice);
+                updates.append(
+                    &mut self
+                        .transactions_status
+                        .get_updates(message, &self.accounts_data_slice),
+                );
                 updates
             }
             Message::Entry(message) => self.entries.get_updates(message),
@@ -673,6 +682,11 @@ struct FilterTransactionsInner {
     account_include: HashSet<Pubkey>,
     account_exclude: HashSet<Pubkey>,
     account_required: HashSet<Pubkey>,
+    account_data_required: HashSet<Pubkey>,
+    max_messages: u64,
+    sent_count: Arc<AtomicU64>,
+    account_data_source: String,
+    account_data_owner: Option<Pubkey>,
 }
 
 #[derive(Debug, Clone)]
@@ -737,6 +751,21 @@ impl FilterTransactions {
                         &filter.account_required,
                         &HashSet::new(),
                     )?,
+                    account_data_required: Filter::decode_pubkeys_into_set(
+                        &filter.account_data_required,
+                        &HashSet::new(),
+                    )?,
+                    max_messages: filter.max_messages.unwrap_or(0),
+                    sent_count: Arc::new(AtomicU64::new(0)),
+                    account_data_source: filter
+                        .account_data_source
+                        .clone()
+                        .unwrap_or_else(|| "processed".to_string()),
+                    account_data_owner: filter
+                        .account_data_owner
+                        .as_ref()
+                        .map(|s| s.parse().map_err(FilterError::InvalidPubkey))
+                        .transpose()?,
                 },
             );
         }
@@ -746,11 +775,27 @@ impl FilterTransactions {
         })
     }
 
-    pub fn get_updates(&self, message: &MessageTransaction) -> FilteredUpdates {
+    pub fn get_updates(
+        &self,
+        message: &MessageTransaction,
+        accounts_data_slice: &FilterAccountsDataSlice,
+    ) -> FilteredUpdates {
+        let mut any_data_required = false;
+        let mut any_previous_required = false;
+        let mut combined_data_required: HashSet<Pubkey> = HashSet::new();
+        let mut combined_data_owners: HashSet<Pubkey> = HashSet::new();
+
         let filters = self
             .filters
             .iter()
             .filter_map(|(name, inner)| {
+                // Early stop: max_messages reached
+                if inner.max_messages > 0
+                    && inner.sent_count.load(Ordering::Relaxed) >= inner.max_messages
+                {
+                    return None;
+                }
+
                 if let Some(is_vote) = inner.vote {
                     if is_vote != message.transaction.is_vote {
                         return None;
@@ -798,6 +843,23 @@ impl FilterTransactions {
                     return None;
                 }
 
+                // Increment sent count for max_messages tracking
+                if inner.max_messages > 0 {
+                    inner.sent_count.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // Collect account_data_required from all matching filters
+                if !inner.account_data_required.is_empty() || inner.account_data_owner.is_some() {
+                    any_data_required = true;
+                    combined_data_required.extend(&inner.account_data_required);
+                    if inner.account_data_source == "previous" {
+                        any_previous_required = true;
+                    }
+                    if let Some(owner) = inner.account_data_owner {
+                        combined_data_owners.insert(owner);
+                    }
+                }
+
                 Some(name.clone())
             })
             .collect::<FilteredUpdateFilters>();
@@ -805,7 +867,30 @@ impl FilterTransactions {
         filtered_updates_once_owned!(
             filters,
             match self.filter_type {
-                FilterTransactionsType::Transaction => FilteredUpdateOneof::transaction(message),
+                FilterTransactionsType::Transaction => {
+                    if any_data_required {
+                        let source = if any_previous_required {
+                            &message.previous_accounts
+                        } else {
+                            &message.accounts
+                        };
+                        let filtered_accounts: Vec<Arc<MessageAccountInfo>> = source
+                            .iter()
+                            .filter(|a| {
+                                combined_data_required.contains(&a.pubkey)
+                                    || combined_data_owners.contains(&a.owner)
+                            })
+                            .cloned()
+                            .collect();
+                        FilteredUpdateOneof::transaction_with_accounts(
+                            message,
+                            filtered_accounts,
+                            accounts_data_slice.clone(),
+                        )
+                    } else {
+                        FilteredUpdateOneof::transaction(message)
+                    }
+                }
                 FilterTransactionsType::TransactionStatus => {
                     FilteredUpdateOneof::transaction_status(message)
                 }
@@ -1194,6 +1279,9 @@ mod tests {
             }),
             slot: 100,
             created_at: Timestamp::from(SystemTime::now()),
+            accounts: Vec::new(),
+            finalized_accounts: Vec::new(),
+            previous_accounts: Vec::new(),
         }
     }
 
@@ -1265,6 +1353,10 @@ mod tests {
                 account_include: vec![],
                 account_exclude: vec![],
                 account_required: vec![],
+                account_data_required: vec![],
+                max_messages: None,
+                account_data_source: None,
+                account_data_owner: None,
             },
         );
 
@@ -1300,6 +1392,10 @@ mod tests {
                 account_include: vec![],
                 account_exclude: vec![],
                 account_required: vec![],
+                account_data_required: vec![],
+                max_messages: None,
+                account_data_source: None,
+                account_data_owner: None,
             },
         );
 
@@ -1341,6 +1437,10 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required: vec![],
+                account_data_required: vec![],
+                max_messages: None,
+                account_data_source: None,
+                account_data_owner: None,
             },
         );
 
@@ -1406,6 +1506,10 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required: vec![],
+                account_data_required: vec![],
+                max_messages: None,
+                account_data_source: None,
+                account_data_owner: None,
             },
         );
 
@@ -1471,6 +1575,10 @@ mod tests {
                 account_include: vec![],
                 account_exclude,
                 account_required: vec![],
+                account_data_required: vec![],
+                max_messages: None,
+                account_data_source: None,
+                account_data_owner: None,
             },
         );
 
@@ -1522,6 +1630,10 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required,
+                account_data_required: vec![],
+                max_messages: None,
+                account_data_source: None,
+                account_data_owner: None,
             },
         );
 
@@ -1595,6 +1707,10 @@ mod tests {
                 account_include,
                 account_exclude: vec![],
                 account_required,
+                account_data_required: vec![],
+                max_messages: None,
+                account_data_source: None,
+                account_data_owner: None,
             },
         );
 

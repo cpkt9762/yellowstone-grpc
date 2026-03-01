@@ -190,6 +190,14 @@ impl FilteredUpdate {
                         msg.transaction.as_ref(),
                     )),
                     slot: msg.slot,
+                    accounts: msg
+                        .accounts
+                        .iter()
+                        .map(|a| {
+                            Self::as_subscribe_update_account(a.as_ref(), &msg.accounts_data_slice)
+                        })
+                        .collect(),
+                    finalized_accounts: vec![],
                 })
             }
             FilteredUpdateOneof::TransactionStatus(msg) => {
@@ -271,6 +279,8 @@ impl FilteredUpdate {
                 FilteredUpdateOneof::Transaction(FilteredUpdateTransaction {
                     transaction: tx.transaction,
                     slot: tx.slot,
+                    accounts: vec![],
+                    accounts_data_slice: FilterAccountsDataSlice::default(),
                 })
             }
             UpdateOneof::TransactionStatus(msg) => {
@@ -354,6 +364,21 @@ impl FilteredUpdateOneof {
         Self::Transaction(FilteredUpdateTransaction {
             transaction: Arc::clone(&message.transaction),
             slot: message.slot,
+            accounts: vec![],
+            accounts_data_slice: FilterAccountsDataSlice::default(),
+        })
+    }
+
+    pub fn transaction_with_accounts(
+        message: &MessageTransaction,
+        accounts: Vec<Arc<MessageAccountInfo>>,
+        accounts_data_slice: FilterAccountsDataSlice,
+    ) -> Self {
+        Self::Transaction(FilteredUpdateTransaction {
+            transaction: Arc::clone(&message.transaction),
+            slot: message.slot,
+            accounts,
+            accounts_data_slice,
         })
     }
 
@@ -623,6 +648,8 @@ impl prost::Message for FilteredUpdateSlot {
 pub struct FilteredUpdateTransaction {
     pub transaction: Arc<MessageTransactionInfo>,
     pub slot: u64,
+    pub accounts: Vec<Arc<MessageAccountInfo>>,
+    pub accounts_data_slice: FilterAccountsDataSlice,
 }
 
 impl prost::Message for FilteredUpdateTransaction {
@@ -630,6 +657,15 @@ impl prost::Message for FilteredUpdateTransaction {
         Self::tx_encode_raw(1u32, &self.transaction, buf);
         if self.slot != 0u64 {
             ::prost::encoding::uint64::encode(2u32, &self.slot, buf);
+        }
+        // Encode accounts at tag=3 (repeated SubscribeUpdateAccountInfo)
+        for account in &self.accounts {
+            FilteredUpdateAccount::account_encode_raw(
+                3u32,
+                account,
+                &self.accounts_data_slice,
+                buf,
+            );
         }
     }
 
@@ -640,6 +676,19 @@ impl prost::Message for FilteredUpdateTransaction {
             } else {
                 0
             }
+            + self
+                .accounts
+                .iter()
+                .map(|account| {
+                    prost_field_encoded_len(
+                        3u32,
+                        FilteredUpdateAccount::account_encoded_len(
+                            account,
+                            &self.accounts_data_slice,
+                        ),
+                    )
+                })
+                .sum::<usize>()
     }
 
     fn merge_field(
@@ -1295,6 +1344,9 @@ pub mod tests {
                 transaction,
                 slot: 42,
                 created_at: Timestamp::from(SystemTime::now()),
+                accounts: Vec::new(),
+                finalized_accounts: Vec::new(),
+                previous_accounts: Vec::new(),
             };
             encode_decode_cmp(&["123"], FilteredUpdateOneof::transaction(&msg));
             encode_decode_cmp(&["123"], FilteredUpdateOneof::transaction_status(&msg));

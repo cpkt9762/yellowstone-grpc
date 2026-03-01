@@ -13,8 +13,8 @@ use {
                 Filter,
             },
             message::{
-                CommitmentLevel, Message, MessageBlock, MessageBlockMeta, MessageEntry,
-                MessageSlot, MessageTransactionInfo, SlotStatus,
+                CommitmentLevel, Message, MessageAccountInfo, MessageBlock, MessageBlockMeta,
+                MessageEntry, MessageSlot, MessageTransaction, MessageTransactionInfo, SlotStatus,
             },
             proto::geyser_server::{Geyser, GeyserServer},
         },
@@ -29,7 +29,7 @@ use {
     solana_clock::{Slot, MAX_RECENT_BLOCKHASHES},
     solana_pubkey::Pubkey,
     std::{
-        collections::{BTreeMap, HashMap},
+        collections::{BTreeMap, HashMap, HashSet},
         net::SocketAddr,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -376,6 +376,8 @@ struct ClientSession {
     cancellation_token: CancellationToken,
     disconnect_reason: &'static str,
     maybe_remote_peer_sk_addr: Option<SocketAddr>,
+    watched_pubkeys: Arc<StdMutex<HashMap<Pubkey, usize>>>,
+    session_pubkeys: HashSet<Pubkey>,
 }
 
 impl ClientSession {
@@ -386,6 +388,7 @@ impl ClientSession {
         maybe_remote_peer_sk_addr: Option<SocketAddr>,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
         cancellation_token: CancellationToken,
+        watched_pubkeys: Arc<StdMutex<HashMap<Pubkey, usize>>>,
     ) -> Self {
         let filter = Filter::default();
         let subscriber_id = subscriber_id.unwrap_or("UNKNOWN".to_owned());
@@ -418,6 +421,20 @@ impl ClientSession {
             cancellation_token,
             disconnect_reason: "unknown",
             maybe_remote_peer_sk_addr,
+            watched_pubkeys,
+            session_pubkeys: HashSet::new(),
+        }
+    }
+
+    fn register_pubkeys(&mut self, pubkeys: Vec<Pubkey>) {
+        let mut map = self
+            .watched_pubkeys
+            .lock()
+            .expect("watched_pubkeys mutex poisoned");
+        for pk in pubkeys {
+            if self.session_pubkeys.insert(pk) {
+                *map.entry(pk).or_insert(0) += 1;
+            }
         }
     }
 
@@ -469,6 +486,23 @@ impl Drop for ClientSession {
             "client #{} ({}): removed ({})",
             self.id, self.subscriber_id, self.disconnect_reason
         );
+        // Clean up watched_pubkeys reference counts
+        {
+            let mut map = self
+                .watched_pubkeys
+                .lock()
+                .expect("watched_pubkeys mutex poisoned");
+            for pk in &self.session_pubkeys {
+                if let Some(count) = map.get_mut(pk) {
+                    if *count > 1 {
+                        *count -= 1;
+                    } else {
+                        map.remove(pk);
+                        info!("client #{}: unwatching pubkey {pk}", self.id);
+                    }
+                }
+            }
+        }
         self.cancellation_token.cancel();
     }
 }
@@ -486,6 +520,7 @@ pub struct GrpcService {
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     debug_clients_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
     filter_names: Arc<Mutex<FilterNames>>,
+    watched_pubkeys: Arc<StdMutex<HashMap<Pubkey, usize>>>,
     cancellation_token: CancellationToken,
     task_tracker: TaskTracker,
 }
@@ -598,6 +633,10 @@ impl GrpcService {
             config.filter_names_cleanup_interval,
         )));
 
+        // Shared watched pubkeys for previous-state shadow cache
+        let watched_pubkeys: Arc<StdMutex<HashMap<Pubkey, usize>>> =
+            Arc::new(StdMutex::new(HashMap::new()));
+
         // Create gRPC service
         let max_decoding_message_size = config.max_decoding_message_size;
         let mut service = GeyserServer::new(Self {
@@ -612,6 +651,7 @@ impl GrpcService {
             replay_first_available_slot: replay_first_available_slot.clone(),
             debug_clients_tx,
             filter_names,
+            watched_pubkeys: watched_pubkeys.clone(),
             cancellation_token: service_cancellation_token.clone(),
             task_tracker: task_tracker.clone(),
         })
@@ -624,6 +664,8 @@ impl GrpcService {
         }
         let service = Arc::new(service);
 
+        let watched_pubkeys_loop = Arc::clone(&watched_pubkeys);
+
         // Run geyser message loop
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
         task_tracker.spawn(async move {
@@ -634,6 +676,7 @@ impl GrpcService {
                 replay_stored_slots_rx,
                 replay_first_available_slot,
                 replay_stored_slots,
+                watched_pubkeys_loop,
             )
             .await;
         });
@@ -719,11 +762,15 @@ impl GrpcService {
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
+        watched_pubkeys: Arc<StdMutex<HashMap<Pubkey, usize>>>,
     ) {
         const PROCESSED_MESSAGES_MAX: usize = 31;
         const PROCESSED_MESSAGES_SLEEP: Duration = Duration::from_millis(10);
         let mut msgid_gen = MessageId::default();
         let mut messages: BTreeMap<u64, SlotMessages> = Default::default();
+        // Shadow cache for previous-state tracking (per watched pubkey)
+        let mut shadow_current: HashMap<Pubkey, Arc<MessageAccountInfo>> = HashMap::new();
+        let mut shadow_previous: HashMap<Pubkey, Arc<MessageAccountInfo>> = HashMap::new();
         let mut processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
         let mut processed_first_slot = None;
         let processed_sleep = sleep(PROCESSED_MESSAGES_SLEEP);
@@ -805,6 +852,7 @@ impl GrpcService {
                                         stored.store(slot, Ordering::Relaxed);
                                     }
                                 }
+
                             }
                         }
                         _ => {}
@@ -826,6 +874,42 @@ impl GrpcService {
                             _ => {}
                         }
                     }
+                    // For Transaction messages, attach account data from accounts_dedup
+                    // before storing, so confirmed/finalized replays also include accounts.
+                    let message = if let Message::Transaction(msg) = &message {
+                        let accounts: Vec<Arc<MessageAccountInfo>> = msg.transaction.account_keys.iter()
+                            .filter_map(|pubkey| {
+                                let (_, msg_idx) = slot_messages.accounts_dedup.get(pubkey)?;
+                                let (_, stored_msg) = slot_messages.messages[*msg_idx].as_ref()?;
+                                if let Message::Account(a) = stored_msg {
+                                    Some(Arc::clone(&a.account))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        // Attach previous-state account data from shadow cache
+                        let previous_accts: Vec<Arc<MessageAccountInfo>> = msg.transaction.account_keys.iter()
+                            .filter_map(|pubkey| shadow_previous.get(pubkey).cloned())
+                            .collect();
+
+                        if accounts.is_empty() && previous_accts.is_empty() {
+                            message
+                        } else {
+                            Message::Transaction(MessageTransaction {
+                                transaction: Arc::clone(&msg.transaction),
+                                slot: msg.slot,
+                                created_at: msg.created_at,
+                                accounts,
+                                finalized_accounts: Vec::new(),
+                                previous_accounts: previous_accts,
+                            })
+                        }
+                    } else {
+                        message
+                    };
+
                     if matches!(&message, Message::Slot(_)) {
                         slot_messages.messages_slots.push((msgid, message.clone()));
                     } else {
@@ -862,6 +946,19 @@ impl GrpcService {
                             metrics::observe_geyser_account_update_received(msg.account.data.len());
                             let write_version = msg.account.write_version;
                             let msg_index = slot_messages.messages.len() - 1;
+
+                            // Shadow cache: track previous state for watched pubkeys
+                            {
+                                let pks = watched_pubkeys.lock()
+                                    .expect("watched_pubkeys mutex poisoned");
+                                if pks.contains_key(&msg.account.pubkey) {
+                                    if let Some(current) = shadow_current.get(&msg.account.pubkey) {
+                                        shadow_previous.insert(msg.account.pubkey, Arc::clone(current));
+                                    }
+                                    shadow_current.insert(msg.account.pubkey, Arc::clone(&msg.account));
+                                }
+                            }
+
                             if let Some(entry) = slot_messages.accounts_dedup.get_mut(&msg.account.pubkey) {
                                 if entry.0 < write_version {
                                     // We can replace the message, but in this case we will lose the order
@@ -1064,7 +1161,7 @@ impl GrpcService {
         subscriber_id: Option<String>,
         endpoint: String,
         stream_tx: LoadAwareSender<TonicResult<FilteredUpdate>>,
-        mut client_rx: mpsc::UnboundedReceiver<Option<(Option<u64>, Filter)>>,
+        mut client_rx: mpsc::UnboundedReceiver<Option<(Option<u64>, Filter, Vec<Pubkey>)>>,
         mut snapshot_rx: Option<crossbeam_channel::Receiver<Box<Message>>>,
         mut messages_rx: broadcast::Receiver<BroadcastedMessage>,
         replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
@@ -1072,6 +1169,7 @@ impl GrpcService {
         maybe_remote_peer_sk_addr: Option<SocketAddr>,
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
+        watched_pubkeys: Arc<StdMutex<HashMap<Pubkey, usize>>>,
     ) {
         let mut session = ClientSession::new(
             id,
@@ -1080,6 +1178,7 @@ impl GrpcService {
             maybe_remote_peer_sk_addr,
             debug_client_tx,
             cancellation_token,
+            watched_pubkeys,
         );
         let cancellation_token = session.cancellation_token.clone();
 
@@ -1142,10 +1241,10 @@ impl GrpcService {
                     }
 
                     match message {
-                        Some(Some((from_slot, filter_new))) => {
+                        Some(Some((from_slot, filter_new, pubkeys))) => {
                             session.set_filter(filter_new);
+                            session.register_pubkeys(pubkeys);
                             info!("client #{id}: filter updated");
-
                             if let Some(from_slot) = from_slot {
                                 let Some(replay_stored_slots_tx) = &replay_stored_slots_tx else {
                                     info!("client #{id}: from_slot is not supported");
@@ -1279,7 +1378,7 @@ impl GrpcService {
         id: usize,
         endpoint: &str,
         stream_tx: LoadAwareSender<TonicResult<FilteredUpdate>>,
-        client_rx: &mut mpsc::UnboundedReceiver<Option<(Option<u64>, Filter)>>,
+        client_rx: &mut mpsc::UnboundedReceiver<Option<(Option<u64>, Filter, Vec<Pubkey>)>>,
         snapshot_rx: crossbeam_channel::Receiver<Box<Message>>,
         filter: &mut Filter,
         cancellation_token: CancellationToken,
@@ -1295,7 +1394,7 @@ impl GrpcService {
                 }
                 maybe = client_rx.recv() => {
                     match maybe {
-                        Some(Some((_from_slot, filter_new))) => {
+                        Some(Some((_from_slot, filter_new, _pubkeys))) => {
                             if let Some(msg) = filter_new.get_pong_msg() {
                                 if stream_tx.send(Ok(msg)).await.is_err() {
                                     error!("client #{id}: stream closed");
@@ -1468,7 +1567,17 @@ impl Geyser for GrpcService {
                                         }
                                         continue;
                                     }
-                                    match incoming_client_tx.send(Some((request.from_slot, filter))) {
+                                    // Extract account_data_required pubkeys for shadow cache
+                                    let mut pubkeys = Vec::new();
+                                    for filter_tx in request.transactions.values().chain(request.transactions_status.values()) {
+                                        for pk_str in &filter_tx.account_data_required {
+                                            if let Ok(pk) = pk_str.parse::<Pubkey>() {
+                                                pubkeys.push(pk);
+                                                info!("client #{id}: watching pubkey {pk}");
+                                            }
+                                        }
+                                    }
+                                    match incoming_client_tx.send(Some((request.from_slot, filter, pubkeys))) {
                                         Ok(()) => Ok(()),
                                         Err(error) => Err(error.to_string()),
                                     }
@@ -1512,6 +1621,7 @@ impl Geyser for GrpcService {
             maybe_remote_peer_sk_addr,
             client_cancellation_token,
             self.task_tracker.clone(),
+            Arc::clone(&self.watched_pubkeys),
         ));
 
         Ok(Response::new(stream_rx))
@@ -1660,12 +1770,12 @@ mod tests {
     // real Ok(None) path: sends the filter, then on half-close awaits
     // cancellation to keep the sender alive.
     async fn incoming_handler(
-        client_tx: mpsc::UnboundedSender<Option<(Option<u64>, Filter)>>,
+        client_tx: mpsc::UnboundedSender<Option<(Option<u64>, Filter, Vec<Pubkey>)>>,
         filter: Filter,
         half_close: oneshot::Receiver<()>,
         ct: CancellationToken,
     ) {
-        client_tx.send(Some((None, filter))).unwrap();
+        client_tx.send(Some((None, filter, vec![]))).unwrap();
         let _ = half_close.await;
         // this is the fix from #670: await cancellation instead of
         // breaking, so client_tx stays alive and client_rx remains open.
@@ -1718,6 +1828,7 @@ mod tests {
             None,
             ct.clone(),
             tt.clone(),
+            Arc::new(StdMutex::new(HashMap::new())),
         ));
 
         // yield so incoming_handler sends the filter and client_loop

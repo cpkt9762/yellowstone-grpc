@@ -357,6 +357,9 @@ pub struct MessageTransaction {
     pub transaction: Arc<MessageTransactionInfo>,
     pub slot: u64,
     pub created_at: Timestamp,
+    pub accounts: Vec<Arc<MessageAccountInfo>>,
+    pub finalized_accounts: Vec<Arc<MessageAccountInfo>>,
+    pub previous_accounts: Vec<Arc<MessageAccountInfo>>,
 }
 
 impl MessageTransaction {
@@ -365,6 +368,9 @@ impl MessageTransaction {
             transaction: Arc::new(MessageTransactionInfo::from_geyser(info)),
             slot,
             created_at: Timestamp::from(SystemTime::now()),
+            accounts: Vec::new(),
+            finalized_accounts: Vec::new(),
+            previous_accounts: Vec::new(),
         }
     }
 
@@ -379,6 +385,9 @@ impl MessageTransaction {
             )?),
             slot: msg.slot,
             created_at,
+            accounts: Vec::new(),
+            finalized_accounts: Vec::new(),
+            previous_accounts: Vec::new(),
         })
     }
 }

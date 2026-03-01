@@ -95,6 +95,16 @@ message SubscribeRequestFilterTransactions {
   repeated string account_include = 3;
   repeated string account_exclude = 4;
   repeated string account_required = 6;
+  // Accounts whose data should be included in the response.
+  // Empty = no account data returned (default, zero overhead).
+  repeated string account_data_required = 7;
+  // Maximum number of matching transactions to receive. 0 = unlimited (default).
+  optional uint64 max_messages = 8;
+  // Account data commitment level: "processed" (default, same-slot) or "finalized".
+  optional string account_data_source = 9;
+  // Only include accounts owned by this program ID. Works with account_data_source.
+  // When set, replaces account_data_required — all accounts matching this owner are included.
+  optional string account_data_owner = 10;
 }
 
 message SubscribeRequestFilterBlocks {
@@ -183,6 +193,8 @@ message SubscribeUpdateSlot {
 message SubscribeUpdateTransaction {
   SubscribeUpdateTransactionInfo transaction = 1;
   uint64 slot = 2;
+  repeated SubscribeUpdateAccountInfo accounts = 3;
+  repeated SubscribeUpdateAccountInfo finalized_accounts = 4;
 }
 
 message SubscribeUpdateTransactionInfo {

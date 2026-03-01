@@ -12,6 +12,9 @@ publish = { workspace = true }
 [[bin]]
 name = "client"
 
+[[bin]]
+name = "test_finalized"
+
 [dependencies]
 anyhow = { workspace = true }
 backoff = { workspace = true, features = ["tokio"] }

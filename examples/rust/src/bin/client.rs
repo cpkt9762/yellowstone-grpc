@@ -542,6 +542,10 @@ impl Action {
                             account_include: args.transactions_account_include.clone(),
                             account_exclude: args.transactions_account_exclude.clone(),
                             account_required: args.transactions_account_required.clone(),
+                            account_data_required: vec![],
+                            max_messages: None,
+                            account_data_source: None,
+                            account_data_owner: None,
                         },
                     );
                 }
@@ -557,6 +561,10 @@ impl Action {
                             account_include: args.transactions_status_account_include.clone(),
                             account_exclude: args.transactions_status_account_exclude.clone(),
                             account_required: args.transactions_status_account_required.clone(),
+                            account_data_required: vec![],
+                            max_messages: None,
+                            account_data_source: None,
+                            account_data_owner: None,
                         },
                     );
                 }
