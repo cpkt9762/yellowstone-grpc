@@ -2,7 +2,7 @@ use {
     super::convert_to,
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaEntryInfoV2, ReplicaTransactionInfoV3,
-        SlotStatus as GeyserSlotStatus,
+        ReplicaTransactionInfoV4, SlotStatus as GeyserSlotStatus,
     },
     bytes::Bytes,
     prost_types::Timestamp,
@@ -315,6 +315,43 @@ impl MessageTransactionInfo {
         }
     }
 
+    pub fn from_geyser_v4(info: &ReplicaTransactionInfoV4<'_>) -> Self {
+        let account_keys: HashSet<Pubkey> = info
+            .transaction
+            .message
+            .static_account_keys()
+            .iter()
+            .chain(
+                info.transaction_status_meta
+                    .loaded_addresses
+                    .writable
+                    .iter(),
+            )
+            .chain(
+                info.transaction_status_meta
+                    .loaded_addresses
+                    .readonly
+                    .iter(),
+            )
+            .copied()
+            .collect();
+
+        let mut meta = convert_to::create_transaction_meta(info.transaction_status_meta);
+        if !info.pre_accounts_data.is_empty() {
+            meta.pre_accounts_data = convert_to::create_pre_accounts_data(info.pre_accounts_data);
+        }
+
+        Self {
+            signature: *info.signature,
+            is_vote: info.is_vote,
+            transaction: convert_to::create_transaction(info.transaction),
+            meta,
+            index: info.index,
+            account_keys,
+            pre_encoded: OnceLock::new(),
+        }
+    }
+
     pub fn from_update_oneof(msg: SubscribeUpdateTransactionInfo) -> FromUpdateOneofResult<Self> {
         Ok(Self {
             signature: Signature::try_from(msg.signature.as_slice())
@@ -378,6 +415,14 @@ impl MessageTransaction {
     pub fn from_geyser(info: &ReplicaTransactionInfoV3<'_>, slot: Slot) -> Self {
         Self {
             transaction: Arc::new(MessageTransactionInfo::from_geyser(info)),
+            slot,
+            created_at: Timestamp::from(SystemTime::now()),
+        }
+    }
+
+    pub fn from_geyser_v4(info: &ReplicaTransactionInfoV4<'_>, slot: Slot) -> Self {
+        Self {
+            transaction: Arc::new(MessageTransactionInfo::from_geyser_v4(info)),
             slot,
             created_at: Timestamp::from(SystemTime::now()),
         }

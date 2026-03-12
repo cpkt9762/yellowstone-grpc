@@ -14,8 +14,10 @@ use {
         ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
         SlotStatus,
     },
+    solana_pubkey::Pubkey,
     std::{
         concat, env,
+        str::FromStr,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex,
@@ -35,6 +37,7 @@ pub struct PluginInner {
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
     grpc_channel: mpsc::UnboundedSender<Message>,
+    pre_accounts_program_ids: Vec<Pubkey>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     encoder_handle: std::thread::JoinHandle<()>,
@@ -76,6 +79,18 @@ impl GeyserPlugin for Plugin {
 
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
+        let pre_accounts_program_ids = config
+            .grpc
+            .pre_accounts_program_ids
+            .iter()
+            .map(|value| {
+                Pubkey::from_str(value).map_err(|error| GeyserPluginError::ConfigFileReadError {
+                    msg: format!(
+                        "failed to parse grpc.pre_accounts_program_ids value {value:?}: {error}"
+                    ),
+                })
+            })
+            .collect::<PluginResult<Vec<_>>>()?;
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
@@ -152,6 +167,7 @@ impl GeyserPlugin for Plugin {
             snapshot_channel: Mutex::new(snapshot_channel),
             snapshot_channel_closed: AtomicBool::new(false),
             grpc_channel,
+            pre_accounts_program_ids,
             plugin_cancellation_token,
             plugin_task_tracker,
             encoder_handle,
@@ -251,21 +267,33 @@ impl GeyserPlugin for Plugin {
         slot: u64,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
-            let transaction = match transaction {
+            match transaction {
                 ReplicaTransactionInfoVersions::V0_0_1(_info) => {
                     unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
                 }
                 ReplicaTransactionInfoVersions::V0_0_2(_info) => {
                     unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
                 }
-                ReplicaTransactionInfoVersions::V0_0_3(info) => info,
-            };
-
-            let message = Message::Transaction(MessageTransaction::from_geyser(transaction, slot));
-            inner.send_message(message);
+                ReplicaTransactionInfoVersions::V0_0_3(info) => {
+                    let message = Message::Transaction(MessageTransaction::from_geyser(info, slot));
+                    inner.send_message(message);
+                }
+                ReplicaTransactionInfoVersions::V0_0_4(info) => {
+                    let message =
+                        Message::Transaction(MessageTransaction::from_geyser_v4(info, slot));
+                    inner.send_message(message);
+                }
+            }
 
             Ok(())
         })
+    }
+
+    fn pre_accounts_program_ids(&self) -> Vec<Pubkey> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.pre_accounts_program_ids.clone())
+            .unwrap_or_default()
     }
 
     fn notify_entry(&self, entry: ReplicaEntryInfoVersions) -> PluginResult<()> {

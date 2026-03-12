@@ -1,4 +1,5 @@
 use {
+    agave_geyser_plugin_interface::geyser_plugin_interface::PreAccountEntry,
     solana_clock::UnixTimestamp,
     solana_message::{
         compiled_instruction::CompiledInstruction, v0::MessageAddressTableLookup, MessageHeader,
@@ -143,6 +144,7 @@ pub fn create_transaction_meta(meta: &TransactionStatusMeta) -> proto::Transacti
         return_data_none: return_data.is_none(),
         compute_units_consumed: *compute_units_consumed,
         cost_units: *cost_units,
+        pre_accounts_data: vec![],
     }
 }
 
@@ -248,4 +250,18 @@ pub const fn create_block_height(block_height: u64) -> proto::BlockHeight {
 
 pub const fn create_timestamp(timestamp: UnixTimestamp) -> proto::UnixTimestamp {
     proto::UnixTimestamp { timestamp }
+}
+
+pub fn create_pre_accounts_data(pre_accounts: &[PreAccountEntry]) -> Vec<proto::PreAccountData> {
+    pre_accounts
+        .iter()
+        .map(|entry| proto::PreAccountData {
+            pubkey: entry.pubkey.to_bytes().into(),
+            data: entry.data.clone(),
+            owner: entry.owner.to_bytes().into(),
+            lamports: entry.lamports,
+            executable: entry.executable,
+            rent_epoch: entry.rent_epoch,
+        })
+        .collect()
 }

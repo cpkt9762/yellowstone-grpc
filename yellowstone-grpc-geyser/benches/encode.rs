@@ -51,11 +51,14 @@ fn bench_account(c: &mut Criterion) {
         .into_iter()
         .map(|transaction| FilteredUpdate {
             filters: filters.clone(),
-            message: FilteredUpdateOneof::transaction(&MessageTransaction {
-                transaction,
-                slot: 42,
-                created_at: Timestamp::from(SystemTime::now()),
-            }),
+            message: FilteredUpdateOneof::transaction(
+                &MessageTransaction {
+                    transaction,
+                    slot: 42,
+                    created_at: Timestamp::from(SystemTime::now()),
+                },
+                true,
+            ),
             created_at: Timestamp::from(SystemTime::now()),
         })
         .collect::<Vec<_>>();

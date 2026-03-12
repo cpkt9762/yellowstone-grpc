@@ -342,6 +342,8 @@ pub struct ConfigGrpc {
     )]
     pub encoder_threads: usize,
     #[serde(default)]
+    pub pre_accounts_program_ids: Vec<String>,
+    #[serde(default)]
     pub server_http2_adaptive_window: Option<bool>,
     #[serde(default, with = "humantime_serde")]
     pub server_http2_keepalive_interval: Option<Duration>,

@@ -69,6 +69,16 @@ message TransactionStatusMeta {
     optional uint64 compute_units_consumed = 16;
     // Total transaction cost
     optional uint64 cost_units = 17;
+    repeated PreAccountData pre_accounts_data = 18;
+}
+
+message PreAccountData {
+    bytes pubkey = 1;
+    bytes data = 2;
+    bytes owner = 3;
+    uint64 lamports = 4;
+    bool executable = 5;
+    uint64 rent_epoch = 6;
 }
 
 message TransactionError {
