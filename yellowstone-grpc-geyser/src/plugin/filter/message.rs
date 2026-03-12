@@ -267,13 +267,14 @@ impl FilteredUpdate {
 
     fn as_subscribe_update_transaction(
         message: &MessageTransaction,
+        include_pre_accounts: bool,
     ) -> SubscribeUpdateTransactionInfo {
         let tx = &message.transaction;
         SubscribeUpdateTransactionInfo {
             signature: tx.signature.as_ref().into(),
             is_vote: tx.is_vote,
             transaction: Some(tx.transaction.clone()),
-            meta: Some(tx.meta.clone()),
+            meta: Some(FilteredUpdateTransaction::tx_meta(tx, include_pre_accounts)),
             index: tx.index as u64,
         }
     }
@@ -310,7 +311,10 @@ impl FilteredUpdate {
             }),
             FilteredUpdateOneof::Transaction(msg) => {
                 UpdateOneof::Transaction(SubscribeUpdateTransaction {
-                    transaction: Some(Self::as_subscribe_update_transaction(&msg.transaction)),
+                    transaction: Some(Self::as_subscribe_update_transaction(
+                        &msg.transaction,
+                        msg.include_pre_accounts,
+                    )),
                     slot: msg.slot,
                     bank_id: msg.transaction.bank_id,
                 })
@@ -338,7 +342,7 @@ impl FilteredUpdate {
                 transactions: msg
                     .transactions
                     .iter()
-                    .map(|tx| Self::as_subscribe_update_transaction(tx.as_ref()))
+                    .map(|tx| Self::as_subscribe_update_transaction(tx.as_ref(), true))
                     .collect(),
                 updated_account_count: msg.updated_account_count,
                 accounts: msg
@@ -414,17 +418,22 @@ impl FilteredUpdateOneof {
         Self::Slot(FilteredUpdateSlot(message))
     }
 
-    pub fn transaction(message: Arc<MessageTransaction>) -> Self {
+    pub fn transaction(message: Arc<MessageTransaction>, include_pre_accounts: bool) -> Self {
         let slot = message.slot;
         Self::Transaction(FilteredUpdateTransaction {
             transaction: message,
             slot,
+            include_pre_accounts,
         })
     }
 
-    pub const fn transaction_status(message: Arc<MessageTransaction>) -> Self {
+    pub const fn transaction_status(
+        message: Arc<MessageTransaction>,
+        include_pre_accounts: bool,
+    ) -> Self {
         Self::TransactionStatus(FilteredUpdateTransactionStatus {
             transaction: message,
+            include_pre_accounts,
         })
     }
 
@@ -740,11 +749,12 @@ impl prost::Message for FilteredUpdateSlot {
 pub struct FilteredUpdateTransaction {
     pub transaction: Arc<MessageTransaction>,
     pub slot: u64,
+    pub include_pre_accounts: bool,
 }
 
 impl prost::Message for FilteredUpdateTransaction {
     fn encode_raw(&self, buf: &mut impl BufMut) {
-        Self::tx_encode_raw(1u32, &self.transaction.transaction, buf);
+        Self::tx_encode_raw(1u32, &self.transaction.transaction, self.include_pre_accounts, buf);
         if self.slot != 0u64 {
             ::prost::encoding::uint64::encode(2u32, &self.slot, buf);
         }
@@ -754,17 +764,18 @@ impl prost::Message for FilteredUpdateTransaction {
     }
 
     fn encoded_len(&self) -> usize {
-        prost_field_encoded_len(1u32, Self::tx_encoded_len(&self.transaction.transaction))
-            + if self.slot != 0u64 {
-                ::prost::encoding::uint64::encoded_len(2u32, &self.slot)
-            } else {
-                0
-            }
-            + if self.transaction.bank_id != 0u64 {
-                ::prost::encoding::uint64::encoded_len(3u32, &self.transaction.bank_id)
-            } else {
-                0
-            }
+        prost_field_encoded_len(
+            1u32,
+            Self::tx_encoded_len(&self.transaction.transaction, self.include_pre_accounts),
+        ) + if self.slot != 0u64 {
+            ::prost::encoding::uint64::encoded_len(2u32, &self.slot)
+        } else {
+            0
+        } + if self.transaction.bank_id != 0u64 {
+            ::prost::encoding::uint64::encoded_len(3u32, &self.transaction.bank_id)
+        } else {
+            0
+        }
     }
 
     fn merge_field(
@@ -789,18 +800,32 @@ fn transaction_return_encoded(pre_encoded: &[u8], tag: u32, buf: &mut impl BufMu
 }
 
 impl FilteredUpdateTransaction {
-    fn tx_encode_raw(tag: u32, tx: &MessageTransactionInfo, buf: &mut impl BufMut) {
-        // try to use pre-encoded bytes (fast path)
-        if let Some(pre_encoded) = tx.get_pre_encoded() {
-            metrics::pre_encoded_cache_hit("txn");
-            transaction_return_encoded(pre_encoded, tag, buf);
-            return;
+    fn tx_meta(
+        tx: &MessageTransactionInfo,
+        include_pre_accounts: bool,
+    ) -> confirmed_block::TransactionStatusMeta {
+        if include_pre_accounts || tx.meta.pre_accounts_data.is_empty() {
+            tx.meta.clone()
         } else {
-            // lazyly pre-encode the transaction for future use
-            TransactionEncoder::pre_encode(tx);
+            let mut meta = tx.meta.clone();
+            meta.pre_accounts_data.clear();
+            meta
+        }
+    }
 
+    fn tx_encode_raw(
+        tag: u32,
+        tx: &MessageTransactionInfo,
+        include_pre_accounts: bool,
+        buf: &mut impl BufMut,
+    ) {
+        // try to use pre-encoded bytes (fast path)
+        if include_pre_accounts {
             if let Some(pre_encoded) = tx.get_pre_encoded() {
-                transaction_return_encoded(pre_encoded, tag, buf);
+                metrics::pre_encoded_cache_hit("txn");
+                encode_key(tag, WireType::LengthDelimited, buf);
+                encode_varint(pre_encoded.len() as u64, buf);
+                buf.put_slice(pre_encoded);
                 return;
             }
         }
@@ -809,7 +834,7 @@ impl FilteredUpdateTransaction {
 
         // fallback: encode from scratch
         encode_key(tag, WireType::LengthDelimited, buf);
-        encode_varint(Self::tx_encoded_len(tx) as u64, buf);
+        encode_varint(Self::tx_encoded_len(tx, include_pre_accounts) as u64, buf);
 
         let index = tx.index as u64;
 
@@ -818,16 +843,18 @@ impl FilteredUpdateTransaction {
             ::prost::encoding::bool::encode(2u32, &tx.is_vote, buf);
         }
         message::encode(3u32, &tx.transaction, buf);
-        message::encode(4u32, &tx.meta, buf);
+        message::encode(4u32, &Self::tx_meta(tx, include_pre_accounts), buf);
         if index != 0u64 {
             ::prost::encoding::uint64::encode(5u32, &index, buf);
         }
     }
 
-    fn tx_encoded_len(tx: &MessageTransactionInfo) -> usize {
+    fn tx_encoded_len(tx: &MessageTransactionInfo, include_pre_accounts: bool) -> usize {
         // try to use pre-encoded length (fast path)
-        if let Some(pre_encoded) = tx.get_pre_encoded() {
-            return pre_encoded.len();
+        if include_pre_accounts {
+            if let Some(pre_encoded) = tx.get_pre_encoded() {
+                return pre_encoded.len();
+            }
         }
 
         let index = tx.index as u64;
@@ -839,7 +866,7 @@ impl FilteredUpdateTransaction {
                 0
             }
             + message::encoded_len(3u32, &tx.transaction)
-            + message::encoded_len(4u32, &tx.meta)
+            + message::encoded_len(4u32, &Self::tx_meta(tx, include_pre_accounts))
             + if index != 0u64 {
                 ::prost::encoding::uint64::encoded_len(5u32, &index)
             } else {
@@ -851,6 +878,7 @@ impl FilteredUpdateTransaction {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FilteredUpdateTransactionStatus {
     pub transaction: Arc<MessageTransaction>,
+    pub include_pre_accounts: bool,
 }
 
 impl prost::Message for FilteredUpdateTransactionStatus {
@@ -1187,7 +1215,7 @@ impl prost::Message for FilteredUpdateBlock {
             message::encode(5u32, msg, buf);
         }
         for tx in &self.transactions {
-            FilteredUpdateTransaction::tx_encode_raw(6u32, &tx.transaction, buf);
+            FilteredUpdateTransaction::tx_encode_raw(6u32, &tx.transaction, true, buf);
         }
         if self.meta.parent_slot != 0u64 {
             ::prost::encoding::uint64::encode(7u32, &self.meta.parent_slot, buf);
@@ -1250,7 +1278,7 @@ impl prost::Message for FilteredUpdateBlock {
                 .as_ref()
                 .map_or(0, |msg| message::encoded_len(5u32, msg))
             + prost_repeated_encoded_len_map!(6u32, self.transactions, |tx| {
-                FilteredUpdateTransaction::tx_encoded_len(&tx.transaction)
+                FilteredUpdateTransaction::tx_encoded_len(&tx.transaction, true)
             })
             + if self.meta.parent_slot != 0u64 {
                 ::prost::encoding::uint64::encoded_len(7u32, &self.meta.parent_slot)
@@ -1419,6 +1447,7 @@ pub mod tests {
                 MessageTransaction, MessageTransactionInfo,
             },
         },
+        agave_geyser_plugin_interface::geyser_plugin_interface::PreAccountEntry,
         bytes::Bytes,
         foldhash::{HashSet as FoldHashSet, HashSetExt},
         prost::Message,
@@ -1895,10 +1924,12 @@ pub mod tests {
             let wrapped_cached = FilteredUpdateTransaction {
                 transaction: tx_with_cache,
                 slot: 42,
+                include_pre_accounts: true,
             };
             let wrapped_manual = FilteredUpdateTransaction {
                 transaction: tx_without_cache,
                 slot: 42,
+                include_pre_accounts: true,
             };
 
             // Encode both using prost::Message::encode_to_vec (public API)
@@ -1924,13 +1955,79 @@ pub mod tests {
         for transaction in load_predefined_transactions() {
             encode_decode_cmp(
                 &["123"],
-                FilteredUpdateOneof::transaction(Arc::clone(&transaction)),
+                FilteredUpdateOneof::transaction(Arc::clone(&transaction), true),
             );
             encode_decode_cmp(
                 &["123"],
-                FilteredUpdateOneof::transaction_status(transaction),
+                FilteredUpdateOneof::transaction_status(Arc::clone(&transaction), true),
             );
         }
+    }
+
+    #[test]
+    fn test_message_transaction_strips_pre_accounts_when_disabled() {
+        let tx = load_predefined_transactions()
+            .into_iter()
+            .next()
+            .expect("fixture transaction should exist");
+        let mut meta = tx.meta.clone();
+        meta.pre_accounts_data = convert_to::create_pre_accounts_data(&[PreAccountEntry {
+            pubkey: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            lamports: 1,
+            data: vec![1, 2, 3],
+            executable: false,
+            rent_epoch: 0,
+        }]);
+
+        let msg = MessageTransaction {
+            transaction: Arc::new(MessageTransactionInfo {
+                signature: tx.signature,
+                is_vote: tx.is_vote,
+                transaction: tx.transaction.clone(),
+                meta,
+                index: tx.index,
+                account_keys: tx.account_keys.clone(),
+                pre_encoded: OnceLock::new(),
+            }),
+            slot: 42,
+            created_at: Timestamp::from(SystemTime::now()),
+        };
+
+        let update = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(&msg, true))
+            .as_subscribe_update();
+        let stripped = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(&msg, false))
+            .as_subscribe_update();
+
+        let update_len = update
+            .update_oneof
+            .as_ref()
+            .and_then(|msg| match msg {
+                yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Transaction(tx) => {
+                    tx.transaction
+                        .as_ref()
+                        .and_then(|tx| tx.meta.as_ref())
+                        .map(|meta| meta.pre_accounts_data.len())
+                }
+                _ => None,
+            })
+            .expect("transaction update should include meta");
+        let stripped_len = stripped
+            .update_oneof
+            .as_ref()
+            .and_then(|msg| match msg {
+                yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof::Transaction(tx) => {
+                    tx.transaction
+                        .as_ref()
+                        .and_then(|tx| tx.meta.as_ref())
+                        .map(|meta| meta.pre_accounts_data.len())
+                }
+                _ => None,
+            })
+            .expect("transaction update should include meta");
+
+        assert_eq!(update_len, 1);
+        assert_eq!(stripped_len, 0);
     }
 
     #[test]

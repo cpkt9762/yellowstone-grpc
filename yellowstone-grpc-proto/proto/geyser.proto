@@ -117,6 +117,10 @@ message SubscribeRequestFilterTransactions {
   repeated string account_exclude = 4;
   repeated string account_required = 6;
   optional CuckooFilter cuckoo_account_include = 7;
+  // Fork-local field (cpkt9762 pre-accounts). Upstream took 7 for
+  // cuckoo_account_include in v15, so this lives in a high tag range to keep
+  // future rebases collision-free.
+  optional bool include_pre_accounts = 1000;
   // ATA / token-account expansion control. When set, account_include /
   // account_exclude / account_required also match against owners of
   // pre/post token balances on each transaction. Absent = no expansion.

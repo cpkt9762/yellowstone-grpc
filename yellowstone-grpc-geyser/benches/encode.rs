@@ -51,7 +51,7 @@ fn bench_account(c: &mut Criterion) {
         .into_iter()
         .map(|transaction| FilteredUpdate {
             filters: filters.clone(),
-            message: FilteredUpdateOneof::transaction(transaction),
+            message: FilteredUpdateOneof::transaction(transaction, true),
             created_at: Timestamp::from(SystemTime::now()),
         })
         .collect::<Vec<_>>();
