@@ -21,6 +21,7 @@ use {
     solana_pubkey::Pubkey,
     std::{
         concat, env,
+        str::FromStr,
         sync::{
             atomic::{AtomicBool, Ordering},
             Arc, Mutex, Once,
@@ -46,6 +47,7 @@ pub struct PluginInner {
     block_reconstruction_channel: mpsc::UnboundedSender<BlockReconstructionMessage>, // block_reconstruction_loop
     broadcast_channel: broadcast::Sender<BroadcastedMessage>,                        // client_loop
     blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
+    pre_accounts_program_ids: Vec<Pubkey>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     file_watcher: Arc<FileWatcher>,
@@ -115,6 +117,18 @@ impl GeyserPlugin for Plugin {
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
         let filter_limits = config.grpc.filter_limits.clone();
+        let pre_accounts_program_ids = config
+            .grpc
+            .pre_accounts_program_ids
+            .iter()
+            .map(|value| {
+                Pubkey::from_str(value).map_err(|error| GeyserPluginError::ConfigFileReadError {
+                    msg: format!(
+                        "failed to parse grpc.pre_accounts_program_ids value {value:?}: {error}"
+                    ),
+                })
+            })
+            .collect::<PluginResult<Vec<_>>>()?;
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
@@ -203,6 +217,7 @@ impl GeyserPlugin for Plugin {
             block_reconstruction_channel: grpc_service_result.block_reconstruction_tx,
             broadcast_channel: grpc_service_result.broadcast_tx,
             blocks_meta_tx: grpc_service_result.blocks_meta_tx,
+            pre_accounts_program_ids,
             plugin_cancellation_token,
             plugin_task_tracker,
             file_watcher,
@@ -352,7 +367,7 @@ impl GeyserPlugin for Plugin {
         slot: u64,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
-            let transaction = match transaction {
+            match transaction {
                 ReplicaTransactionInfoVersions::V0_0_1(_info) => {
                     unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
                 }
@@ -360,6 +375,13 @@ impl GeyserPlugin for Plugin {
                     unreachable!("ReplicaAccountInfoVersions::V0_0_2 is not supported")
                 }
                 ReplicaTransactionInfoVersions::V0_0_3(info) => info,
+                ReplicaTransactionInfoVersions::V0_0_4(info) => {
+                    let message = Message::Transaction(Arc::new(
+                        MessageTransaction::from_geyser_v4(info, slot),
+                    ));
+                    inner.send_message(message);
+                    return Ok(());
+                }
             };
 
             let message =
@@ -368,6 +390,13 @@ impl GeyserPlugin for Plugin {
 
             Ok(())
         })
+    }
+
+    fn pre_accounts_program_ids(&self) -> Vec<Pubkey> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.pre_accounts_program_ids.clone())
+            .unwrap_or_default()
     }
 
     fn notify_entry(&self, entry: ReplicaEntryInfoVersions) -> PluginResult<()> {

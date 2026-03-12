@@ -927,6 +927,7 @@ struct FilterTransactionsInner {
     account_required: Vec<Pubkey>,
     /// `None` means no ATA expansion (the proto field is absent).
     token_accounts: Option<TokenAccountsMode>,
+    include_pre_accounts: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1002,6 +1003,7 @@ impl FilterTransactions {
                         .token_accounts
                         .map(TokenAccountsMode::from_proto)
                         .transpose()?,
+                    include_pre_accounts: filter.include_pre_accounts.unwrap_or(false),
                 },
             );
         }
@@ -1012,6 +1014,7 @@ impl FilterTransactions {
     }
 
     pub fn get_updates(&self, message: &Arc<MessageTransaction>) -> FilteredUpdates {
+        let mut include_pre_accounts = false;
         let filters = self
             .filters
             .iter()
@@ -1072,6 +1075,7 @@ impl FilterTransactions {
                     return None;
                 }
 
+                include_pre_accounts |= inner.include_pre_accounts;
                 Some(name.clone())
             })
             .collect::<FilteredUpdateFilters>();
@@ -1079,10 +1083,11 @@ impl FilterTransactions {
         filtered_updates_once_owned!(
             filters,
             match self.filter_type {
-                FilterTransactionsType::Transaction =>
-                    FilteredUpdateOneof::transaction(Arc::clone(message)),
+                FilterTransactionsType::Transaction => {
+                    FilteredUpdateOneof::transaction(Arc::clone(message), include_pre_accounts)
+                }
                 FilterTransactionsType::TransactionStatus => {
-                    FilteredUpdateOneof::transaction_status(Arc::clone(message))
+                    FilteredUpdateOneof::transaction_status(Arc::clone(message), include_pre_accounts)
                 }
             },
             message.created_at
@@ -1897,6 +1902,7 @@ mod tests {
                 account_exclude: vec![],
                 account_required: vec![],
                 token_accounts: None,
+                include_pre_accounts: None,
             },
         );
 
@@ -1933,6 +1939,7 @@ mod tests {
                 account_exclude: vec![],
                 account_required: vec![],
                 token_accounts: None,
+                include_pre_accounts: None,
             },
         );
 
@@ -1975,6 +1982,7 @@ mod tests {
                 account_exclude: vec![],
                 account_required: vec![],
                 token_accounts: None,
+                include_pre_accounts: None,
             },
         );
 
@@ -2041,6 +2049,7 @@ mod tests {
                 account_exclude: vec![],
                 account_required: vec![],
                 token_accounts: None,
+                include_pre_accounts: None,
             },
         );
 
@@ -2107,6 +2116,7 @@ mod tests {
                 account_exclude,
                 account_required: vec![],
                 token_accounts: None,
+                include_pre_accounts: None,
             },
         );
 
@@ -2159,6 +2169,7 @@ mod tests {
                 account_exclude: vec![],
                 account_required,
                 token_accounts: None,
+                include_pre_accounts: None,
             },
         );
 
@@ -2562,6 +2573,7 @@ mod tests {
                 account_exclude: vec![],
                 account_required,
                 token_accounts: None,
+                include_pre_accounts: None,
             },
         );
 
