@@ -7,7 +7,7 @@ use {
             ReplicaContactInfoV0_0_1, ReplicaDeshredTransactionInfo,
             ReplicaDeshredTransactionInfoV2, ReplicaDeshredTransactionInfoVersions,
             ReplicaDeshredUpdateParentInfo, ReplicaEntryInfoV2, ReplicaEntryUpdateParentInfo,
-            ReplicaTransactionInfoV4, SlotStatus as GeyserSlotStatus,
+            ReplicaTransactionInfoV4, ReplicaTransactionInfoV5, SlotStatus as GeyserSlotStatus,
         },
     },
     bytes::Bytes,
@@ -304,6 +304,45 @@ impl MessageTransactionInfo {
         }
     }
 
+    pub fn from_geyser_v5(info: &ReplicaTransactionInfoV5<'_>) -> Self {
+        let account_keys = info
+            .transaction
+            .message
+            .static_account_keys()
+            .iter()
+            .chain(
+                info.transaction_status_meta
+                    .loaded_addresses
+                    .writable
+                    .iter(),
+            )
+            .chain(
+                info.transaction_status_meta
+                    .loaded_addresses
+                    .readonly
+                    .iter(),
+            )
+            .copied()
+            .collect();
+
+        let mut meta = convert_to::create_transaction_meta(info.transaction_status_meta);
+        if !info.pre_accounts_data.is_empty() {
+            meta.pre_accounts_data = convert_to::create_pre_accounts_data(info.pre_accounts_data);
+        }
+
+        Self {
+            signature: *info.signature,
+            is_vote: info.is_vote,
+            transaction: convert_to::create_transaction(info.transaction),
+            meta,
+            index: info.index,
+            account_keys,
+            pre_encoded: OnceLock::new(),
+            token_owners_all: OnceLock::new(),
+            token_owners_changed: OnceLock::new(),
+        }
+    }
+
     pub fn fill_account_keys(&mut self) -> FromUpdateOneofResult<()> {
         let mut account_keys = FoldHashSet::new();
 
@@ -353,6 +392,19 @@ impl MessageTransaction {
     pub fn from_geyser(info: &ReplicaTransactionInfoV4<'_>, slot: Slot, bank_id: BankId) -> Self {
         Self {
             transaction: MessageTransactionInfo::from_geyser(info),
+            slot,
+            created_at: Timestamp::from(SystemTime::now()),
+            bank_id,
+        }
+    }
+
+    pub fn from_geyser_v5(
+        info: &ReplicaTransactionInfoV5<'_>,
+        slot: Slot,
+        bank_id: BankId,
+    ) -> Self {
+        Self {
+            transaction: MessageTransactionInfo::from_geyser_v5(info),
             slot,
             created_at: Timestamp::from(SystemTime::now()),
             bank_id,

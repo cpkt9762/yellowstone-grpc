@@ -4,6 +4,7 @@ use {
         block_footer::{
             BlockFinalizationCert, NotarRewardCertificate, SkipRewardCertificate, VotesAggregate,
         },
+        geyser_plugin_interface::PreAccountEntry,
         transaction_status_meta::{
             InnerInstruction, InnerInstructions, Reward, TransactionReturnData,
             TransactionStatusMeta, TransactionTokenBalance,
@@ -173,6 +174,7 @@ pub fn create_transaction_meta(meta: &TransactionStatusMeta) -> proto::Transacti
         return_data_none: return_data.is_none(),
         compute_units_consumed: *compute_units_consumed,
         cost_units: *cost_units,
+        pre_accounts_data: vec![],
     }
 }
 
@@ -430,4 +432,18 @@ pub fn create_gossip_snapshot(
         created_at: Some(Timestamp::from(SystemTime::now())),
         seq,
     }
+}
+
+pub fn create_pre_accounts_data(pre_accounts: &[PreAccountEntry]) -> Vec<proto::PreAccountData> {
+    pre_accounts
+        .iter()
+        .map(|entry| proto::PreAccountData {
+            pubkey: entry.pubkey.to_bytes().into(),
+            data: entry.data.clone(),
+            owner: entry.owner.to_bytes().into(),
+            lamports: entry.lamports,
+            executable: entry.executable,
+            rent_epoch: entry.rent_epoch,
+        })
+        .collect()
 }
