@@ -10,7 +10,7 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
-    solana_transaction_context::TransactionReturnData,
+    solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
         ConfirmedBlock, InnerInstruction, InnerInstructions, Reward, RewardType,
@@ -274,6 +274,7 @@ pub fn create_reward(reward: proto::Reward) -> CreateResult<Reward> {
                     .map_err(|_| "failed to parse reward commission")?,
             )
         },
+        commission_bps: None,
     })
 }
 

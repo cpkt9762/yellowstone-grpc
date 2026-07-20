@@ -18,33 +18,105 @@ use {
     tonic::codec::CompressionEncoding,
 };
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub libpath: String,
-    #[serde(default)]
     pub log: ConfigLog,
-    #[serde(default)]
     pub tokio: ConfigTokio,
     pub grpc: ConfigGrpc,
-    #[serde(default)]
     pub prometheus: Option<ConfigPrometheus>,
-    /// Collect client filters, processed slot and make it available on prometheus port `/debug_clients`
-    #[serde(default)]
+    pub shm: Option<ConfigShm>,
     pub debug_clients_http: bool,
 }
 
 impl Config {
+    fn parse_field<T: serde::de::DeserializeOwned>(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Result<T, String> {
+        let val = obj
+            .remove(key)
+            .ok_or_else(|| format!("missing field: {key}"))?;
+        let json_str = serde_json::to_string(&val).map_err(|e| e.to_string())?;
+        serde_json::from_str(&json_str).map_err(|e| format!("field {key}: {e}"))
+    }
+
+    fn parse_field_or_default<T: serde::de::DeserializeOwned + Default>(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Result<T, String> {
+        match obj.remove(key) {
+            Some(serde_json::Value::Null) | None => Ok(T::default()),
+            Some(val) => {
+                let json_str = serde_json::to_string(&val).map_err(|e| e.to_string())?;
+                serde_json::from_str(&json_str).map_err(|e| format!("field {key}: {e}"))
+            }
+        }
+    }
+
+    fn parse_field_option<T: serde::de::DeserializeOwned>(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Result<Option<T>, String> {
+        match obj.remove(key) {
+            Some(serde_json::Value::Null) | None => Ok(None),
+            Some(val) => {
+                let json_str = serde_json::to_string(&val).map_err(|e| e.to_string())?;
+                serde_json::from_str(&json_str)
+                    .map(Some)
+                    .map_err(|e| format!("field {key}: {e}"))
+            }
+        }
+    }
+
     fn load_from_str(config: &str) -> PluginResult<Self> {
-        serde_json::from_str(config).map_err(|error| GeyserPluginError::ConfigFileReadError {
-            msg: error.to_string(),
-        })
+        let value: serde_json::Value = serde_json::from_str(config)
+            .map_err(|e| GeyserPluginError::ConfigFileReadError { msg: e.to_string() })?;
+
+        let mut obj = match value {
+            serde_json::Value::Object(m) => m,
+            _ => {
+                return Err(GeyserPluginError::ConfigFileReadError {
+                    msg: "config must be a JSON object".into(),
+                })
+            }
+        };
+
+        let result = (|| -> Result<Self, String> {
+            let libpath: String = Self::parse_field(&mut obj, "libpath")?;
+            let log: ConfigLog = Self::parse_field_or_default(&mut obj, "log")?;
+            let tokio: ConfigTokio = Self::parse_field_or_default(&mut obj, "tokio")?;
+            let grpc: ConfigGrpc = Self::parse_field(&mut obj, "grpc")?;
+            let prometheus: Option<ConfigPrometheus> =
+                Self::parse_field_option(&mut obj, "prometheus")?;
+            let shm: Option<ConfigShm> = Self::parse_field_option(&mut obj, "shm")?;
+            let debug_clients_http: bool =
+                Self::parse_field_or_default(&mut obj, "debug_clients_http")?;
+
+            Ok(Self {
+                libpath,
+                log,
+                tokio,
+                grpc,
+                prometheus,
+                shm,
+                debug_clients_http,
+            })
+        })();
+
+        result.map_err(|e| GeyserPluginError::ConfigFileReadError { msg: e })
     }
 
     pub fn load_from_file<P: AsRef<Path>>(file: P) -> PluginResult<Self> {
         let config = read_to_string(file).map_err(GeyserPluginError::ConfigFileOpenError)?;
         Self::load_from_str(&config)
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigShm {
+    pub shm_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -627,5 +699,39 @@ mod tests {
         let json = r#""not_valid""#;
         let result: Result<GrpcAddresses, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    fn minimal_config_json(shm_fragment: &str) -> String {
+        format!(
+            r#"{{
+                "libpath": "/tmp/test.so",
+                "grpc": {{
+                    "address": "127.0.0.1:10000",
+                    "channel_capacity": "100"
+                }}{shm_fragment}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn test_config_with_shm() {
+        let json = minimal_config_json(r#", "shm": { "shm_path": "/dev/shm/test" }"#);
+        let config: super::Config = serde_json::from_str(&json).unwrap();
+        let shm = config.shm.expect("shm should be Some");
+        assert_eq!(shm.shm_path, "/dev/shm/test");
+    }
+
+    #[test]
+    fn test_config_without_shm() {
+        let json = minimal_config_json("");
+        let config: super::Config = serde_json::from_str(&json).unwrap();
+        assert!(config.shm.is_none());
+    }
+
+    #[test]
+    fn test_config_with_null_shm() {
+        let json = minimal_config_json(r#", "shm": null"#);
+        let config: super::Config = serde_json::from_str(&json).unwrap();
+        assert!(config.shm.is_none());
     }
 }

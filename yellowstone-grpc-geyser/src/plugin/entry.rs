@@ -4,9 +4,12 @@ use {
         grpc::GrpcService,
         metrics::{self, PrometheusService},
         parallel::ParallelEncoder,
-        plugin::message::{
-            Message, MessageAccount, MessageBlockMeta, MessageEntry, MessageSlot,
-            MessageTransaction,
+        plugin::{
+            message::{
+                Message, MessageAccount, MessageBlockMeta, MessageEntry, MessageSlot,
+                MessageTransaction,
+            },
+            shm::ShmSubscriptionState,
         },
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
@@ -14,8 +17,10 @@ use {
         ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
         SlotStatus,
     },
+    arc_swap::ArcSwap,
     solana_pubkey::Pubkey,
     std::{
+        collections::HashSet,
         concat, env,
         str::FromStr,
         sync::{
@@ -37,7 +42,9 @@ pub struct PluginInner {
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
     grpc_channel: mpsc::UnboundedSender<Message>,
-    pre_accounts_program_ids: Vec<Pubkey>,
+    dynamic_pre_accounts_program_ids: Arc<arc_swap::ArcSwap<HashSet<Pubkey>>>,
+    pub shm_state: Arc<arc_swap::ArcSwap<ShmSubscriptionState>>,
+    pub shm_path: Option<String>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     encoder_handle: std::thread::JoinHandle<()>,
@@ -79,7 +86,7 @@ impl GeyserPlugin for Plugin {
 
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
-        let pre_accounts_program_ids = config
+        let static_program_ids: HashSet<Pubkey> = config
             .grpc
             .pre_accounts_program_ids
             .iter()
@@ -90,7 +97,10 @@ impl GeyserPlugin for Plugin {
                     ),
                 })
             })
-            .collect::<PluginResult<Vec<_>>>()?;
+            .collect::<PluginResult<HashSet<_>>>()?;
+        let dynamic_pre_accounts_program_ids = Arc::new(ArcSwap::from_pointee(static_program_ids));
+        let shm_path = config.shm.as_ref().map(|cfg| cfg.shm_path.clone());
+        let shm_state = Arc::new(ArcSwap::from_pointee(ShmSubscriptionState::empty()));
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
@@ -126,6 +136,9 @@ impl GeyserPlugin for Plugin {
         let encoder_threads = config.grpc.encoder_threads;
         let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
 
+        let dynamic_pre_accounts_for_grpc = dynamic_pre_accounts_program_ids.clone();
+        let shm_state_for_grpc = shm_state.clone();
+        let shm_path_for_grpc = shm_path.clone();
         let result = runtime.block_on(async move {
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
             // Create prometheus service First so if it fails the plugin doesn't spawn geyser tasks unnecessarily.
@@ -145,6 +158,9 @@ impl GeyserPlugin for Plugin {
                 grpc_cancellation_token,
                 grpc_task_tracker,
                 encoder,
+                dynamic_pre_accounts_for_grpc,
+                shm_state_for_grpc,
+                shm_path_for_grpc,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
@@ -167,7 +183,9 @@ impl GeyserPlugin for Plugin {
             snapshot_channel: Mutex::new(snapshot_channel),
             snapshot_channel_closed: AtomicBool::new(false),
             grpc_channel,
-            pre_accounts_program_ids,
+            dynamic_pre_accounts_program_ids,
+            shm_state,
+            shm_path,
             plugin_cancellation_token,
             plugin_task_tracker,
             encoder_handle,
@@ -215,6 +233,28 @@ impl GeyserPlugin for Plugin {
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
 
+            let shm_guard = inner.shm_state.load();
+            if let Some(ref writer) = shm_guard.writer {
+                if let (Ok(pubkey_arr), Ok(owner_arr)) = (
+                    <&[u8; 32]>::try_from(account.pubkey),
+                    <&[u8; 32]>::try_from(account.owner),
+                ) {
+                    if shm_guard.accounts.contains(pubkey_arr) {
+                        if let Err(e) = writer.write_account(
+                            pubkey_arr,
+                            owner_arr,
+                            account.lamports,
+                            account.executable,
+                            account.rent_epoch,
+                            account.data,
+                            slot,
+                        ) {
+                            log::warn!("shm write failed: {e}");
+                        }
+                    }
+                }
+            }
+
             if is_startup {
                 if let Some(channel) = inner.snapshot_channel.lock().unwrap().as_ref() {
                     let message =
@@ -254,6 +294,13 @@ impl GeyserPlugin for Plugin {
         status: &SlotStatus,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            if matches!(status, SlotStatus::Processed) {
+                let shm_guard = inner.shm_state.load();
+                if let Some(ref writer) = shm_guard.writer {
+                    writer.update_global_slot(slot);
+                }
+            }
+
             let message = Message::Slot(MessageSlot::from_geyser(slot, parent, status));
             inner.send_message(message);
             metrics::update_slot_status(status, slot);
@@ -292,8 +339,21 @@ impl GeyserPlugin for Plugin {
     fn pre_accounts_program_ids(&self) -> Vec<Pubkey> {
         self.inner
             .as_ref()
-            .map(|inner| inner.pre_accounts_program_ids.clone())
+            .map(|inner| {
+                inner
+                    .dynamic_pre_accounts_program_ids
+                    .load()
+                    .iter()
+                    .copied()
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    fn pre_accounts_program_ids_shared(&self) -> Option<Arc<ArcSwap<HashSet<Pubkey>>>> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.dynamic_pre_accounts_program_ids.clone())
     }
 
     fn notify_entry(&self, entry: ReplicaEntryInfoVersions) -> PluginResult<()> {
