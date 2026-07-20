@@ -40,6 +40,8 @@ pub struct Config {
     pub grpc: ConfigGrpc,
     #[serde(default)]
     pub prometheus: Option<ConfigPrometheus>,
+    #[serde(default)]
+    pub shm: Option<ConfigShm>,
     /// Collect client filters, processed slot and make it available on prometheus port `/debug_clients`
     #[serde(default)]
     #[deprecated(note = "This option is deprecated and will be removed in future versions.")]
@@ -57,6 +59,12 @@ impl Config {
         let config = read_to_string(file).map_err(GeyserPluginError::ConfigFileOpenError)?;
         Self::load_from_str(&config)
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigShm {
+    pub shm_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1095,5 +1103,39 @@ mod tests {
         let json = r#""not_valid""#;
         let result: Result<GrpcAddresses, _> = serde_json::from_str(json);
         assert!(result.is_err());
+    }
+
+    fn minimal_config_json(shm_fragment: &str) -> String {
+        format!(
+            r#"{{
+                "libpath": "/tmp/test.so",
+                "grpc": {{
+                    "address": "127.0.0.1:10000",
+                    "channel_capacity": "100"
+                }}{shm_fragment}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn test_config_with_shm() {
+        let json = minimal_config_json(r#", "shm": { "shm_path": "/dev/shm/test" }"#);
+        let config: super::Config = serde_json::from_str(&json).unwrap();
+        let shm = config.shm.expect("shm should be Some");
+        assert_eq!(shm.shm_path, "/dev/shm/test");
+    }
+
+    #[test]
+    fn test_config_without_shm() {
+        let json = minimal_config_json("");
+        let config: super::Config = serde_json::from_str(&json).unwrap();
+        assert!(config.shm.is_none());
+    }
+
+    #[test]
+    fn test_config_with_null_shm() {
+        let json = minimal_config_json(r#", "shm": null"#);
+        let config: super::Config = serde_json::from_str(&json).unwrap();
+        assert!(config.shm.is_none());
     }
 }
