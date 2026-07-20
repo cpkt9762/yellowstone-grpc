@@ -22,6 +22,7 @@ use {
             },
             message::{CommitmentLevel, Message, MessageBlockMeta, MessageSlot, SlotStatus},
             proto::geyser_server::{Geyser, GeyserServer},
+            shm::{open_and_validate_shm, ShmSubscriptionState},
         },
         ratelimit::{MethodRatelimiter, PrometheusRatelimitCallbacks},
         stream::{tokio::BatchStreamUnboundedReceiver, BatchStream, BatchStreamExt, Buffer},
@@ -45,6 +46,7 @@ use {
         os::unix::fs::PermissionsExt,
         path::PathBuf,
         pin::Pin,
+        str::FromStr,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex as StdMutex,
@@ -640,6 +642,10 @@ pub struct GrpcService {
     deshred_broadcast_tx: broadcast::Sender<DeshredBroadcastedMessage>,
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
+    dynamic_pre_accounts_program_ids:
+        Arc<arc_swap::ArcSwap<std::collections::HashSet<solana_pubkey::Pubkey>>>,
+    shm_state: Arc<arc_swap::ArcSwap<ShmSubscriptionState>>,
+    shm_path: Option<String>,
     cancellation_token: CancellationToken,
     task_tracker: TaskTracker,
     filter_name_size_limit: usize,
@@ -791,6 +797,80 @@ pub struct GrpcServiceResult {
 }
 
 impl GrpcService {
+    fn maybe_update_pre_accounts_program_ids(
+        request: &yellowstone_grpc_proto::geyser::SubscribeRequest,
+        dyn_ids: &arc_swap::ArcSwap<std::collections::HashSet<solana_pubkey::Pubkey>>,
+    ) {
+        let mut new_pubkeys = Vec::new();
+        for tx_filter in request.transactions.values() {
+            if tx_filter.include_pre_accounts.unwrap_or(false) {
+                for acct in &tx_filter.account_include {
+                    if let Ok(pk) = acct.parse::<solana_pubkey::Pubkey>() {
+                        new_pubkeys.push(pk);
+                    }
+                }
+            }
+        }
+        if new_pubkeys.is_empty() {
+            return;
+        }
+        let current = dyn_ids.load();
+        if new_pubkeys.iter().all(|pk| current.contains(pk)) {
+            return;
+        }
+        let mut updated = (**current).clone();
+        for pk in new_pubkeys {
+            updated.insert(pk);
+        }
+        dyn_ids.store(std::sync::Arc::new(updated));
+    }
+
+    fn maybe_update_shm_subscription(
+        request: &SubscribeRequest,
+        shm_state: &arc_swap::ArcSwap<ShmSubscriptionState>,
+        shm_path: Option<&str>,
+    ) {
+        let Some(shm_path) = shm_path else {
+            return;
+        };
+
+        let mut accounts = std::collections::HashSet::<[u8; 32]>::new();
+        for filter in request.accounts.values() {
+            for account in &filter.account {
+                let pubkey = match Pubkey::from_str(account) {
+                    Ok(pubkey) => pubkey,
+                    Err(error) => {
+                        log::warn!("failed to parse shm subscription pubkey {account:?}: {error}");
+                        return;
+                    }
+                };
+                accounts.insert(pubkey.to_bytes());
+            }
+        }
+
+        if accounts.is_empty() {
+            return;
+        }
+
+        let pubkeys = accounts.iter().copied().collect::<Vec<_>>();
+        match open_and_validate_shm(shm_path, &pubkeys) {
+            Ok(writer) => {
+                log::warn!(
+                    "shm subscription activated: {} accounts, path={}",
+                    accounts.len(),
+                    shm_path
+                );
+                shm_state.store(Arc::new(ShmSubscriptionState {
+                    accounts,
+                    writer: Some(writer),
+                }));
+            }
+            Err(error) => {
+                log::warn!("failed to open shm for subscription at {shm_path}: {error}");
+            }
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     pub async fn create<St>(
         config: ConfigGrpc,
@@ -799,6 +879,11 @@ impl GrpcService {
         task_tracker: TaskTracker,
         file_watcher: Arc<FileWatcher>,
         messages_rx: St,
+        dynamic_pre_accounts_program_ids: Arc<
+            arc_swap::ArcSwap<std::collections::HashSet<solana_pubkey::Pubkey>>,
+        >,
+        shm_state: Arc<arc_swap::ArcSwap<ShmSubscriptionState>>,
+        shm_path: Option<String>,
     ) -> anyhow::Result<GrpcServiceResult>
     where
         St: BatchStream<Item = Message> + Unpin + Send + 'static,
@@ -1016,6 +1101,9 @@ impl GrpcService {
             deshred_broadcast_tx: deshred_broadcast_tx.clone(),
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
+            dynamic_pre_accounts_program_ids,
+            shm_state,
+            shm_path,
             cancellation_token: service_cancellation_token.clone(),
             task_tracker: task_tracker.clone(),
             filter_name_size_limit: config.filter_name_size_limit,
@@ -2073,6 +2161,9 @@ impl Geyser for GrpcService {
             .unwrap_or_else(|| "".to_owned());
 
         let config_filter_limits = Arc::clone(&self.config_filter_limits);
+        let dyn_program_ids = Arc::clone(&self.dynamic_pre_accounts_program_ids);
+        let shm_state = Arc::clone(&self.shm_state);
+        let shm_path = self.shm_path.clone();
         let incoming_stream_tx = stream_tx.clone();
         let incoming_client_tx = client_tx;
         let incoming_cancellation_token = client_cancellation_token.child_token();
@@ -2095,6 +2186,9 @@ impl Geyser for GrpcService {
                     message = request.get_mut().message() => match message {
                         Ok(Some(request)) => {
                             filter_names.try_clean();
+
+                            Self::maybe_update_pre_accounts_program_ids(&request, &dyn_program_ids);
+                            Self::maybe_update_shm_subscription(&request, &shm_state, shm_path.as_deref());
 
                             if let Err(error) = match Filter::new(&request, &config_filter_limits, &mut filter_names) {
                                 Ok(filter) => {

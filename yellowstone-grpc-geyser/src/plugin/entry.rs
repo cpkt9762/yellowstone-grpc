@@ -10,6 +10,7 @@ use {
                 CommitmentLevel, Message, MessageAccount, MessageBlockMeta,
                 MessageDeshredTransaction, MessageEntry, MessageSlot, MessageTransaction,
             },
+            shm::ShmSubscriptionState,
         },
         stream::tokio::BatchStreamUnboundedReceiver,
     },
@@ -18,8 +19,10 @@ use {
         ReplicaDeshredTransactionInfoVersions, ReplicaEntryInfoVersions,
         ReplicaTransactionInfoVersions, Result as PluginResult, SlotStatus,
     },
+    arc_swap::ArcSwap,
     solana_pubkey::Pubkey,
     std::{
+        collections::HashSet,
         concat, env,
         str::FromStr,
         sync::{
@@ -47,7 +50,9 @@ pub struct PluginInner {
     block_reconstruction_channel: mpsc::UnboundedSender<BlockReconstructionMessage>, // block_reconstruction_loop
     broadcast_channel: broadcast::Sender<BroadcastedMessage>,                        // client_loop
     blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
-    pre_accounts_program_ids: Vec<Pubkey>,
+    dynamic_pre_accounts_program_ids: Arc<arc_swap::ArcSwap<HashSet<Pubkey>>>,
+    pub shm_state: Arc<arc_swap::ArcSwap<ShmSubscriptionState>>,
+    pub shm_path: Option<String>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     file_watcher: Arc<FileWatcher>,
@@ -117,7 +122,7 @@ impl GeyserPlugin for Plugin {
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
         let filter_limits = config.grpc.filter_limits.clone();
-        let pre_accounts_program_ids = config
+        let static_program_ids: HashSet<Pubkey> = config
             .grpc
             .pre_accounts_program_ids
             .iter()
@@ -128,7 +133,10 @@ impl GeyserPlugin for Plugin {
                     ),
                 })
             })
-            .collect::<PluginResult<Vec<_>>>()?;
+            .collect::<PluginResult<HashSet<_>>>()?;
+        let dynamic_pre_accounts_program_ids = Arc::new(ArcSwap::from_pointee(static_program_ids));
+        let shm_path = config.shm.as_ref().map(|cfg| cfg.shm_path.clone());
+        let shm_state = Arc::new(ArcSwap::from_pointee(ShmSubscriptionState::empty()));
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
@@ -168,6 +176,9 @@ impl GeyserPlugin for Plugin {
         let file_watcher = Arc::new(file_watcher);
         let geyser_svc_file_watcher = Arc::clone(&file_watcher);
         let (grpc_channel_tx, grpc_channel_receiver) = mpsc::unbounded_channel();
+        let dynamic_pre_accounts_for_grpc = Arc::clone(&dynamic_pre_accounts_program_ids);
+        let shm_state_for_grpc = Arc::clone(&shm_state);
+        let shm_path_for_grpc = shm_path.clone();
         let result = runtime.block_on(async move {
             static CRYPTO_PROVIDER_INIT: Once = Once::new();
 
@@ -191,6 +202,9 @@ impl GeyserPlugin for Plugin {
                 grpc_task_tracker,
                 geyser_svc_file_watcher,
                 grpc_channel_rx,
+                dynamic_pre_accounts_for_grpc,
+                shm_state_for_grpc,
+                shm_path_for_grpc,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
@@ -217,7 +231,9 @@ impl GeyserPlugin for Plugin {
             block_reconstruction_channel: grpc_service_result.block_reconstruction_tx,
             broadcast_channel: grpc_service_result.broadcast_tx,
             blocks_meta_tx: grpc_service_result.blocks_meta_tx,
-            pre_accounts_program_ids,
+            dynamic_pre_accounts_program_ids,
+            shm_state,
+            shm_path,
             plugin_cancellation_token,
             plugin_task_tracker,
             file_watcher,
@@ -271,6 +287,28 @@ impl GeyserPlugin for Plugin {
                 }
             }
 
+            let shm_guard = inner.shm_state.load();
+            if let Some(ref writer) = shm_guard.writer {
+                if let (Ok(pubkey_arr), Ok(owner_arr)) = (
+                    <&[u8; 32]>::try_from(account.pubkey),
+                    <&[u8; 32]>::try_from(account.owner),
+                ) {
+                    if shm_guard.accounts.contains(pubkey_arr) {
+                        if let Err(error) = writer.write_account(
+                            pubkey_arr,
+                            owner_arr,
+                            account.lamports,
+                            account.executable,
+                            account.rent_epoch,
+                            account.data,
+                            slot,
+                        ) {
+                            log::warn!("shm write failed: {error}");
+                        }
+                    }
+                }
+            }
+
             if is_startup {
                 if let Some(channel) = inner.snapshot_channel.lock().unwrap().as_ref() {
                     let message = Message::Account(Arc::new(MessageAccount::from_geyser(
@@ -312,6 +350,13 @@ impl GeyserPlugin for Plugin {
         status: &SlotStatus,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            if matches!(status, SlotStatus::Processed) {
+                let shm_guard = inner.shm_state.load();
+                if let Some(ref writer) = shm_guard.writer {
+                    writer.update_global_slot(slot);
+                }
+            }
+
             let message = Message::Slot(Arc::new(MessageSlot::from_geyser(slot, parent, status)));
             if matches!(
                 status,
@@ -395,8 +440,21 @@ impl GeyserPlugin for Plugin {
     fn pre_accounts_program_ids(&self) -> Vec<Pubkey> {
         self.inner
             .as_ref()
-            .map(|inner| inner.pre_accounts_program_ids.clone())
+            .map(|inner| {
+                inner
+                    .dynamic_pre_accounts_program_ids
+                    .load()
+                    .iter()
+                    .copied()
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    fn pre_accounts_program_ids_shared(&self) -> Option<Arc<ArcSwap<HashSet<Pubkey>>>> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.dynamic_pre_accounts_program_ids.clone())
     }
 
     fn notify_entry(&self, entry: ReplicaEntryInfoVersions) -> PluginResult<()> {
