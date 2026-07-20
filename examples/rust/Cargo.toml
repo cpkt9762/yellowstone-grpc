@@ -12,9 +12,14 @@ publish = { workspace = true }
 [[bin]]
 name = "client"
 
+[[bin]]
+name = "dump-tx"
+
 [dependencies]
 anyhow = { workspace = true }
 backoff = { workspace = true, features = ["tokio"] }
+base64 = { workspace = true }
+bincode = { workspace = true }
 bs58 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -25,6 +30,8 @@ indicatif = { workspace = true }
 log = { workspace = true }
 maplit = { workspace = true }
 serde_json = { workspace = true }
+solana-account = { workspace = true }
+solana-account-decoder = { workspace = true }
 solana-transaction-status = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }
 tonic = { workspace = true, features = ["zstd", "gzip", "tls-native-roots", "tls-ring"] }
