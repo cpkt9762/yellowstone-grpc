@@ -340,7 +340,7 @@ impl MessageTransactionInfo {
     }
 
     pub fn from_geyser_v4(info: &ReplicaTransactionInfoV4<'_>) -> Self {
-        let account_keys: HashSet<Pubkey> = info
+        let account_keys: FoldHashSet<Pubkey> = info
             .transaction
             .message
             .static_account_keys()
@@ -373,6 +373,8 @@ impl MessageTransactionInfo {
             index: info.index,
             account_keys,
             pre_encoded: OnceLock::new(),
+            token_owners_all: OnceLock::new(),
+            token_owners_changed: OnceLock::new(),
         }
     }
 
@@ -448,7 +450,7 @@ impl MessageTransaction {
 
     pub fn from_geyser_v4(info: &ReplicaTransactionInfoV4<'_>, slot: Slot) -> Self {
         Self {
-            transaction: Arc::new(MessageTransactionInfo::from_geyser_v4(info)),
+            transaction: MessageTransactionInfo::from_geyser_v4(info),
             slot,
             created_at: Timestamp::from(SystemTime::now()),
         }

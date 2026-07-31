@@ -3,7 +3,7 @@ use {
         metrics,
         plugin::{
             filter::{
-                encoder::{AccountEncoder, TransactionEncoder},
+                encoder::AccountEncoder,
                 name::FilterName,
                 FilterAccountsDataSlice,
             },
@@ -712,12 +712,6 @@ impl prost::Message for FilteredUpdateTransaction {
     fn clear(&mut self) {
         unimplemented!()
     }
-}
-
-fn transaction_return_encoded(pre_encoded: &[u8], tag: u32, buf: &mut impl BufMut) {
-    encode_key(tag, WireType::LengthDelimited, buf);
-    encode_varint(pre_encoded.len() as u64, buf);
-    buf.put_slice(pre_encoded);
 }
 
 impl FilteredUpdateTransaction {

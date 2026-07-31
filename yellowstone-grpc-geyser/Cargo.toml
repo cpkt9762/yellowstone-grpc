@@ -84,6 +84,7 @@ solana-transaction-status = { workspace = true }
 # Solana Misc
 smallvec = { workspace = true }
 solana-storage-proto = { workspace = true, optional = true }
+solana-shm-accounts = { workspace = true }
 spl-token-2022-interface = { workspace = true }
 
 # Yellowstone
@@ -95,7 +96,6 @@ yellowstone-grpc-tools = { workspace = true }
 # wrapped in mod cpu_core_affinity
 affinity = { workspace = true }
 
-solana-shm-accounts = { path = "../../solana-shm-accounts" }
 
 [[bench]]
 name = "encode"
