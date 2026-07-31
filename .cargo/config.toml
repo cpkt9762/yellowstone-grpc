@@ -1,8 +1,0 @@
-[target.x86_64-unknown-linux-gnu]
-linker = "../../.cross/x86_64-linux-gnu-gcc"
-rustflags = ["-Ctarget-cpu=x86-64-v2"]
-
-[env]
-CC_x86_64_unknown_linux_gnu = { value = "../../.cross/x86_64-linux-gnu-gcc", relative = true }
-PKG_CONFIG_SYSROOT_DIR = { value = "../../.cross/x86_64-linux-gnu-sysroot", relative = true }
-PKG_CONFIG_PATH_x86_64_unknown_linux_gnu = { value = "../../.cross/x86_64-linux-gnu-sysroot/usr/lib/x86_64-linux-gnu/pkgconfig", relative = true }

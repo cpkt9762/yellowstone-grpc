@@ -47,6 +47,7 @@ use {
         ServerConfig,
     },
     solana_clock::{BankId, Slot, MAX_RECENT_BLOCKHASHES},
+    solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
         io,
@@ -55,7 +56,6 @@ use {
         os::unix::fs::PermissionsExt,
         path::PathBuf,
         pin::Pin,
-        str::FromStr,
         sync::{
             atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex as StdMutex,
@@ -953,7 +953,7 @@ impl GrpcService {
         let mut accounts = std::collections::HashSet::<[u8; 32]>::new();
         for filter in request.accounts.values() {
             for account in &filter.account {
-                let pubkey = match Pubkey::from_str(account) {
+                let pubkey = match account.parse::<Pubkey>() {
                     Ok(pubkey) => pubkey,
                     Err(error) => {
                         log::warn!("failed to parse shm subscription pubkey {account:?}: {error}");
