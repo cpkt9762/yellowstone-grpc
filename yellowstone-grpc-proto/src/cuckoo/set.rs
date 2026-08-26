@@ -356,6 +356,7 @@ impl CompressedAccountFilterSet {
             account_required: vec![],
             cuckoo_account_include: Some(self.to_proto()),
             token_accounts: None,
+            include_pre_accounts: None,
         }
     }
 
