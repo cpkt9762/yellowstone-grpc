@@ -155,8 +155,11 @@ trivially_copy_pass_by_ref = "deny"
 collapsible_match = "allow"
 
 [patch.crates-io]
+agave-feature-set = { path = "../../feature-set" }
 agave-geyser-plugin-interface = { path = "../../geyser-plugin-interface" }
+agave-votor-messages = { path = "../../votor-messages" }
 solana-account-decoder = { path = "../../account-decoder" }
+solana-entry = { path = "../../entry" }
 solana-storage-proto = { path = "../../storage-proto" }
 solana-transaction-context = { path = "../../transaction-context" }
 solana-transaction-status = { path = "../../transaction-status" }
