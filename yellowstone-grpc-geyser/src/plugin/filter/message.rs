@@ -35,12 +35,15 @@ use {
         sync::Arc,
         time::SystemTime,
     },
-    yellowstone_grpc_proto::geyser::{
-        subscribe_update::UpdateOneof, SlotStatus as SlotStatusProto, SubscribeUpdate,
-        SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
-        SubscribeUpdateEntry, SubscribeUpdatePing, SubscribeUpdatePong, SubscribeUpdateSlot,
-        SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
-        SubscribeUpdateTransactionStatus,
+    yellowstone_grpc_proto::{
+        geyser::{
+            subscribe_update::UpdateOneof, SlotStatus as SlotStatusProto, SubscribeUpdate,
+            SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
+            SubscribeUpdateEntry, SubscribeUpdatePing, SubscribeUpdatePong, SubscribeUpdateSlot,
+            SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+            SubscribeUpdateTransactionStatus,
+        },
+        solana::storage::confirmed_block,
     },
 };
 
