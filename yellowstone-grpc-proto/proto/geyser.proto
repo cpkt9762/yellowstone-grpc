@@ -75,6 +75,10 @@ message SubscribeRequestFilterAccounts {
   optional bool nonempty_txn_signature = 5;
 
   optional CuckooFilter cuckoo_accounts_filter = 6;
+  // Fork-local (cpkt9762). When true, accounts listed explicitly in `account`
+  // are exempt from the server-side owner_reject drop for this filter.
+  // Absent/false keeps upstream behavior.
+  optional bool include_owner_rejected = 1001;
 }
 
 message SubscribeRequestFilterAccountsFilter {
@@ -204,8 +208,24 @@ message SubscribeUpdate {
     SubscribeUpdateEntry entry = 8;
     SubscribeUpdateBlockFooter block_footer = 12;
     SubscribeUpdateEntryUpdateParent entry_update_parent = 13;
+    // Fork-local (cpkt9762). Sent only to clients that opted in.
+    SubscribeUpdateOwnerRejectExemption owner_reject_exemption = 1001;
   }
   google.protobuf.Timestamp created_at = 11;
+}
+
+message SubscribeUpdateOwnerRejectExemption {
+  // Full current exempt set of this client after the latest accepted request.
+  repeated OwnerRejectExemptAccount accounts = 1;
+  // Owners in the server owner_reject list (base58), for client-side evidence.
+  repeated string owner_reject = 2;
+}
+
+message OwnerRejectExemptAccount {
+  string pubkey = 1; // base58
+  // Every write to this account at slot >= active_from_slot is delivered to
+  // this client; writes at earlier slots may have been dropped.
+  uint64 active_from_slot = 2;
 }
 
 message SubscribeUpdateAccount {
