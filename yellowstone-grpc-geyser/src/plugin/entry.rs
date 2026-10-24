@@ -13,6 +13,7 @@ use {
                 MessageDeshredTransaction, MessageDeshredUpdateParent, MessageEntry,
                 MessageEntryUpdateParent, MessageSlot, MessageTransaction,
             },
+            owner_reject::OwnerRejectRegistry,
             shm::ShmSubscriptionState,
         },
         stream::tokio::BatchStreamUnboundedReceiver,
@@ -60,6 +61,7 @@ pub struct PluginInner {
     dynamic_pre_accounts_program_ids: Arc<arc_swap::ArcSwap<HashSet<Pubkey>>>,
     pub shm_state: Arc<arc_swap::ArcSwap<ShmSubscriptionState>>,
     pub shm_path: Option<String>,
+    owner_reject_registry: Arc<OwnerRejectRegistry>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     file_watcher: Arc<FileWatcher>,
@@ -267,6 +269,7 @@ impl GeyserPlugin for Plugin {
             dynamic_pre_accounts_program_ids,
             shm_state,
             shm_path,
+            owner_reject_registry: grpc_service_result.owner_reject_registry,
             plugin_cancellation_token,
             plugin_task_tracker,
             file_watcher,
@@ -359,9 +362,19 @@ impl GeyserPlugin for Plugin {
             };
 
             if let Ok(owner) = Pubkey::try_from(account.owner) {
-                // Drop accounts from owners in the drop list, even during startup.
+                // Only explicitly registered live accounts can bypass the owner drop.
                 if inner.filter_limits.accounts.owner_reject.contains(&owner) {
-                    incr_geyser_event_dropped("account");
+                    let pubkey = Pubkey::try_from(account.pubkey)
+                        .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
+                    if inner.owner_reject_registry.allows(&pubkey, slot) {
+                        // Exempt updates are gRPC-only; never mirror them to SHM.
+                        let mut message =
+                            MessageAccount::from_geyser(account, slot, false, Some(bank_id));
+                        message.owner_reject_exempt = true;
+                        inner.send_message(Message::Account(Arc::new(message)));
+                    } else {
+                        incr_geyser_event_dropped("account");
+                    }
                     return Ok(());
                 }
             }

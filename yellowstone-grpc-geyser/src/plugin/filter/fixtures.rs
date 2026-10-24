@@ -83,6 +83,7 @@ pub fn message_account(account: MessageAccountInfo) -> Arc<MessageAccount> {
         account,
         slot: 100,
         is_startup: false,
+        owner_reject_exempt: false,
         created_at: Timestamp::default(),
         bank_id: Some(100),
     })

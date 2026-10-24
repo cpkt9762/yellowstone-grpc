@@ -223,6 +223,8 @@ pub struct MessageAccount {
     pub account: MessageAccountInfo,
     pub slot: Slot,
     pub is_startup: bool,
+    /// Internal only: never changes account wire encoding or SHM behavior.
+    pub owner_reject_exempt: bool,
     // startup account update has no bank id.
     pub bank_id: Option<BankId>,
     pub created_at: Timestamp,
@@ -245,6 +247,7 @@ impl MessageAccount {
             account: MessageAccountInfo::from_geyser(info),
             slot,
             is_startup,
+            owner_reject_exempt: false,
             bank_id,
             created_at: Timestamp::from(SystemTime::now()),
         }
