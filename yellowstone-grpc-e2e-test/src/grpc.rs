@@ -269,7 +269,9 @@ impl GeyserEventAdapter for E2EGeyserEventAdapter {
             // A block repeats content the block machine rebuilds itself, and an UpdateParent
             // has no counterpart in its abstraction.
             UpdateOneof::Block(_) | UpdateOneof::EntryUpdateParent(_) => None,
-            UpdateOneof::Ping(_) | UpdateOneof::Pong(_) => None,
+            UpdateOneof::Ping(_)
+            | UpdateOneof::Pong(_)
+            | UpdateOneof::OwnerRejectExemption(_) => None,
         }
     }
 }
