@@ -26,6 +26,7 @@ use {
             message::{
                 CommitmentLevel, Message, MessageBlock, MessageBlockMeta, MessageSlot, SlotStatus,
             },
+            owner_reject::{OwnerRejectRegistry, OwnerRejectSubscription},
             proto::geyser_server::{Geyser, GeyserServer},
             shm::{open_and_validate_shm, ShmSubscriptionState},
         },
@@ -478,6 +479,9 @@ enum HeldMessage<'a> {
 fn route_held<'a>(held: &mut Vec<BankId>, message: &'a Message) -> HeldMessage<'a> {
     let (bank_id, block) = match message {
         Message::Slot(slot) if slot.status == SlotStatus::CreatedBank => (slot.bank_id, None),
+        // Exempt writes are not in a sealed block's account list. Passing them
+        // live is required even if an earlier ordinary replay holds this bank.
+        Message::Account(account) if account.owner_reject_exempt => return HeldMessage::Pass,
         Message::Account(account) => (account.bank_id, None),
         Message::Transaction(transaction) => (Some(transaction.bank_id), None),
         Message::Entry(entry) => (Some(entry.bank_id), None),
@@ -594,6 +598,8 @@ struct ClientSession {
     subscriber_id: String,
     endpoint: String,
     filter: Filter,
+    owner_reject: OwnerRejectSubscription,
+    owner_reject_owners: Vec<Pubkey>,
     cancellation_token: CancellationToken,
     disconnect_reason: &'static str,
     /// Must own it so that when the session is dropped, the subscription count is decremented.
@@ -617,10 +623,32 @@ impl ClientSession {
             subscriber_id,
             endpoint,
             filter,
+            owner_reject: OwnerRejectSubscription::new(Arc::new(OwnerRejectRegistry::default())),
+            owner_reject_owners: Vec::new(),
             cancellation_token,
             disconnect_reason: "unknown",
             _subscription_permit: subscription_permit,
         }
+    }
+
+    fn install_filter(&mut self, new_filter: Filter) -> anyhow::Result<Option<FilteredUpdate>> {
+        let opt_in = new_filter.owner_reject_opt_in();
+        let update = self
+            .owner_reject
+            .prepare(&new_filter.owner_reject_accounts())?;
+        // Registration and filter installation are synchronous in the consumer:
+        // no broadcast can be consumed between insert/read-max and set_filter.
+        // The commitment receiver must already be subscribed before this call.
+        // Every callback admitted after registration (and every later synthesized
+        // Confirmed/Finalized update) is therefore evaluated under the new filter.
+        self.set_filter(new_filter);
+        self.owner_reject.commit(update);
+        Ok(opt_in.then(|| {
+            FilteredUpdate::new_empty(FilteredUpdateOneof::OwnerRejectExemption(
+                self.owner_reject
+                    .notification(self.owner_reject_owners.iter().copied()),
+            ))
+        }))
     }
 
     fn set_filter(&mut self, new_filter: Filter) {
@@ -762,6 +790,7 @@ pub struct GrpcService {
         Arc<arc_swap::ArcSwap<std::collections::HashSet<solana_pubkey::Pubkey>>>,
     shm_state: Arc<arc_swap::ArcSwap<ShmSubscriptionState>>,
     shm_path: Option<String>,
+    owner_reject_registry: Arc<OwnerRejectRegistry>,
     cancellation_token: CancellationToken,
     task_tracker: TaskTracker,
     filter_name_size_limit: usize,
@@ -910,6 +939,7 @@ pub struct GrpcServiceResult {
     pub contact_info_tx: mpsc::UnboundedSender<contact_info::ContactInfoNotification>,
     pub broadcast: SubscriberChannels,
     pub blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
+    pub owner_reject_registry: Arc<OwnerRejectRegistry>,
 }
 
 impl GrpcService {
@@ -1004,6 +1034,7 @@ impl GrpcService {
     where
         St: BatchStream<Item = Message> + Unpin + Send + 'static,
     {
+        let owner_reject_registry = Arc::new(OwnerRejectRegistry::default());
         // Bind all configured addresses (TCP or Unix domain socket)
         let mut listeners = Vec::new();
 
@@ -1239,6 +1270,7 @@ impl GrpcService {
             dynamic_pre_accounts_program_ids,
             shm_state,
             shm_path,
+            owner_reject_registry: Arc::clone(&owner_reject_registry),
             cancellation_token: service_cancellation_token.clone(),
             task_tracker: task_tracker.clone(),
             filter_name_size_limit: config.filter_name_size_limit,
@@ -1363,6 +1395,7 @@ impl GrpcService {
             contact_info_tx,
             broadcast,
             blocks_meta_tx,
+            owner_reject_registry,
         })
     }
 
@@ -1732,6 +1765,29 @@ impl GrpcService {
 
         let mut commitment = session.filter.get_commitment_level();
         let mut messages_rx = broadcast.subscribe(commitment);
+        // A startup subscriber installs its first filter in snapshot replay.
+        // Activate only now: live broadcasts can be consumed from this point on.
+        if session.filter.owner_reject_opt_in() {
+            match session.install_filter(session.filter.clone()) {
+                Ok(Some(notification)) => {
+                    if tokio::select! {
+                        _ = cancellation_token.cancelled() => true,
+                        result = stream_tx.send(Ok(notification)) => result.is_err(),
+                    } {
+                        session.disconnect_reason = "client_closed";
+                        return;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = stream_tx
+                        .send(Err(Status::invalid_argument(error.to_string())))
+                        .await;
+                    session.disconnect_reason = "owner_reject_registration";
+                    return;
+                }
+            }
+        }
         let mut held_banks: Vec<BankId> = Vec::new();
 
         'outer: loop {
@@ -1765,14 +1821,29 @@ impl GrpcService {
 
                     match message {
                         Some(Some((from_slot, filter_new))) => {
-                            session.set_filter(filter_new);
-                            info!("client #{}: filter updated", session.subscriber_id);
-
-                            let commitment_new = session.filter.get_commitment_level();
+                            let commitment_new = filter_new.get_commitment_level();
                             if commitment_new != commitment {
                                 commitment = commitment_new;
                                 messages_rx = broadcast.subscribe(commitment);
                                 held_banks.clear();
+                            }
+                            let notification = match session.install_filter(filter_new) {
+                                Ok(notification) => notification,
+                                Err(error) => {
+                                    let _ = stream_tx.send(Err(Status::invalid_argument(error.to_string()))).await;
+                                    session.disconnect_reason = "owner_reject_registration";
+                                    break 'outer;
+                                }
+                            };
+                            info!("client #{}: filter updated", session.subscriber_id);
+                            if let Some(notification) = notification {
+                                if tokio::select! {
+                                    _ = cancellation_token.cancelled() => true,
+                                    result = stream_tx.send(Ok(notification)) => result.is_err(),
+                                } {
+                                    session.disconnect_reason = "client_closed";
+                                    break 'outer;
+                                }
                             }
 
                             if let Some(from_slot) = from_slot {
@@ -2460,13 +2531,22 @@ impl Geyser for GrpcService {
             }
         });
 
-        let client_session = ClientSession::new(
+        let mut client_session = ClientSession::new(
             id,
             subscriber_id.clone(),
             endpoint.clone(),
             client_cancellation_token,
             subscription_permit,
         );
+        client_session.owner_reject =
+            OwnerRejectSubscription::new(Arc::clone(&self.owner_reject_registry));
+        client_session.owner_reject_owners = self
+            .config_filter_limits
+            .accounts
+            .owner_reject
+            .iter()
+            .copied()
+            .collect();
         self.task_tracker.spawn(Self::client_loop(
             client_session,
             stream_tx,
@@ -2868,9 +2948,10 @@ mod tests {
         assert_eq!(scales.weight(&account_update), 4);
         assert_eq!(default_scales.weight(&account_update), 1);
         assert_eq!(
-            scales.weight(&update(
-                FilteredUpdateOneof::transaction(test_transaction(), false)
-            )),
+            scales.weight(&update(FilteredUpdateOneof::transaction(
+                test_transaction(),
+                false
+            ))),
             5
         );
         assert_eq!(
@@ -3016,8 +3097,12 @@ mod tests {
         };
         let units = |len: usize| u32::try_from((len / 64).max(1)).unwrap();
         let transaction = test_transaction();
-        let transaction_update =
-            || update(FilteredUpdateOneof::transaction(Arc::clone(&transaction), false));
+        let transaction_update = || {
+            update(FilteredUpdateOneof::transaction(
+                Arc::clone(&transaction),
+                false,
+            ))
+        };
 
         assert_eq!(scales.weight(&transaction_update()), 4);
 
@@ -4182,6 +4267,165 @@ mod tests {
         // The tracker should remain empty since no increment happened.
         {
             let _session = ClientSession::new(0, None, "".into(), CancellationToken::new(), None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_reject_tests {
+    use {
+        super::*,
+        crate::plugin::filter::fixtures,
+        prost::Message as _,
+        yellowstone_grpc_proto::prelude::{SubscribeRequestFilterAccounts, SubscribeUpdate},
+    };
+
+    fn filter(key: Pubkey, opt_in: bool, commitment: CommitmentLevel) -> Filter {
+        Filter::new(
+            &SubscribeRequest {
+                accounts: HashMap::from([(
+                    "key".to_owned(),
+                    SubscribeRequestFilterAccounts {
+                        account: vec![key.to_string()],
+                        include_owner_rejected: Some(opt_in),
+                        ..Default::default()
+                    },
+                )]),
+                commitment: Some(commitment as i32),
+                ..Default::default()
+            },
+            &FilterLimits::default(),
+            &mut fixtures::filter_names(),
+        )
+        .expect("valid account filter")
+    }
+
+    #[test]
+    fn owner_reject_activation_occurs_only_when_consumer_installs_filter() {
+        let registry = Arc::new(OwnerRejectRegistry::default());
+        let key = Pubkey::new_unique();
+        let mut session =
+            ClientSession::new(0, None, String::new(), CancellationToken::new(), None);
+        session.owner_reject = OwnerRejectSubscription::new(Arc::clone(&registry));
+        session.owner_reject_owners = vec![Pubkey::default()];
+        let ordinary =
+            Message::Account(fixtures::simple_message_account(key, Pubkey::new_unique()));
+        session
+            .install_filter(filter(key, false, CommitmentLevel::Processed))
+            .expect("old filter installation");
+        assert_eq!(session.filter.get_updates(&ordinary, None).len(), 1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(filter(key, true, CommitmentLevel::Processed))
+            .expect("queue new filter");
+        assert!(
+            !registry.allows(&key, 90),
+            "queued filters must not register exemptions"
+        );
+        assert_eq!(
+            session.filter.get_updates(&ordinary, None).len(),
+            1,
+            "old filter still active"
+        );
+        let mut flagged = if let Message::Account(account) = &ordinary {
+            (**account).clone()
+        } else {
+            panic!("account");
+        };
+        flagged.owner_reject_exempt = true;
+        let flagged = Message::Account(Arc::new(flagged));
+        let mut held_banks = vec![100];
+        assert!(matches!(
+            route_held(&mut held_banks, &flagged),
+            HeldMessage::Pass
+        ));
+        assert_eq!(
+            held_banks,
+            [100],
+            "exempt writes bypass ordinary replay holds"
+        );
+        assert!(session.filter.get_updates(&flagged, None).is_empty());
+        let ack = session
+            .install_filter(rx.try_recv().expect("new queued filter"))
+            .expect("new filter installation")
+            .expect("opt-in acknowledgement");
+        let encoded = ack.encode_to_vec();
+        assert_eq!(encoded.len(), ack.encoded_len());
+        let decoded = SubscribeUpdate::decode(encoded.as_slice())
+            .expect("decode custom notification encoder");
+        assert_eq!(decoded, ack.as_subscribe_update());
+        let FilteredUpdateOneof::OwnerRejectExemption(ack) = ack.message else {
+            panic!("expected exemption ack");
+        };
+        assert_eq!(ack.accounts[0].active_from_slot, 91);
+        assert_eq!(ack.owner_reject, [Pubkey::default().to_string()]);
+        assert!(registry.allows(&key, 91));
+        assert_eq!(session.filter.get_updates(&flagged, None).len(), 1);
+        session
+            .install_filter(filter(key, false, CommitmentLevel::Processed))
+            .expect("remove exemption");
+        assert!(!registry.allows(&key, 92));
+        assert!(session.filter.get_updates(&flagged, None).is_empty());
+        assert_eq!(session.filter.get_updates(&ordinary, None).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn owner_reject_client_stream_all_commitments_and_disconnect() {
+        for commitment in [
+            CommitmentLevel::Processed,
+            CommitmentLevel::Confirmed,
+            CommitmentLevel::Finalized,
+        ] {
+            let key = Pubkey::new_unique();
+            let registry = Arc::new(OwnerRejectRegistry::default());
+            assert!(!registry.allows(&key, 100));
+            let mut session =
+                ClientSession::new(0, None, String::new(), CancellationToken::new(), None);
+            session.owner_reject = OwnerRejectSubscription::new(Arc::clone(&registry));
+            let (stream_tx, mut stream_rx) = load_aware_channel(100, WeightScales::default());
+            let (client_tx, client_rx) = mpsc::unbounded_channel();
+            let broadcast = SubscriberChannels::new(100, 100, 100);
+            let handle = tokio::spawn(GrpcService::client_loop(
+                session,
+                stream_tx,
+                client_rx,
+                None,
+                broadcast.clone(),
+                None,
+                TaskTracker::new(),
+                None,
+            ));
+            client_tx
+                .send(Some((None, filter(key, true, commitment))))
+                .expect("queue filter");
+            let ack = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+                .await
+                .expect("ack timeout")
+                .expect("open stream")
+                .expect("valid notification");
+            assert!(matches!(
+                ack.message,
+                FilteredUpdateOneof::OwnerRejectExemption(_)
+            ));
+            assert!(registry.allows(&key, 101));
+            let mut account = fixtures::simple_message_account(key, Pubkey::default());
+            Arc::make_mut(&mut account).owner_reject_exempt = true;
+            broadcast.send(commitment, Arc::new(vec![Message::Account(account)]));
+            let update = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
+                .await
+                .expect("account timeout")
+                .expect("open stream")
+                .expect("valid account");
+            assert_eq!(update.as_subscribe_update().filters, ["key"]);
+            assert!(matches!(update.message, FilteredUpdateOneof::Account(_)));
+            drop(client_tx);
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("disconnect timeout")
+                .expect("client task completed");
+            assert!(
+                !registry.allows(&key, 102),
+                "disconnect releases all exemptions"
+            );
         }
     }
 }

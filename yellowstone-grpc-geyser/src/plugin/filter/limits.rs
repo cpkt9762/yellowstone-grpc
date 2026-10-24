@@ -10,6 +10,8 @@ pub enum FilterLimitsCheckError {
     Max { max: usize },
     #[error("Subscribe on full stream with `any` is not allowed, at least one filter required")]
     Any,
+    #[error("owner_reject exemption limit {max} exceeded: requested {requested} unique accounts")]
+    OwnerRejectExemptMax { max: usize, requested: usize },
     #[error("Max amount of Pubkeys reached, only {max} allowed")]
     MaxPubkey { max: usize },
     #[error("Pubkey {pubkey} in filters is not allowed")]
@@ -77,6 +79,8 @@ pub struct FilterLimitsAccounts {
     pub account_max: usize,
     #[serde(deserialize_with = "deserialize_pubkey_set")]
     pub account_reject: FoldHashSet<Pubkey>,
+    /// Fork-local total unique owner-reject exemptions per client.
+    pub owner_reject_exempt_max: usize,
     pub owner_max: usize,
     #[serde(deserialize_with = "deserialize_pubkey_set")]
     pub owner_reject: FoldHashSet<Pubkey>,
@@ -91,6 +95,7 @@ impl Default for FilterLimitsAccounts {
             any: true,
             account_max: usize::MAX,
             account_reject: FoldHashSet::new(),
+            owner_reject_exempt_max: 1000,
             owner_max: usize::MAX,
             owner_reject: FoldHashSet::new(),
             data_slice_max: usize::MAX,

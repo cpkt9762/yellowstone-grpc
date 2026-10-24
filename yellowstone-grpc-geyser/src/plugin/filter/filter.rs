@@ -91,6 +91,8 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum FilterError {
+    #[error("owner_reject opt-in cannot be combined with from_slot: exemption history is not replayable")]
+    OwnerRejectReplay,
     #[error(transparent)]
     Name(#[from] FilterNameError),
     #[error(transparent)]
@@ -237,6 +239,14 @@ impl Filter {
         limits: &FilterLimits,
         names: &mut FilterNames,
     ) -> FilterResult<Self> {
+        if config.from_slot.is_some()
+            && config
+                .accounts
+                .values()
+                .any(|filter| filter.include_owner_rejected == Some(true))
+        {
+            return Err(FilterError::OwnerRejectReplay);
+        }
         Ok(Self {
             accounts: FilterAccounts::new(&config.accounts, &limits.accounts, names)?,
             slots: FilterSlots::new(&config.slots, &limits.slots, names)?,
@@ -477,6 +487,21 @@ impl Filter {
         Ok(())
     }
 
+    pub const fn owner_reject_opt_in(&self) -> bool {
+        self.accounts.owner_reject_opt_in
+    }
+
+    pub fn owner_reject_accounts(&self) -> std::collections::HashSet<Pubkey> {
+        self.accounts
+            .aggregates()
+            .iter()
+            .filter(|aggregate| aggregate.include_owner_rejected)
+            .filter_map(|aggregate| aggregate.accounts.as_ref())
+            .flatten()
+            .copied()
+            .collect()
+    }
+
     pub fn get_pong_msg(&self) -> Option<FilteredUpdate> {
         self.ping
             .map(|id| FilteredUpdate::new_empty(FilteredUpdateOneof::pong(id)))
@@ -490,6 +515,7 @@ impl Filter {
 struct FilterAccountAggregate {
     pub filter_name: FilterName,
     pub txn_signature: Option<bool>,
+    pub include_owner_rejected: bool,
     pub accounts: Option<FoldHashSet<Pubkey>>,
     pub accounts_cuckoo: Option<Arc<CuckooFilter<[u8; 32]>>>,
     pub owners: Option<FoldHashSet<Pubkey>>,
@@ -501,6 +527,7 @@ impl FilterAccountAggregate {
         Self {
             filter_name,
             txn_signature: None,
+            include_owner_rejected: false,
             accounts: None,
             accounts_cuckoo: None,
             owners: None,
@@ -1263,6 +1290,7 @@ impl FilterAccountsStrategy {
 #[derive(Debug, Default, Clone)]
 struct FilterAccounts {
     strategy: FilterAccountsStrategy,
+    owner_reject_opt_in: bool,
 }
 
 impl FilterAccounts {
@@ -1286,6 +1314,7 @@ impl FilterAccounts {
 
             let filter_name = names.get(name)?;
             let mut filter_aggregate = FilterAccountAggregate::new(filter_name);
+            filter_aggregate.include_owner_rejected = filter.include_owner_rejected == Some(true);
 
             if filter.nonempty_txn_signature.is_some() {
                 filter_aggregate.txn_signature = filter.nonempty_txn_signature;
@@ -1321,8 +1350,26 @@ impl FilterAccounts {
             aggregates.push(filter_aggregate);
         }
 
+        let requested = aggregates
+            .iter()
+            .filter(|aggregate| aggregate.include_owner_rejected)
+            .filter_map(|aggregate| aggregate.accounts.as_ref())
+            .flatten()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if requested > limits.owner_reject_exempt_max {
+            return Err(FilterLimitsCheckError::OwnerRejectExemptMax {
+                max: limits.owner_reject_exempt_max,
+                requested,
+            }
+            .into());
+        }
         Ok(Self {
             strategy: FilterAccountsStrategy::build(aggregates),
+            owner_reject_opt_in: configs
+                .values()
+                .any(|filter| filter.include_owner_rejected == Some(true)),
         })
     }
 
@@ -1335,7 +1382,24 @@ impl FilterAccounts {
         message: &Arc<MessageAccount>,
         accounts_data_slice: &FilterAccountsDataSlice,
     ) -> FilteredUpdates {
-        let filters = self.strategy.get_filters(&message.account);
+        let filters = if message.owner_reject_exempt {
+            // Never grant exemptions through owner, cuckoo, or state-only matches.
+            // The explicit account check is an additional AND; all original
+            // conditions (including owner, memcmp and lamports) still apply.
+            self.aggregates()
+                .iter()
+                .filter(|aggregate| {
+                    aggregate.include_owner_rejected
+                        && aggregate
+                            .accounts
+                            .as_ref()
+                            .is_some_and(|accounts| accounts.contains(&message.account.pubkey))
+                })
+                .filter_map(|aggregate| aggregate.match_filter(&message.account, Some(true), None))
+                .collect()
+        } else {
+            self.strategy.get_filters(&message.account)
+        };
 
         filtered_updates_once_owned!(
             filters,
@@ -1802,7 +1866,10 @@ impl FilterTransactions {
                     FilteredUpdateOneof::transaction(Arc::clone(message), include_pre_accounts)
                 }
                 FilterTransactionsType::TransactionStatus => {
-                    FilteredUpdateOneof::transaction_status(Arc::clone(message), include_pre_accounts)
+                    FilteredUpdateOneof::transaction_status(
+                        Arc::clone(message),
+                        include_pre_accounts,
+                    )
                 }
             },
             message.created_at
@@ -2278,7 +2345,9 @@ impl FilterBlocks {
                     .accounts
                     .iter()
                     .filter_map(|account| {
-                        if inner.matches_account(&account.account.pubkey) {
+                        if !account.owner_reject_exempt
+                            && inner.matches_account(&account.account.pubkey)
+                        {
                             accounts_data_len += account.account.data.len();
                             Some(Arc::clone(account))
                         } else {
@@ -2826,6 +2895,7 @@ mod tests {
             },
             slot: 100,
             is_startup: false,
+            owner_reject_exempt: false,
             created_at: Timestamp::from(SystemTime::now()),
             bank_id: Some(100),
         })
@@ -4074,6 +4144,7 @@ mod account_filter_regression_tests {
             account,
             slot: 42,
             is_startup: false,
+            owner_reject_exempt: false,
             created_at: Timestamp::default(),
             bank_id: Some(42),
         });
@@ -4200,7 +4271,7 @@ mod account_filter_regression_tests {
             (
                 "combined".to_owned(),
                 SubscribeRequestFilterAccounts {
-                include_owner_rejected: None,
+                    include_owner_rejected: None,
                     nonempty_txn_signature: Some(true),
                     account: vec![account.to_string()],
                     owner: vec![owner.to_string()],
@@ -4912,7 +4983,7 @@ mod parity_oracle {
             accounts.insert(
                 format!("filter-{i}"),
                 SubscribeRequestFilterAccounts {
-                include_owner_rejected: None,
+                    include_owner_rejected: None,
                     account,
                     owner,
                     filters: gen_state_filters(rng, fixtures::TOKEN_ACCOUNT_LEN),
@@ -6640,7 +6711,7 @@ mod cuckoo_tests {
             tx_filters.insert(
                 "f".to_owned(),
                 SubscribeRequestFilterTransactions {
-                include_pre_accounts: None,
+                    include_pre_accounts: None,
                     vote: None,
                     failed: None,
                     signature: None,
@@ -6856,5 +6927,198 @@ mod cuckoo_tests {
             );
             assert!(tx.transaction.token_owners_changed.get().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_reject_tests {
+    use {
+        super::*,
+        crate::plugin::filter::fixtures,
+        yellowstone_grpc_proto::prelude::{
+            subscribe_request_filter_accounts_filter,
+            subscribe_request_filter_accounts_filter_memcmp,
+            SubscribeRequestFilterAccountsFilterMemcmp,
+        },
+    };
+
+    fn request(key: Pubkey, opt_in: Option<bool>) -> SubscribeRequest {
+        SubscribeRequest {
+            accounts: HashMap::from([(
+                "explicit".to_owned(),
+                SubscribeRequestFilterAccounts {
+                    account: vec![key.to_string()],
+                    include_owner_rejected: opt_in,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn owner_reject_delivery_requires_opt_in_explicit_key_and_all_conditions() {
+        let key = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let mut message = fixtures::simple_message_account(key, owner);
+        Arc::make_mut(&mut message).owner_reject_exempt = true;
+        let message = Message::Account(message);
+        for opt_in in [None, Some(false), Some(true)] {
+            let mut config = request(key, opt_in);
+            config.accounts.insert(
+                "owner-only".to_owned(),
+                SubscribeRequestFilterAccounts {
+                    owner: vec![owner.to_string()],
+                    include_owner_rejected: Some(true),
+                    ..Default::default()
+                },
+            );
+            config.accounts.insert(
+                "state-only".to_owned(),
+                SubscribeRequestFilterAccounts {
+                    filters: vec![SubscribeRequestFilterAccountsFilter {
+                        filter: Some(subscribe_request_filter_accounts_filter::Filter::Datasize(
+                            0,
+                        )),
+                    }],
+                    include_owner_rejected: Some(true),
+                    ..Default::default()
+                },
+            );
+            let mut cuckoo =
+                yellowstone_grpc_proto::cuckoo::CompressedAccountFilterSet::with_capacity(1)
+                    .expect("cuckoo test capacity");
+            cuckoo.insert(key).expect("insert matching key");
+            let mut cuckoo_only = cuckoo.to_account_filter();
+            cuckoo_only.include_owner_rejected = Some(true);
+            config
+                .accounts
+                .insert("cuckoo-only".to_owned(), cuckoo_only);
+            let filter = Filter::new(
+                &config,
+                &FilterLimits::default(),
+                &mut fixtures::filter_names(),
+            )
+            .expect("valid explicit and owner filters");
+            let updates = filter.get_updates(&message, None);
+            if opt_in == Some(true) {
+                assert_eq!(updates.len(), 1);
+                assert_eq!(updates[0].as_subscribe_update().filters, ["explicit"]);
+            } else {
+                assert!(updates.is_empty());
+            }
+        }
+        let mut config = request(key, Some(true));
+        config
+            .accounts
+            .get_mut("explicit")
+            .expect("explicit filter")
+            .filters
+            .push(SubscribeRequestFilterAccountsFilter {
+                filter: Some(subscribe_request_filter_accounts_filter::Filter::Memcmp(
+                    SubscribeRequestFilterAccountsFilterMemcmp {
+                        offset: 0,
+                        data: Some(
+                            subscribe_request_filter_accounts_filter_memcmp::Data::Bytes(vec![1]),
+                        ),
+                    },
+                )),
+            });
+        let filter = Filter::new(
+            &config,
+            &FilterLimits::default(),
+            &mut fixtures::filter_names(),
+        )
+        .expect("valid memcmp filter");
+        assert!(filter.get_updates(&message, None).is_empty());
+        let filter = Filter::new(
+            &request(Pubkey::new_unique(), Some(true)),
+            &FilterLimits::default(),
+            &mut fixtures::filter_names(),
+        )
+        .expect("valid different explicit address");
+        assert!(filter.get_updates(&message, None).is_empty());
+    }
+
+    #[test]
+    fn owner_reject_unique_limit_and_replay_validation() {
+        let key = Pubkey::new_unique();
+        let mut config = request(key, Some(true));
+        let mut limits = FilterLimits::default();
+        limits.accounts.owner_reject_exempt_max = 1;
+        config
+            .accounts
+            .insert("duplicate".to_owned(), config.accounts["explicit"].clone());
+        let filter = Filter::new(&config, &limits, &mut fixtures::filter_names())
+            .expect("deduplicate keys across names");
+        assert_eq!(filter.owner_reject_accounts().len(), 1);
+        config
+            .accounts
+            .get_mut("duplicate")
+            .expect("duplicate filter")
+            .account = vec![Pubkey::new_unique().to_string()];
+        let error = Filter::new(&config, &limits, &mut fixtures::filter_names())
+            .expect_err("reject two unique exemptions");
+        assert!(error.to_string().contains("limit 1"));
+        assert!(error.to_string().contains("requested 2"));
+        config.from_slot = Some(1);
+        assert!(matches!(
+            Filter::new(&config, &limits, &mut fixtures::filter_names()),
+            Err(FilterError::OwnerRejectReplay)
+        ));
+        for filter in config.accounts.values_mut() {
+            filter.include_owner_rejected = None;
+        }
+        Filter::new(&config, &limits, &mut fixtures::filter_names())
+            .expect("upstream replay unaffected");
+        let omitted: FilterLimitsAccounts = serde_json::from_str("{}").expect("old config loads");
+        assert_eq!(omitted.owner_reject_exempt_max, 1000);
+        let explicit: FilterLimitsAccounts =
+            serde_json::from_str("{\"owner_reject_exempt_max\":17}").expect("new limit loads");
+        assert_eq!(explicit.owner_reject_exempt_max, 17);
+    }
+
+    #[test]
+    fn owner_reject_block_accounts_exclude_flagged_writes() {
+        let normal = fixtures::simple_message_account(Pubkey::new_unique(), Pubkey::new_unique());
+        let mut exempt =
+            fixtures::simple_message_account(Pubkey::new_unique(), Pubkey::new_unique());
+        Arc::make_mut(&mut exempt).owner_reject_exempt = true;
+        let config = SubscribeRequest {
+            blocks: HashMap::from([(
+                "block".to_owned(),
+                SubscribeRequestFilterBlocks {
+                    include_accounts: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let filter = Filter::new(
+            &config,
+            &FilterLimits::default(),
+            &mut fixtures::filter_names(),
+        )
+        .expect("block filter");
+        let updates = filter.get_updates(
+            &Message::Block(fixtures::message_block(
+                100,
+                vec![],
+                vec![Arc::clone(&normal), exempt],
+                vec![],
+            )),
+            None,
+        );
+        let update = updates[0].as_subscribe_update();
+        let Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::Block(block)) =
+            update.update_oneof
+        else {
+            panic!("expected block");
+        };
+        assert_eq!(block.accounts.len(), 1);
+        assert_eq!(
+            block.accounts[0].pubkey.as_slice(),
+            normal.account.pubkey.as_ref()
+        );
     }
 }

@@ -2,11 +2,7 @@ use {
     crate::{
         metrics,
         plugin::{
-            filter::{
-                encoder::AccountEncoder,
-                name::FilterName,
-                FilterAccountsDataSlice,
-            },
+            filter::{encoder::AccountEncoder, name::FilterName, FilterAccountsDataSlice},
             message::{
                 MessageAccount, MessageAccountInfo, MessageBlockFooter, MessageBlockMeta,
                 MessageDeshredTransaction, MessageDeshredTransactionInfo,
@@ -39,9 +35,9 @@ use {
         geyser::{
             subscribe_update::UpdateOneof, SlotStatus as SlotStatusProto, SubscribeUpdate,
             SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
-            SubscribeUpdateEntry, SubscribeUpdatePing, SubscribeUpdatePong, SubscribeUpdateSlot,
-            SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
-            SubscribeUpdateTransactionStatus,
+            SubscribeUpdateEntry, SubscribeUpdateOwnerRejectExemption, SubscribeUpdatePing,
+            SubscribeUpdatePong, SubscribeUpdateSlot, SubscribeUpdateTransaction,
+            SubscribeUpdateTransactionInfo, SubscribeUpdateTransactionStatus,
         },
         solana::storage::confirmed_block,
     },
@@ -182,7 +178,8 @@ impl WeightScales {
             FilteredUpdateOneof::TransactionStatus(_)
             | FilteredUpdateOneof::BlockMeta(_)
             | FilteredUpdateOneof::Ping
-            | FilteredUpdateOneof::Pong(_) => 1,
+            | FilteredUpdateOneof::Pong(_)
+            | FilteredUpdateOneof::OwnerRejectExemption(_) => 1,
         };
         scale.max(1)
     }
@@ -365,6 +362,9 @@ impl FilteredUpdate {
             }),
             FilteredUpdateOneof::Ping => UpdateOneof::Ping(SubscribeUpdatePing {}),
             FilteredUpdateOneof::Pong(msg) => UpdateOneof::Pong(*msg),
+            FilteredUpdateOneof::OwnerRejectExemption(msg) => {
+                UpdateOneof::OwnerRejectExemption(msg.clone())
+            }
             FilteredUpdateOneof::BlockMeta(msg) => UpdateOneof::BlockMeta(msg.block_meta.clone()),
             FilteredUpdateOneof::EntryUpdateParent(msg) => {
                 UpdateOneof::EntryUpdateParent(msg.update_parent.clone())
@@ -393,17 +393,18 @@ pub type FilteredUpdateFilters = SmallVec<[FilterName; 4]>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilteredUpdateOneof {
-    Account(FilteredUpdateAccount),                     // 2
-    Slot(FilteredUpdateSlot),                           // 3
-    Transaction(FilteredUpdateTransaction),             // 4
-    TransactionStatus(FilteredUpdateTransactionStatus), // 10
-    Block(Box<FilteredUpdateBlock>),                    // 5
-    Ping,                                               // 6
-    Pong(SubscribeUpdatePong),                          // 9
-    BlockMeta(Arc<MessageBlockMeta>),                   // 7
-    Entry(FilteredUpdateEntry),                         // 8
-    EntryUpdateParent(Arc<MessageEntryUpdateParent>),   // 13
-    BlockFooter(Arc<MessageBlockFooter>),               // 12
+    Account(FilteredUpdateAccount),                            // 2
+    Slot(FilteredUpdateSlot),                                  // 3
+    Transaction(FilteredUpdateTransaction),                    // 4
+    TransactionStatus(FilteredUpdateTransactionStatus),        // 10
+    Block(Box<FilteredUpdateBlock>),                           // 5
+    Ping,                                                      // 6
+    Pong(SubscribeUpdatePong),                                 // 9
+    OwnerRejectExemption(SubscribeUpdateOwnerRejectExemption), // 1001
+    BlockMeta(Arc<MessageBlockMeta>),                          // 7
+    Entry(FilteredUpdateEntry),                                // 8
+    EntryUpdateParent(Arc<MessageEntryUpdateParent>),          // 13
+    BlockFooter(Arc<MessageBlockFooter>),                      // 12
 }
 
 impl FilteredUpdateOneof {
@@ -479,6 +480,7 @@ impl prost::Message for FilteredUpdateOneof {
                 encode_varint(0, buf);
             }
             Self::Pong(msg) => message::encode(9u32, msg, buf),
+            Self::OwnerRejectExemption(msg) => message::encode(1001u32, msg, buf),
             Self::BlockMeta(msg) => message::encode(7u32, &msg.block_meta, buf),
             Self::Entry(msg) => message::encode(8u32, msg, buf),
             Self::BlockFooter(msg) => message::encode(12u32, &msg.block_footer, buf),
@@ -495,6 +497,7 @@ impl prost::Message for FilteredUpdateOneof {
             Self::Block(msg) => message::encoded_len(5u32, msg),
             Self::Ping => key_len(6u32) + encoded_len_varint(0),
             Self::Pong(msg) => message::encoded_len(9u32, msg),
+            Self::OwnerRejectExemption(msg) => message::encoded_len(1001u32, msg),
             Self::BlockMeta(msg) => message::encoded_len(7u32, &msg.block_meta),
             Self::Entry(msg) => message::encoded_len(8u32, msg),
             Self::BlockFooter(msg) => message::encoded_len(12u32, &msg.block_footer),
@@ -757,7 +760,12 @@ pub struct FilteredUpdateTransaction {
 
 impl prost::Message for FilteredUpdateTransaction {
     fn encode_raw(&self, buf: &mut impl BufMut) {
-        Self::tx_encode_raw(1u32, &self.transaction.transaction, self.include_pre_accounts, buf);
+        Self::tx_encode_raw(
+            1u32,
+            &self.transaction.transaction,
+            self.include_pre_accounts,
+            buf,
+        );
         if self.slot != 0u64 {
             ::prost::encoding::uint64::encode(2u32, &self.slot, buf);
         }
@@ -1534,6 +1542,7 @@ pub mod tests {
                             account: account.clone(),
                             slot,
                             is_startup,
+                            owner_reject_exempt: false,
                             bank_id: Some(slot),
                             created_at: Timestamp::from(SystemTime::now()),
                         };
@@ -1677,6 +1686,7 @@ pub mod tests {
                             account: acc_info,
                             slot: block.parent_slot + 1,
                             is_startup: false,
+                            owner_reject_exempt: false,
                             created_at: Timestamp::from(SystemTime::now()),
                             bank_id: Some(block.parent_slot + 1),
                         })
@@ -1981,8 +1991,9 @@ pub mod tests {
         msg.transaction.meta = meta;
         msg.transaction.pre_encoded = OnceLock::new();
         let msg = Arc::new(msg);
-        let update = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(Arc::clone(&msg), true))
-            .as_subscribe_update();
+        let update =
+            FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(Arc::clone(&msg), true))
+                .as_subscribe_update();
         let stripped = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(msg, false))
             .as_subscribe_update();
 

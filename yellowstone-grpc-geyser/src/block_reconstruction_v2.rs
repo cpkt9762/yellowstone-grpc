@@ -149,6 +149,13 @@ impl BankBuffer {
     fn add_event(&mut self, event: Message) {
         match &event {
             Message::Account(message_account) => {
+                if message_account.owner_reject_exempt {
+                    // Fork-local account stream only: retain every admitted write for
+                    // Confirmed/Finalized, without altering ordinary dedup, sysvar
+                    // readiness, block account count, or SubscribeUpdateBlock.accounts.
+                    self.original_messages.push(event);
+                    return;
+                }
                 let write_version = message_account.account.write_version;
                 self.account_write_version_map
                     .entry(message_account.account.pubkey)
@@ -242,7 +249,7 @@ impl BankBuffer {
                     created_bank_index = dedup_messages.len();
                     continue;
                 }
-                Message::Account(account) => {
+                Message::Account(account) if !account.owner_reject_exempt => {
                     let Some(write_version) =
                         self.account_write_version_map.get(&account.account.pubkey)
                     else {
@@ -1166,6 +1173,7 @@ mod tests {
             },
             slot,
             is_startup: false,
+            owner_reject_exempt: false,
             created_at: ts(),
             bank_id: Some(bank_id),
         }))
@@ -1194,6 +1202,7 @@ mod tests {
             },
             slot,
             is_startup: true,
+            owner_reject_exempt: false,
             created_at: ts(),
             bank_id: None,
         }))
@@ -2213,6 +2222,63 @@ mod tests {
             drain_ready(&mut storage),
             vec![(10, CommitmentLevel::Processed, 2)],
             "bank 2 got its own Processed and must be delivered"
+        );
+    }
+    #[test]
+    fn owner_reject_stream_keeps_every_write_without_changing_blocks_or_normal_dedup() {
+        let mut storage = BlockMachineStorage::new(16);
+        let key = Pubkey::new_unique();
+        storage.add(make_account_msg(10, 1, key, 1));
+        for write_version in [2, 3] {
+            let mut message = make_account_msg(10, 1, key, write_version);
+            if let Message::Account(account) = &mut message {
+                Arc::make_mut(account).owner_reject_exempt = true;
+            }
+            storage.add(message);
+        }
+        drive_bank_to_processed(&mut storage, 10, 1, Some(9));
+        storage.add(make_commitment_msg(10, Some(9), SlotStatus::Finalized, 1));
+        let mut commitments = Vec::new();
+        while let Some((update, frozen)) = storage.pop_ready_block() {
+            commitments.push(update.commitment);
+            let messages = frozen.messages();
+            let versions = messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::Account(account) if account.account.pubkey == key => {
+                        Some((account.account.write_version, account.owner_reject_exempt))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(versions, [(1, false), (2, true), (3, true)]);
+            let block = frozen.get_message_block();
+            assert!(!block
+                .accounts
+                .iter()
+                .any(|account| account.owner_reject_exempt));
+            assert_eq!(
+                block.updated_account_count as usize,
+                MUST_HAVE_SYSVAR_ACCOUNTS.len() + 1
+            );
+            assert_eq!(
+                block
+                    .accounts
+                    .iter()
+                    .find(|account| account.account.pubkey == key)
+                    .expect("ordinary write retained")
+                    .account
+                    .write_version,
+                1
+            );
+        }
+        assert_eq!(
+            commitments,
+            [
+                CommitmentLevel::Processed,
+                CommitmentLevel::Confirmed,
+                CommitmentLevel::Finalized
+            ]
         );
     }
 }
