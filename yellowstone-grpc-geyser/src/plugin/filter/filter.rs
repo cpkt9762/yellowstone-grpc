@@ -2860,6 +2860,7 @@ mod tests {
         accounts.insert(
             "solend".to_owned(),
             SubscribeRequestFilterAccounts {
+                include_owner_rejected: None,
                 nonempty_txn_signature: None,
                 account: vec![],
                 owner: vec![],
@@ -4199,6 +4200,7 @@ mod account_filter_regression_tests {
             (
                 "combined".to_owned(),
                 SubscribeRequestFilterAccounts {
+                include_owner_rejected: None,
                     nonempty_txn_signature: Some(true),
                     account: vec![account.to_string()],
                     owner: vec![owner.to_string()],
@@ -4910,6 +4912,7 @@ mod parity_oracle {
             accounts.insert(
                 format!("filter-{i}"),
                 SubscribeRequestFilterAccounts {
+                include_owner_rejected: None,
                     account,
                     owner,
                     filters: gen_state_filters(rng, fixtures::TOKEN_ACCOUNT_LEN),
@@ -5642,6 +5645,7 @@ mod cuckoo_tests {
         accounts.insert(
             "test".to_string(),
             SubscribeRequestFilterAccounts {
+                include_owner_rejected: None,
                 account: vec![],
                 owner: vec![],
                 filters: vec![],
@@ -5703,6 +5707,7 @@ mod cuckoo_tests {
         accounts.insert(
             "test".to_string(),
             SubscribeRequestFilterAccounts {
+                include_owner_rejected: None,
                 account: vec![],
                 owner: vec![],
                 filters: vec![],
@@ -5749,6 +5754,7 @@ mod cuckoo_tests {
         accounts.insert(
             "test".to_string(),
             SubscribeRequestFilterAccounts {
+                include_owner_rejected: None,
                 account: vec![pk_in_list.to_string()],
                 owner: vec![],
                 filters: vec![],
@@ -5813,6 +5819,7 @@ mod cuckoo_tests {
         accounts.insert(
             "test".to_string(),
             SubscribeRequestFilterAccounts {
+                include_owner_rejected: None,
                 account: vec![],
                 owner: vec![owner.to_string()],
                 filters: vec![],
@@ -6043,6 +6050,7 @@ mod cuckoo_tests {
             mode: Option<super::TokenAccountExpansionControlFlag>,
         ) -> SubscribeRequestFilterTransactions {
             SubscribeRequestFilterTransactions {
+                include_pre_accounts: None,
                 vote: None,
                 failed: None,
                 signature: None,
@@ -6632,6 +6640,7 @@ mod cuckoo_tests {
             tx_filters.insert(
                 "f".to_owned(),
                 SubscribeRequestFilterTransactions {
+                include_pre_accounts: None,
                     vote: None,
                     failed: None,
                     signature: None,

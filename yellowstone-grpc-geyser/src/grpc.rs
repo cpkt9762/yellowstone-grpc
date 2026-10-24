@@ -2869,7 +2869,7 @@ mod tests {
         assert_eq!(default_scales.weight(&account_update), 1);
         assert_eq!(
             scales.weight(&update(
-                FilteredUpdateOneof::transaction(test_transaction())
+                FilteredUpdateOneof::transaction(test_transaction(), false)
             )),
             5
         );
@@ -2888,7 +2888,7 @@ mod tests {
         );
 
         // Kinds without a scale and errors always weigh 1.
-        let status = FilteredUpdateOneof::transaction_status(test_transaction());
+        let status = FilteredUpdateOneof::transaction_status(test_transaction(), false);
         assert_eq!(scales.weight(&update(status)), 1);
         let meta = FilteredUpdateOneof::block_meta(fixtures::message_block_meta(1));
         assert_eq!(scales.weight(&update(meta)), 1);
@@ -3017,7 +3017,7 @@ mod tests {
         let units = |len: usize| u32::try_from((len / 64).max(1)).unwrap();
         let transaction = test_transaction();
         let transaction_update =
-            || update(FilteredUpdateOneof::transaction(Arc::clone(&transaction)));
+            || update(FilteredUpdateOneof::transaction(Arc::clone(&transaction), false));
 
         assert_eq!(scales.weight(&transaction_update()), 4);
 

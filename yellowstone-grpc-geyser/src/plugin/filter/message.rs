@@ -1967,7 +1967,7 @@ pub mod tests {
             .into_iter()
             .next()
             .expect("fixture transaction should exist");
-        let mut meta = tx.meta.clone();
+        let mut meta = tx.transaction.meta.clone();
         meta.pre_accounts_data = convert_to::create_pre_accounts_data(&[PreAccountEntry {
             pubkey: Pubkey::new_unique(),
             owner: Pubkey::new_unique(),
@@ -1977,23 +1977,13 @@ pub mod tests {
             rent_epoch: 0,
         }]);
 
-        let msg = MessageTransaction {
-            transaction: Arc::new(MessageTransactionInfo {
-                signature: tx.signature,
-                is_vote: tx.is_vote,
-                transaction: tx.transaction.clone(),
-                meta,
-                index: tx.index,
-                account_keys: tx.account_keys.clone(),
-                pre_encoded: OnceLock::new(),
-            }),
-            slot: 42,
-            created_at: Timestamp::from(SystemTime::now()),
-        };
-
-        let update = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(&msg, true))
+        let mut msg = (*tx).clone();
+        msg.transaction.meta = meta;
+        msg.transaction.pre_encoded = OnceLock::new();
+        let msg = Arc::new(msg);
+        let update = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(Arc::clone(&msg), true))
             .as_subscribe_update();
-        let stripped = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(&msg, false))
+        let stripped = FilteredUpdate::new_empty(FilteredUpdateOneof::transaction(msg, false))
             .as_subscribe_update();
 
         let update_len = update
