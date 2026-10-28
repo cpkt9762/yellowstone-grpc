@@ -845,7 +845,11 @@ async fn revision_r1_zero_b_callback_pipeline_matches_3a3d1cd_without_order_work
     async fn run(
         baseline: bool,
         shared_filter: Filter,
-    ) -> (Vec<Vec<u8>>, Arc<crate::order_integrity::OrderIntegrity>) {
+    ) -> (
+        Vec<Vec<u8>>,
+        Arc<crate::order_integrity::OrderIntegrity>,
+        usize,
+    ) {
         let mut b = SubscriberChannels::new(64, 64, 64);
         b.revision_timestamp = Some(REVISION_TIMESTAMP);
         let audit = Arc::clone(&b.order_integrity);
@@ -889,11 +893,17 @@ async fn revision_r1_zero_b_callback_pipeline_matches_3a3d1cd_without_order_work
         ingress.await.expect("ingress");
         reconstruct.abort();
         client.2.abort();
-        (result, audit)
+        let credit_owners = client.1.revision_credit_owners();
+        (result, audit, credit_owners)
     }
     let f = filter(&request(false));
-    let (reference, _) = run(true, f.clone()).await;
-    let (actual, audit) = run(false, f).await;
+    let (reference, _, reference_credit_owners) = run(true, f.clone()).await;
+    let (actual, audit, actual_credit_owners) = run(false, f).await;
+    assert_eq!(
+        (reference_credit_owners, actual_credit_owners),
+        (0, 0),
+        "zero B baseline/current queue must not clone per-message credit ownership"
+    );
     assert_eq!(
         actual, reference,
         "callback queue to reconstruction to A wire must match frozen 3a3d1cd"

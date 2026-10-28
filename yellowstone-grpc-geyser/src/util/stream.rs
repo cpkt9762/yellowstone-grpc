@@ -9,7 +9,7 @@ use {
     thiserror::Error,
     tokio::sync::{
         mpsc::{UnboundedReceiver, UnboundedSender},
-        OwnedSemaphorePermit, Semaphore, TryAcquireError,
+        Semaphore, TryAcquireError,
     },
 };
 
@@ -144,9 +144,11 @@ impl<T> Weigher for UnitWeigher<T> {
 /// State shared between every [`LoadAwareSender`] and the [`LoadAwareReceiver`].
 #[derive(Debug)]
 struct Shared {
+    #[cfg(test)]
+    revision_credit_owners: std::sync::atomic::AtomicUsize,
     /// One permit per unit of weight. A sender acquires the item weight before queueing and the
     /// receiver gives it back on dequeue. Waiting senders are served in strict FIFO order.
-    semaphore: Arc<Semaphore>,
+    semaphore: Semaphore,
     /// Total weight the channel can hold.
     capacity: usize,
 }
@@ -171,13 +173,36 @@ impl Shared {
     }
 }
 
+// Primary credit uses only its weight, as in the original A queue. Only an
+// independent B lane carries ownership so its pool survives sender teardown.
+struct QueueCredit {
+    weight: u32,
+    independent: Option<Arc<Shared>>,
+}
+impl QueueCredit {
+    fn release(self, primary: &Shared) {
+        if self.independent.is_none() {
+            primary.semaphore.add_permits(self.weight as usize);
+        }
+        // Drop returns independent credit to that lane, never to primary/A.
+    }
+}
+impl Drop for QueueCredit {
+    fn drop(&mut self) {
+        if let Some(shared) = &self.independent {
+            shared.semaphore.add_permits(self.weight as usize);
+        }
+    }
+}
+
 /// Sender end of the channel created by [`load_aware_channel`].
 ///
 /// It can be cloned freely, every clone shares the same capacity and weighs items with its own
 /// clone of the [`Weigher`] `W`.
 pub struct LoadAwareSender<T, W> {
     shared: Arc<Shared>,
-    inner: UnboundedSender<(OwnedSemaphorePermit, T)>,
+    inner: UnboundedSender<(QueueCredit, T)>,
+    independent: bool,
     weigher: W,
 }
 
@@ -194,6 +219,7 @@ impl<T, W: Clone> Clone for LoadAwareSender<T, W> {
         Self {
             shared: Arc::clone(&self.shared),
             inner: self.inner.clone(),
+            independent: self.independent,
             weigher: self.weigher.clone(),
         }
     }
@@ -204,7 +230,7 @@ impl<T, W: Clone> Clone for LoadAwareSender<T, W> {
 /// Dropping it closes the channel and wakes every sender waiting for capacity.
 pub struct LoadAwareReceiver<T> {
     shared: Arc<Shared>,
-    inner: UnboundedReceiver<(OwnedSemaphorePermit, T)>,
+    inner: UnboundedReceiver<(QueueCredit, T)>,
 }
 
 impl<T> Drop for LoadAwareReceiver<T> {
@@ -252,12 +278,15 @@ where
     );
     let (inner_sender, inner_receiver) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
-        semaphore: Arc::new(Semaphore::new(weighted_capacity)),
+        #[cfg(test)]
+        revision_credit_owners: Default::default(),
+        semaphore: Semaphore::new(weighted_capacity),
         capacity: weighted_capacity,
     });
     let sender = LoadAwareSender {
         shared: Arc::clone(&shared),
         inner: inner_sender,
+        independent: false,
         weigher,
     };
 
@@ -273,6 +302,21 @@ impl<T, W> LoadAwareSender<T, W>
 where
     W: Weigher<Item = T>,
 {
+    fn queue_credit(&self, weight: u32) -> QueueCredit {
+        let independent = if self.independent {
+            #[cfg(test)]
+            self.shared
+                .revision_credit_owners
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some(Arc::clone(&self.shared))
+        } else {
+            None
+        };
+        QueueCredit {
+            weight,
+            independent,
+        }
+    }
     /// Returns the weight `item` is accounted for while it sits in the channel.
     fn admitted_weight(&self, item: &T) -> u32 {
         self.shared.admitted_weight(self.weigher.weight(item))
@@ -296,25 +340,36 @@ where
     /// Returns the `item` back in a [`SendError`] if the [`LoadAwareReceiver`] is dropped.
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
         let weight = self.admitted_weight(&item);
-        if self.inner.is_closed() {
+        if self.independent && self.inner.is_closed() {
             return Err(SendError(item));
         }
-        let permit = match Arc::clone(&self.shared.semaphore).try_acquire_many_owned(weight) {
+        // Primary admission retains the baseline borrowed-permit path. B waits
+        // also observe mpsc closure because only the primary semaphore is closed.
+        let permit = match self.shared.semaphore.try_acquire_many(weight) {
             Ok(permit) => permit,
             Err(TryAcquireError::Closed) => return Err(SendError(item)),
             Err(TryAcquireError::NoPermits) => {
-                tokio::select! {
-                    _ = self.inner.closed() => return Err(SendError(item)),
-                    result = Arc::clone(&self.shared.semaphore).acquire_many_owned(weight) => match result {
-                        Ok(permit) => permit,
-                        Err(_) => return Err(SendError(item)),
+                let result = if self.independent {
+                    tokio::select! {
+                        _ = self.inner.closed() => return Err(SendError(item)),
+                        result = self.shared.semaphore.acquire_many(weight) => result,
                     }
+                } else {
+                    self.shared.semaphore.acquire_many(weight).await
+                };
+                match result {
+                    Ok(permit) => permit,
+                    Err(_) => return Err(SendError(item)),
                 }
             }
         };
-        self.inner
-            .send((permit, item))
-            .map_err(|err| SendError(err.0 .1))
+        let credit = self.queue_credit(weight);
+        permit.forget();
+        self.inner.send((credit, item)).map_err(|err| {
+            let (credit, item) = err.0;
+            credit.release(&self.shared);
+            SendError(item)
+        })
     }
 
     /// Independent credit pool, sharing exactly the same ordered mpsc queue.
@@ -328,28 +383,35 @@ where
         }
         Ok(Self {
             shared: Arc::new(Shared {
-                semaphore: Arc::new(Semaphore::new(capacity)),
+                #[cfg(test)]
+                revision_credit_owners: Default::default(),
+                semaphore: Semaphore::new(capacity),
                 capacity,
             }),
             inner: self.inner.clone(),
+            independent: true,
             weigher: self.weigher.clone(),
         })
     }
 
     /// Sends without waiting; preserves FIFO and releases the correct lane's permits.
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
-        if self.inner.is_closed() {
+        if self.independent && self.inner.is_closed() {
             return Err(TrySendError::Closed(item));
         }
         let weight = self.admitted_weight(&item);
-        let permit = match Arc::clone(&self.shared.semaphore).try_acquire_many_owned(weight) {
+        let permit = match self.shared.semaphore.try_acquire_many(weight) {
             Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(item)),
             Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(item)),
         };
-        self.inner
-            .send((permit, item))
-            .map_err(|err| TrySendError::Closed(err.0 .1))
+        let credit = self.queue_credit(weight);
+        permit.forget();
+        self.inner.send((credit, item)).map_err(|err| {
+            let (credit, item) = err.0;
+            credit.release(&self.shared);
+            TrySendError::Closed(item)
+        })
     }
 
     /// Strict admission for B: never clamp a message larger than its byte budget.
@@ -374,6 +436,12 @@ where
 }
 
 impl<T> LoadAwareReceiver<T> {
+    #[cfg(test)]
+    pub(crate) fn revision_credit_owners(&self) -> usize {
+        self.shared
+            .revision_credit_owners
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     /// Receives the next item, releasing its weight back to the channel.
     ///
     /// # Returns
@@ -397,8 +465,8 @@ impl<T> LoadAwareReceiver<T> {
     /// [`LoadAwareSender`] is dropped. [`Poll::Pending`] otherwise.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         self.inner.poll_recv(cx).map(|maybe| {
-            maybe.map(|(permit, item)| {
-                drop(permit);
+            maybe.map(|(credit, item)| {
+                credit.release(&self.shared);
                 item
             })
         })
@@ -454,6 +522,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn revision2_n2_independent_wait_cancel_and_close_return_credit() {
+        use futures::poll;
+        use std::pin::pin;
+        let (a, rx) = load_aware_channel(1, TestWeigher);
+        let b = a.with_budget(4).expect("independent lane");
+        b.send(TestItem(3)).await.expect("B send");
+        {
+            let mut waiting = pin!(b.send(TestItem(3)));
+            assert!(poll!(&mut waiting).is_pending());
+            assert_eq!(b.current_weight(), 4);
+        }
+        assert_eq!(
+            b.current_weight(),
+            3,
+            "cancel returns partial borrowed reservation"
+        );
+        let mut waiting = pin!(b.send(TestItem(3)));
+        assert!(poll!(&mut waiting).is_pending());
+        drop(rx);
+        assert!(
+            matches!(poll!(&mut waiting), Poll::Ready(Err(_))),
+            "B wait observes mpsc closure"
+        );
+        assert_eq!(
+            b.current_weight(),
+            0,
+            "dropped queue and cancelled wait release B credit"
+        );
+        assert!(b.send(TestItem(1)).await.is_err());
+        assert!(matches!(
+            b.try_send(TestItem(1)),
+            Err(TrySendError::Closed(_))
+        ));
+        assert_eq!(a.current_weight(), 0, "B never releases credit into A");
+    }
+    #[tokio::test]
+    async fn revision2_n2_primary_credit_has_no_per_message_ownership_clones() {
+        let (sender, mut receiver) = load_aware_channel(4, TestWeigher);
+        sender.try_send(TestItem(2)).expect("primary try_send");
+        sender.send(TestItem(2)).await.expect("primary send");
+        {
+            let mut waiting = pin!(sender.send(TestItem(1)));
+            assert!(poll!(&mut waiting).is_pending());
+        }
+        assert_eq!(receiver.recv().await, Some(TestItem(2)));
+        assert_eq!(receiver.recv().await, Some(TestItem(2)));
+        assert_eq!(
+            sender.current_weight(),
+            0,
+            "cancel and dequeue return all credit"
+        );
+        sender.try_send(TestItem(4)).expect("fill");
+        let mut waiting = pin!(sender.send(TestItem(3)));
+        assert!(poll!(&mut waiting).is_pending());
+        assert_eq!(receiver.recv().await, Some(TestItem(4)));
+        assert!(matches!(poll!(&mut waiting), Poll::Ready(Ok(()))));
+        assert_eq!(receiver.recv().await, Some(TestItem(3)));
+        assert_eq!(
+            receiver.revision_credit_owners(),
+            0,
+            "zero B queue admission/wait/cancel/dequeue must not clone credit ownership"
+        );
+    }
     #[tokio::test]
     async fn test_basic_send_and_receive() {
         let (sender, mut receiver) = load_aware_channel(10, TestWeigher);
@@ -708,6 +840,31 @@ mod tests {
 #[cfg(test)]
 mod order_writes_v1 {
     use super::*;
+    #[tokio::test]
+    async fn revision2_n2_queued_independent_credit_outlives_sender() {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
+        let b = a.with_budget(1).expect("independent lane");
+        let credit = Arc::downgrade(&b.shared);
+        b.send(7).await.expect("B queued");
+        assert_eq!(
+            b.shared
+                .revision_credit_owners
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "audit counts the actual independent ownership clone"
+        );
+        drop(b);
+        assert!(
+            credit.upgrade().is_some(),
+            "queued B credit retains its own lane"
+        );
+        a.try_send(8).expect("independent A credit");
+        assert_eq!(rx.recv().await, Some(7));
+        assert!(credit.upgrade().is_none(), "dequeue releases last B owner");
+        assert_eq!(a.current_weight(), 1, "B dequeue cannot release A credit");
+        assert_eq!(rx.recv().await, Some(8));
+        assert_eq!(a.current_weight(), 0);
+    }
     #[tokio::test]
     async fn b_full_and_reserved_full_preserve_a_capacity_and_fifo() {
         let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
