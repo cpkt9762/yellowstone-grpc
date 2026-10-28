@@ -143,6 +143,26 @@ impl OrderIntegrity {
         })();
         self.record_error(result);
     }
+    pub fn resolve_pending_slot(&self, slot: u64, winner: u64) {
+        if !self.has_watchers() {
+            return;
+        }
+        #[cfg(test)]
+        self.revision_locks.fetch_add(1, Ordering::Relaxed);
+        let result = (|| -> Result<()> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+            for watcher in state.watchers.values_mut() {
+                watcher
+                    .pending
+                    .retain(|(s, b), _| *s != slot || *b == winner);
+            }
+            Ok(())
+        })();
+        self.record_error(result);
+    }
     /// Called at the original drop sites and before GC could revive a late bank.
     pub fn note_late(&self, bank: BankRef) {
         if !self.has_watchers() {

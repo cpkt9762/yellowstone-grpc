@@ -508,7 +508,10 @@ impl BlockMachineStorage {
         self.observe_slot(message.get_slot());
         match message {
             Message::Slot(message_slot) => {
-                if message_slot.status == SlotStatus::Confirmed {
+                if matches!(
+                    message_slot.status,
+                    SlotStatus::Confirmed | SlotStatus::Finalized
+                ) {
                     if let (Some(integrity), Some(bank_id)) =
                         (&self.order_integrity, message_slot.bank_id)
                     {
@@ -736,6 +739,9 @@ impl BlockMachineStorage {
             } else {
                 self.resolved_bank_per_slot.insert(slot, bank_id);
             }
+            if let Some(integrity) = self.order_integrity.as_ref().filter(|i| i.has_watchers()) {
+                integrity.resolve_pending_slot(slot, bank_id);
+            }
             self.discard_losing_banks(slot, bank_id);
         }
 
@@ -804,6 +810,13 @@ impl BlockMachineStorage {
         }
 
         self.try_infer_sole_candidate_winner(slot);
+        if level != CommitmentLevel::Processed {
+            if let Some(integrity) = self.order_integrity.as_ref().filter(|i| i.has_watchers()) {
+                if let Some(&bank_id) = self.resolved_bank_per_slot.get(&slot) {
+                    integrity.note_pending((slot, bank_id));
+                }
+            }
+        }
         if let Some(frozen) = self.resolved_frozen_bank(slot) {
             self.emit_commitment_levels_up_to(slot, level, &frozen);
         }

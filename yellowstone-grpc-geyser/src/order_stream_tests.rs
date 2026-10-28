@@ -494,3 +494,268 @@ fn failed_vote_unknown_and_readonly_preserve_raw_and_epoch_sequence() {
     )
     .expect("overflow gap");
 }
+
+fn revision_r4_feed_bank(
+    source: &mut crate::block_reconstruction_v2::BlockMachineStorage,
+    slot: u64,
+    expected: u64,
+    status: Option<SlotStatus>,
+) {
+    use solana_pubkey::Pubkey;
+    let mut created = fixtures::message_slot(slot, SlotStatus::CreatedBank);
+    created.bank_id = Some(slot);
+    source.add(SourceMessage::Slot(Arc::new(created)));
+    for key in crate::block_reconstruction_v2::MUST_HAVE_SYSVAR_ACCOUNTS {
+        let mut a = fixtures::simple_message_account(key, Pubkey::default());
+        let m = Arc::make_mut(&mut a);
+        m.slot = slot;
+        m.bank_id = Some(slot);
+        source.add(SourceMessage::Account(a));
+    }
+    let mut meta = fixtures::message_block_meta(slot);
+    let m = Arc::make_mut(&mut meta);
+    m.block_meta.bank_id = slot;
+    m.block_meta.executed_transaction_count = expected;
+    source.add(SourceMessage::BlockMeta(meta));
+    if let Some(status) = status {
+        source.add(SourceMessage::Slot(Arc::new(fixtures::message_slot(
+            slot, status,
+        ))));
+    }
+}
+fn revision_r4_source(
+    registry: &Arc<crate::order_integrity::OrderIntegrity>,
+) -> (
+    crate::block_reconstruction_v2::BlockMachineStorage,
+    Arc<crate::block_reconstruction_v2::FrozenBank>,
+) {
+    revision_r4_source_mode(registry, Some(SlotStatus::Confirmed))
+}
+fn revision_r4_source_mode(
+    registry: &Arc<crate::order_integrity::OrderIntegrity>,
+    status: Option<SlotStatus>,
+) -> (
+    crate::block_reconstruction_v2::BlockMachineStorage,
+    Arc<crate::block_reconstruction_v2::FrozenBank>,
+) {
+    let mut source = crate::block_reconstruction_v2::BlockMachineStorage::new(16);
+    source.order_integrity = Some(Arc::clone(registry));
+    revision_r4_feed_bank(&mut source, 20, 1, status);
+    revision_r4_feed_bank(&mut source, 21, 0, Some(SlotStatus::Confirmed));
+    let mut ready = None;
+    while let Some((u, frozen)) = source.pop_ready_block() {
+        if u.slot == 21 && u.commitment == solana_commitment_config::CommitmentLevel::Confirmed {
+            ready = Some(frozen);
+        }
+    }
+    (
+        source,
+        ready.expect("Y really freezes/confirms despite incomplete X"),
+    )
+}
+fn revision_r4_start(
+    s: &mut OrderSession,
+    frozen: &crate::block_reconstruction_v2::FrozenBank,
+    out: &mut Vec<FilteredUpdate>,
+) {
+    let limits = crate::plugin::filter::limits::FilterLimitsOrder::default();
+    s.begin(BankGroup::from_frozen(frozen, &limits), &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("native group begin");
+    for message in frozen.messages().iter() {
+        s.observe_sent(message, &[], &mut |u| {
+            out.push(u);
+            Ok(())
+        })
+        .expect("native group content");
+    }
+}
+fn revision_r4_end(
+    s: &mut OrderSession,
+    frozen: &crate::block_reconstruction_v2::FrozenBank,
+    out: &mut Vec<FilteredUpdate>,
+) {
+    let meta = frozen.get_block_meta();
+    let slot = meta.slot;
+    let bank_id = meta.bank_id;
+    let message = SourceMessage::BlockMeta(Arc::clone(&meta));
+    let update = FilteredUpdate::new_empty(FilteredUpdateOneof::BlockMeta(meta));
+    s.observe_sent(&message, &[update], &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("native metadata");
+    let message = MessageSlot {
+        slot,
+        parent: Some(slot - 1),
+        status: SlotStatus::Confirmed,
+        dead_error: None,
+        bank_id: Some(bank_id),
+        created_at: Default::default(),
+    };
+    let source = SourceMessage::Slot(Arc::new(message.clone()));
+    let update = FilteredUpdate::new_empty(FilteredUpdateOneof::slot(message));
+    s.observe_sent(&source, &[update], &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("native Confirmed");
+    s.end(slot, bank_id, 21, &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("native end");
+}
+#[test]
+fn revision_r4_close_cannot_seal_around_another_native_incomplete_bank() {
+    let registry = Arc::new(crate::order_integrity::OrderIntegrity::new(
+        Default::default(),
+    ));
+    let mut s = OrderSession::default();
+    s.register_watch(&registry).expect("watch");
+    let mut out = Vec::new();
+    let (r, o) = request(vec![vec![1; 32]], 1, None);
+    s.request(&r, &o, 0, &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("scope");
+    let (_source, y) = revision_r4_source(&registry);
+    assert!(s
+        .watch
+        .as_ref()
+        .expect("watch")
+        .pending(1)
+        .expect("X pending"));
+    revision_r4_start(&mut s, &y, &mut out);
+    let active = s.active.as_ref().expect("active");
+    let close = SubscribeRequest {
+        order_close: Some(SubscribeRequestOrderClose {
+            context: Some(active.context.clone()),
+            tracked_keys_sha256: active.key_hash.clone(),
+        }),
+        ..Default::default()
+    };
+    s.close(&close, &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("close inside Y");
+    revision_r4_end(&mut s, &y, &mut out);
+    assert!(!out.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(subscribe_update::UpdateOneof::OrderEpochSeal(seal))if seal.reason==Some(2))),"Y ending cannot erase native X's incomplete coverage");
+    assert!(s.closing.is_some());
+    s.closing = Some(Instant::now() - Duration::from_secs(16));
+    s.check_deadline(&mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("fixed total close deadline");
+    assert!(out.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(subscribe_update::UpdateOneof::OrderGap(g))if g.reason==Some(3))));
+    assert!(!s.has_active());
+}
+#[test]
+fn revision_r4_replace_waits_for_all_native_pending_banks() {
+    let registry = Arc::new(crate::order_integrity::OrderIntegrity::new(
+        Default::default(),
+    ));
+    let mut s = OrderSession::default();
+    s.register_watch(&registry).expect("watch");
+    let mut out = Vec::new();
+    let (r, o) = request(vec![vec![1; 32]], 1, None);
+    s.request(&r, &o, 0, &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("scope");
+    let (mut source, y) = revision_r4_source(&registry);
+    revision_r4_start(&mut s, &y, &mut out);
+    let epoch = s
+        .active
+        .as_ref()
+        .expect("active")
+        .context
+        .source_epoch
+        .clone();
+    let (r, o) = request(vec![vec![1; 32], vec![2; 32]], 2, Some(epoch));
+    s.request(&r, &o, 21, &mut |u| {
+        out.push(u);
+        Ok(())
+    })
+    .expect("pending replace");
+    revision_r4_end(&mut s, &y, &mut out);
+    assert!(!out.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(subscribe_update::UpdateOneof::OrderEpochSeal(seal))if seal.reason==Some(1))),"REPLACED is also a normal sealing exit and cannot skip X");
+    assert!(s.has_pending());
+    let mut tx = fixtures::message_transaction(
+        solana_signature::Signature::from([9; 64]),
+        vec![solana_pubkey::Pubkey::new_from_array([1; 32])],
+        false,
+        Default::default(),
+    );
+    let m = Arc::make_mut(&mut tx);
+    m.slot = 20;
+    m.bank_id = 20;
+    m.transaction.index = 0;
+    source.add(SourceMessage::Transaction(tx));
+    let mut x = None;
+    while let Some((u, frozen)) = source.pop_ready_block() {
+        if u.slot == 20 && u.commitment == solana_commitment_config::CommitmentLevel::Confirmed {
+            x = Some(frozen);
+        }
+    }
+    let x = x.expect("missing X transaction completes the real source Bank");
+    revision_r4_start(&mut s, &x, &mut out);
+    revision_r4_end(&mut s, &x, &mut out);
+    assert!(!s.has_pending());
+    assert!(out.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(subscribe_update::UpdateOneof::OrderCoverageAck(ack))if ack.context.as_ref().and_then(|c|c.request_version)==Some(2))));
+}
+
+#[test]
+fn revision_r4_finalized_and_inherited_confirmation_also_block_close() {
+    for status in [Some(SlotStatus::Finalized), None] {
+        let registry = Arc::new(crate::order_integrity::OrderIntegrity::new(
+            Default::default(),
+        ));
+        let mut s = OrderSession::default();
+        s.register_watch(&registry).expect("watch");
+        let mut out = Vec::new();
+        let (r, o) = request(vec![vec![1; 32]], 1, None);
+        s.request(&r, &o, 0, &mut |u| {
+            out.push(u);
+            Ok(())
+        })
+        .expect("scope");
+        let (_source, y) = revision_r4_source_mode(&registry, status);
+        revision_r4_start(&mut s, &y, &mut out);
+        let active = s.active.as_ref().expect("active");
+        let close = SubscribeRequest {
+            order_close: Some(SubscribeRequestOrderClose {
+                context: Some(active.context.clone()),
+                tracked_keys_sha256: active.key_hash.clone(),
+            }),
+            ..Default::default()
+        };
+        s.close(&close, &mut |u| {
+            out.push(u);
+            Ok(())
+        })
+        .expect("close");
+        revision_r4_end(&mut s, &y, &mut out);
+        assert!(
+            !out.iter().any(|u| matches!(
+                u.as_subscribe_update().update_oneof,
+                Some(subscribe_update::UpdateOneof::OrderEpochSeal(_))
+            )),
+            "native Finalized/inherited Confirmed cannot hide incomplete ancestor X"
+        );
+        assert!(s.closing.is_some());
+        s.closing = Some(Instant::now() - Duration::from_secs(16));
+        s.check_deadline(&mut |u| {
+            out.push(u);
+            Ok(())
+        })
+        .expect("deadline");
+        assert!(!s.has_active());
+    }
+}

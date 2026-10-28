@@ -382,6 +382,12 @@ impl OrderSession {
         watermark: u64,
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
+        if self.pending.is_none() {
+            return Ok(());
+        }
+        if self.active.is_some() && !self.normal_boundary_ready(send)? {
+            return Ok(());
+        }
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
@@ -563,10 +569,31 @@ impl OrderSession {
         }
         Ok(())
     }
+    /// Every normal epoch sealing exit uses the same current source health and
+    /// pending-bank barrier; completing an unrelated group cannot clear it.
+    fn normal_boundary_ready(
+        &mut self,
+        send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
+    ) -> Result<bool> {
+        self.check_deadline(send)?;
+        if self.stopped || self.active.is_none() {
+            return Ok(false);
+        }
+        if let (Some(watch), Some(floor)) = (&self.watch, self.coverage_floor()) {
+            watch.check()?;
+            return Ok(!watch.pending(floor)?);
+        }
+        Ok(true)
+    }
     fn finish_close(&mut self, send: &mut impl FnMut(FilteredUpdate) -> Result<()>) -> Result<()> {
+        if !self.normal_boundary_ready(send)? {
+            return Ok(());
+        }
+        if let Some(epoch) = self.active.as_ref() {
+            send(Self::epoch_seal(epoch, OrderEpochSealReason::NormalEnd))?;
+        }
         if let Some(epoch) = self.active.take() {
             self.historical.push((epoch.context.clone(), epoch.seq));
-            send(Self::epoch_seal(&epoch, OrderEpochSealReason::NormalEnd))?;
         }
         self.closing = None;
         self.stopped = true;
@@ -780,6 +807,7 @@ impl OrderSession {
         watermark: u64,
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
+        self.check_deadline(send)?;
         if self.stopped {
             self.group = None;
             return self.check_deadline(send);
