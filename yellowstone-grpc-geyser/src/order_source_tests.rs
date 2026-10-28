@@ -1277,3 +1277,133 @@ async fn revision_r3_reported_changes_only_after_gap_is_queued_or_retained() {
         matches!(update.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderGap(g))if g.context.as_ref()==Some(&contexts[0]))
     );
 }
+
+#[tokio::test]
+async fn revision_r5_real_reconstruction_exposes_conflicting_confirmed_and_preserves_a() {
+    let mut b = SubscriberChannels::new(128, 128, 128);
+    b.revision_timestamp = Some(REVISION_TIMESTAMP);
+    let mut on = spawn(b.clone());
+    let mut off = spawn(b.clone());
+    let initial = install(&mut on, &request(true)).await.expect("B ack");
+    install(&mut off, &request(false)).await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (source_tx, source_rx) = mpsc::unbounded_channel();
+    let ingress = tokio::spawn(GrpcService::geyser_loop(
+        crate::stream::tokio::BatchStreamUnboundedReceiver::new(rx),
+        b.clone(),
+        source_tx,
+    ));
+    let source = tokio::spawn(GrpcService::block_reconstruction_loop(
+        crate::stream::tokio::BatchStreamUnboundedReceiver::new(source_rx),
+        b.clone(),
+        None,
+        None,
+        16,
+    ));
+    let send = |m: Message| {
+        b.observe_callback(m.get_slot());
+        tx.send(m).expect("callback queue");
+    };
+    for bank in [200, 201] {
+        for m in revision_callbacks(20, bank) {
+            if !matches!(&m,Message::Slot(s)if matches!(s.status,SlotStatus::Confirmed|SlotStatus::Finalized))
+            {
+                send(m);
+            }
+        }
+    }
+    let mut a_on = Vec::new();
+    let mut processed = std::collections::HashSet::new();
+    while processed.len() < 2 {
+        let u = read(&mut on.1).await;
+        if let FilteredUpdateOneof::Slot(s) = &u.message {
+            if s.slot == 20 && s.status == SlotStatus::Processed {
+                processed.insert(s.bank_id.expect("bank"));
+            }
+        }
+        assert!(!matches!(u.message, FilteredUpdateOneof::Order(_)));
+        a_on.push(u.encode_to_vec());
+    }
+    assert_eq!(
+        processed,
+        std::collections::HashSet::from([200, 201]),
+        "both banks were frozen by the real source"
+    );
+    let confirmation = |bank| {
+        let mut s = fixtures::message_slot(20, SlotStatus::Confirmed);
+        s.bank_id = Some(bank);
+        s.created_at = REVISION_TIMESTAMP;
+        Message::Slot(Arc::new(s))
+    };
+    send(confirmation(200));
+    loop {
+        let u = read(&mut on.1).await;
+        let sealed = matches!(u.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderSlotSeal(s))if s.bank_id==Some(200));
+        if !matches!(u.message, FilteredUpdateOneof::Order(_)) {
+            a_on.push(u.encode_to_vec());
+        }
+        if sealed {
+            break;
+        }
+    }
+    // Only a conflicting status follows; there is no late account/tx/meta/footer.
+    send(confirmation(201));
+    for m in revision_callbacks(22, 22) {
+        if !matches!(&m,Message::Slot(s)if matches!(s.status,SlotStatus::Confirmed|SlotStatus::Finalized))
+        {
+            send(m);
+        }
+    }
+    let mut gap = false;
+    loop {
+        let u = read(&mut on.1).await;
+        if let Some(UpdateOneof::OrderGap(g)) = u.as_subscribe_update().update_oneof {
+            gap = g.reason == Some(7) && g.context == initial.context;
+        }
+        let done = matches!(&u.message,FilteredUpdateOneof::Slot(s)if s.slot==22 && s.status==SlotStatus::Processed);
+        if !matches!(u.message, FilteredUpdateOneof::Order(_)) {
+            a_on.push(u.encode_to_vec());
+        }
+        if done {
+            break;
+        }
+    }
+    let mut a_off = Vec::new();
+    loop {
+        let u = read(&mut off.1).await;
+        let done = matches!(&u.message,FilteredUpdateOneof::Slot(s)if s.slot==22 && s.status==SlotStatus::Processed);
+        a_off.push(u.encode_to_vec());
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        a_on, a_off,
+        "legacy projection retains the old conflict/drop behavior and original raw order"
+    );
+    let close = SubscribeRequest {
+        order_close: Some(SubscribeRequestOrderClose {
+            context: initial.context,
+            tracked_keys_sha256: initial.tracked_keys_sha256,
+        }),
+        ..Default::default()
+    };
+    on.0.send(Some((None, Filter::order_control(close))))
+        .expect("close after conflict");
+    let response = read(&mut on.1).await;
+    assert!(
+        gap,
+        "the real discarded/conflicting Confirmed branch must revoke B, not disappear"
+    );
+    assert!(
+        !matches!(response.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderEpochSeal(s))if s.reason==Some(2)),
+        "conflict cannot be followed by NORMAL_END"
+    );
+    assert!(!on.2.is_finished());
+    assert!(!off.2.is_finished());
+    drop(tx);
+    ingress.await.expect("ingress");
+    source.abort();
+    on.2.abort();
+    off.2.abort();
+}

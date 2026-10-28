@@ -516,6 +516,7 @@ impl BlockMachineStorage {
                         (&self.order_integrity, message_slot.bank_id)
                     {
                         if integrity.has_watchers() {
+                            integrity.note_authoritative(message_slot.slot, bank_id);
                             integrity.note_pending((message_slot.slot, bank_id));
                         }
                     }
@@ -682,6 +683,15 @@ impl BlockMachineStorage {
             return;
         };
         if self.discarded_bank_ids.contains_key(&bank_id) {
+            if matches!(
+                message_slot.status,
+                SlotStatus::Confirmed | SlotStatus::Finalized
+            ) {
+                if let Some(integrity) = self.order_integrity.as_ref().filter(|i| i.has_watchers())
+                {
+                    integrity.note_conflict(message_slot.slot);
+                }
+            }
             log::warn!(
                 "commitment update for slot {} targets bank_id {bank_id}, which was already discarded as a loser -- dropping",
                 message_slot.slot
@@ -726,6 +736,11 @@ impl BlockMachineStorage {
                         existing_level,
                         Some(CommitmentLevel::Confirmed) | Some(CommitmentLevel::Finalized)
                     ) {
+                        if let Some(integrity) =
+                            self.order_integrity.as_ref().filter(|i| i.has_watchers())
+                        {
+                            integrity.note_conflict(slot);
+                        }
                         log::warn!(
                             "commitment update for slot {slot} targets bank_id {bank_id}, but bank_id {existing} was already {existing_level:?} for this slot -- dropping",
                         );
@@ -1004,6 +1019,12 @@ impl BlockMachineStorage {
             self.num_buffered_finalized_slot += 1;
         }
         for update in to_emit {
+            if update.commitment == CommitmentLevel::Confirmed {
+                if let Some(integrity) = self.order_integrity.as_ref().filter(|i| i.has_watchers())
+                {
+                    integrity.note_authoritative(update.slot, update.bank_id);
+                }
+            }
             self.ready_queue.push_back((update, Arc::clone(frozen)));
         }
         if newly_finalized {
@@ -2374,5 +2395,35 @@ mod tests {
         );
         assert!(integrity.take_notifications().is_empty());
         drop(watch);
+    }
+    #[test]
+    fn revision_r5_authoritative_identity_survives_reconstruction_gc() {
+        let integrity = Arc::new(crate::order_integrity::OrderIntegrity::new(
+            Default::default(),
+        ));
+        let watch = integrity.register().expect("watch");
+        let mut source = BlockMachineStorage::new(1);
+        source.order_integrity = Some(Arc::clone(&integrity));
+        drive_bank_to_processed(&mut source, 10, 7, Some(9));
+        source.add(make_commitment_msg(10, Some(9), SlotStatus::Confirmed, 7));
+        while source.pop_ready_block().is_some() {}
+        watch
+            .bind((10, 7), &[4; 16])
+            .expect("promise original Bank");
+        source.evict_slot(10);
+        assert!(!source.resolved_bank_per_slot.contains_key(&10));
+        // No stale loser entry is available to trigger the old discarded-bank branch.
+        source.add(make_commitment_msg(10, Some(9), SlotStatus::Confirmed, 8));
+        assert!(
+            source.pop_ready_block().is_none(),
+            "A still cannot publish content it never reconstructed"
+        );
+        assert!(
+            watch
+                .pending_lates()
+                .expect("sticky revocation")
+                .contains(&(10, 7)),
+            "forgetting the replay bank must not forget the identity previously promised to B"
+        );
     }
 }

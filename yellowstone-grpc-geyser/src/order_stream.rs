@@ -186,7 +186,7 @@ impl OrderSession {
             .get_or_init(|| uuid::Uuid::new_v4().as_bytes().to_vec())
             .clone()
     }
-    pub fn mark_requested(&mut self) {
+    pub const fn mark_requested(&mut self) {
         self.ever = true;
     }
 
@@ -219,7 +219,7 @@ impl OrderSession {
             self.fail(
                 OrderGapReason::SourceAfterSeal,
                 Some(bank),
-                "source data after immutable Bank seal",
+                "source integrity changed after immutable Bank seal",
                 send,
             )?;
             if let Some(watch) = self.watch.as_ref() {
@@ -239,7 +239,7 @@ impl OrderSession {
                     reason: Some(OrderGapReason::SourceAfterSeal as i32),
                     slot: Some(bank.0),
                     bank_id: Some(bank.1),
-                    detail: "source data after sealed historical epoch".into(),
+                    detail: "source integrity changed after sealed historical epoch".into(),
                 },
             ));
             send(update)?;

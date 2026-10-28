@@ -20,6 +20,7 @@ struct BankWatch {
 #[derive(Debug, Default)]
 struct WatchState {
     banks: HashMap<BankRef, BankWatch>,
+    authoritative: HashMap<u64, u64>,
     pending: HashMap<BankRef, std::time::Instant>,
     overflow: bool,
 }
@@ -191,6 +192,80 @@ impl OrderIntegrity {
                 );
                 s.notifications.insert(bank);
             }
+            Ok(())
+        })();
+        self.record_error(result);
+    }
+    /// Remember authoritative identities independently of reconstruction GC.
+    pub fn note_authoritative(&self, slot: u64, bank_id: u64) {
+        if !self.has_watchers() {
+            return;
+        }
+        #[cfg(test)]
+        self.revision_locks.fetch_add(1, Ordering::Relaxed);
+        let result = (|| -> Result<bool> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+            let mut conflict = false;
+            for watcher in state.watchers.values_mut() {
+                if let Some(previous) = watcher.authoritative.get(&slot) {
+                    conflict |= *previous != bank_id;
+                } else if watcher.authoritative.len() < self.limits.max_banks_per_stream {
+                    watcher.authoritative.insert(slot, bank_id);
+                } else {
+                    watcher.overflow = true;
+                }
+            }
+            Ok(conflict)
+        })();
+        match result {
+            Ok(true) => self.note_conflict(slot),
+            Ok(false) => {}
+            Err(error) => self.record_error(Err(error)),
+        }
+    }
+    /// Authoritative identity conflicts revoke every promised Bank at the slot,
+    /// including peers removed from the short-lived reconstruction/replay maps.
+    pub fn note_conflict(&self, slot: u64) {
+        if !self.has_watchers() {
+            return;
+        }
+        #[cfg(test)]
+        self.revision_locks.fetch_add(1, Ordering::Relaxed);
+        let result = (|| -> Result<()> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+            let mut notices = HashSet::new();
+            let mut overflow = false;
+            for watcher in state.watchers.values_mut() {
+                for (bank, entry) in watcher.banks.iter_mut().filter(|((s, _), _)| *s == slot) {
+                    if !entry.late {
+                        entry.late = true;
+                        if notices.len() < self.limits.max_notifications || notices.contains(bank) {
+                            notices.insert(*bank);
+                        } else {
+                            overflow = true;
+                        }
+                    }
+                }
+            }
+            // Even when the broadcast-notice budget is full, all sticky flags
+            // above remain set for each client's independent deadline retry.
+            for bank in notices {
+                if state.notifications.contains(&bank) {
+                    continue;
+                }
+                if state.notifications.len() < self.limits.max_notifications {
+                    state.notifications.insert(bank);
+                } else {
+                    overflow = true;
+                }
+            }
+            ensure!(!overflow, "B conflict notification resource limit");
             Ok(())
         })();
         self.record_error(result);
