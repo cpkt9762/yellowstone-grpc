@@ -271,7 +271,15 @@ impl GeyserEventAdapter for E2EGeyserEventAdapter {
             UpdateOneof::Block(_) | UpdateOneof::EntryUpdateParent(_) => None,
             UpdateOneof::Ping(_)
             | UpdateOneof::Pong(_)
-            | UpdateOneof::OwnerRejectExemption(_) => None,
+            | UpdateOneof::OwnerRejectExemption(_)
+            // B uses physical-stream epochs and exact source sequence/digests.
+            // It must not enter legacy dedup, replay cursors or reconstructed bank data.
+            | UpdateOneof::TransactionOrder(_)
+            | UpdateOneof::OrderCoverageAck(_)
+            | UpdateOneof::OrderSlotSeal(_)
+            | UpdateOneof::OrderEpochSeal(_)
+            | UpdateOneof::OrderGap(_)
+            | UpdateOneof::OrderRejected(_) => None,
         }
     }
 }
