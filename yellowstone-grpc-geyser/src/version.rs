@@ -6,6 +6,9 @@ pub struct Version {
     pub version: &'static str,
     pub proto: &'static str,
     pub solana: &'static str,
+    pub git_sha: &'static str,
+    pub proto_schema_sha256: &'static str,
+    pub capabilities: [OrderCapabilityJson; 1],
     pub git: &'static str,
     pub rustc: &'static str,
     pub buildts: &'static str,
@@ -16,6 +19,9 @@ pub const VERSION: Version = Version {
     version: env!("CARGO_PKG_VERSION"),
     proto: env!("YELLOWSTONE_GRPC_PROTO_VERSION"),
     solana: env!("SOLANA_SDK_VERSION"),
+    git_sha: env!("ORDER_GIT_SHA"),
+    proto_schema_sha256: env!("ORDER_PROTO_SHA256"),
+    capabilities: [ORDER_CAPABILITY],
     git: env!("GIT_VERSION"),
     rustc: env!("VERGEN_RUSTC_SEMVER"),
     buildts: env!("VERGEN_BUILD_TIMESTAMP"),
@@ -44,3 +50,26 @@ impl Default for GrpcVersionInfo {
         }
     }
 }
+
+// JSON mirrors every field of the wire capability, under version.capabilities.
+#[derive(Debug, Serialize)]
+pub struct OrderCapabilityJson {
+    name: &'static str,
+    protocol_version: u32,
+    permission_semantics: &'static str,
+    commitment: i32,
+    encoder_profile: &'static str,
+    bank_scoped: bool,
+    zero_write_seals: bool,
+    full_target_unchanged: bool,
+}
+pub const ORDER_CAPABILITY: OrderCapabilityJson = OrderCapabilityJson {
+    name: "order_writes_v1",
+    protocol_version: 1,
+    permission_semantics: "hb_upper_v2",
+    commitment: 1,
+    encoder_profile: "prost_order_v1",
+    bank_scoped: true,
+    zero_write_seals: true,
+    full_target_unchanged: true,
+};

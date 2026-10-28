@@ -8280,6 +8280,7 @@ dependencies = [
  "reqwest 0.13.5",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "smallvec",
  "solana-account 4.7.0",
  "solana-account-decoder",

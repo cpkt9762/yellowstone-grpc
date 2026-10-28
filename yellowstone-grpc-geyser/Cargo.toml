@@ -21,6 +21,8 @@ default = []
 bench = ["dep:solana-storage-proto"]
 
 [dependencies]
+# Reuse the existing locked SHA-256 implementation for protocol digests.
+sha2 = "=0.10.9"
 foldhash = { workspace = true }
 arc-swap = { workspace = true }
 anyhow = { workspace = true }
@@ -111,6 +113,7 @@ harness = false
 required-features = ["bench"]
 
 [build-dependencies]
+sha2 = "=0.10.9"
 anyhow = { workspace = true }
 cargo-lock = { workspace = true }
 git-version = { workspace = true }

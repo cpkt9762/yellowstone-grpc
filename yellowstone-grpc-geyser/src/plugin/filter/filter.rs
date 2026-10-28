@@ -2709,6 +2709,8 @@ mod tests {
 
         // Every kind subscribed: three transaction updates (one is a vote), two accounts, one entry.
         let filter = create(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             transactions: HashMap::from([(name(), Default::default())]),
             transactions_status: HashMap::from([(
                 name(),
@@ -2749,6 +2751,8 @@ mod tests {
 
         // A kind the client did not subscribe to yields nothing.
         let filter = create(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             entry: HashMap::from([(name(), Default::default())]),
             ..Default::default()
         });
@@ -2757,6 +2761,8 @@ mod tests {
         assert_eq!(updates, one_by_one(&filter));
 
         let filter = create(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             slots: HashMap::from([(name(), Default::default())]),
             ..Default::default()
         });
@@ -2905,6 +2911,8 @@ mod tests {
     fn test_filters_all_empty() {
         // ensure Filter can be created with empty values
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -2940,6 +2948,8 @@ mod tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -2980,6 +2990,8 @@ mod tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3019,6 +3031,8 @@ mod tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3064,6 +3078,8 @@ mod tests {
         );
 
         let mut config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3133,6 +3149,8 @@ mod tests {
         );
 
         let mut config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3202,6 +3220,8 @@ mod tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3257,6 +3277,8 @@ mod tests {
         );
 
         let mut config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3480,6 +3502,8 @@ mod tests {
             }),
         ));
         let request = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             entry: HashMap::from([
                 ("plain".to_owned(), SubscribeRequestFilterEntry::default()),
                 (
@@ -3868,6 +3892,8 @@ mod tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3899,6 +3925,8 @@ mod tests {
 
         let filter = Filter::new(
             &SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 slots,
                 ..Default::default()
             },
@@ -3953,6 +3981,8 @@ mod tests {
             ),
         ]);
         let request = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             accounts: accounts.clone(),
             ..Default::default()
         };
@@ -4033,6 +4063,8 @@ mod tests {
 
         let single_filter = Filter::new(
             &SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 accounts: HashMap::from([(
                     "single".to_owned(),
                     SubscribeRequestFilterAccounts {
@@ -4287,6 +4319,8 @@ mod account_filter_regression_tests {
         ]);
         let filter = Filter::new(
             &SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 accounts,
                 ..Default::default()
             },
@@ -5029,6 +5063,8 @@ mod parity_oracle {
 
         Scenario {
             request: SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 accounts,
                 ..Default::default()
             },
@@ -5213,6 +5249,8 @@ mod filter_kind_coverage {
         interslot_updates: Option<bool>,
     ) -> SubscribeRequest {
         SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             slots: HashMap::from([(
                 "s".to_owned(),
                 SubscribeRequestFilterSlots {
@@ -5278,6 +5316,8 @@ mod filter_kind_coverage {
     #[test]
     fn entry_filter_matches_every_entry_and_absence_yields_nothing() {
         let filter = build(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             entry: HashMap::from([("e".to_owned(), SubscribeRequestFilterEntry::default())]),
             ..Default::default()
         });
@@ -5293,6 +5333,8 @@ mod filter_kind_coverage {
     #[test]
     fn blocks_meta_filter_matches_and_reports_every_subscribed_name() {
         let filter = build(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             blocks_meta: HashMap::from([
                 ("a".to_owned(), SubscribeRequestFilterBlocksMeta {}),
                 ("b".to_owned(), SubscribeRequestFilterBlocksMeta {}),
@@ -5314,6 +5356,8 @@ mod filter_kind_coverage {
     #[test]
     fn block_footer_filter_matches_and_reports_every_subscribed_name() {
         let filter = build(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: HashMap::from([
                 ("a".to_owned(), SubscribeRequestFilterBlockFooter::default()),
                 ("b".to_owned(), SubscribeRequestFilterBlockFooter::default()),
@@ -5370,6 +5414,8 @@ mod filter_kind_coverage {
                 ],
             ] {
                 let request = SubscribeRequest {
+                    order_writes: None,
+                    order_close: None,
                     block_footer: settings
                         .iter()
                         .map(|(name, include_certificates)| {
@@ -5428,6 +5474,8 @@ mod filter_kind_coverage {
     #[test]
     fn blocks_meta_filter_does_not_match_a_block_footer() {
         let filter = build(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             blocks_meta: HashMap::from([("a".to_owned(), SubscribeRequestFilterBlocksMeta {})]),
             ..Default::default()
         });
@@ -5448,6 +5496,8 @@ mod filter_kind_coverage {
         cuckoo_account_include: Option<ProtoCuckooFilter>,
     ) -> SubscribeRequest {
         SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             blocks: HashMap::from([(
                 "b".to_owned(),
                 SubscribeRequestFilterBlocks {
@@ -5726,6 +5776,8 @@ mod cuckoo_tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -5788,6 +5840,8 @@ mod cuckoo_tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -5842,6 +5896,8 @@ mod cuckoo_tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -5900,6 +5956,8 @@ mod cuckoo_tests {
         );
 
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -6093,6 +6151,8 @@ mod cuckoo_tests {
             tx_filters: HashMap<String, SubscribeRequestFilterTransactions>,
         ) -> Filter {
             let config = SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -6634,6 +6694,8 @@ mod cuckoo_tests {
             );
 
             let config = SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -6681,6 +6743,8 @@ mod cuckoo_tests {
             );
 
             let config = SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -6724,6 +6788,8 @@ mod cuckoo_tests {
             );
 
             let config = SubscribeRequest {
+                order_writes: None,
+                order_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -6944,6 +7010,8 @@ mod owner_reject_tests {
 
     fn request(key: Pubkey, opt_in: Option<bool>) -> SubscribeRequest {
         SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             accounts: HashMap::from([(
                 "explicit".to_owned(),
                 SubscribeRequestFilterAccounts {
@@ -7085,6 +7153,8 @@ mod owner_reject_tests {
             fixtures::simple_message_account(Pubkey::new_unique(), Pubkey::new_unique());
         Arc::make_mut(&mut exempt).owner_reject_exempt = true;
         let config = SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             blocks: HashMap::from([(
                 "block".to_owned(),
                 SubscribeRequestFilterBlocks {

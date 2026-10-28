@@ -8,6 +8,7 @@ pub mod file_watcher;
 pub mod grpc;
 pub mod metered;
 pub mod metrics;
+pub mod order_protocol;
 pub mod plugin;
 pub mod ratelimit;
 pub mod stream;

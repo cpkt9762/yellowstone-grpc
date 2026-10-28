@@ -49,6 +49,8 @@ message SubscribeRequest {
   optional SubscribeRequestPing ping = 9;
   optional uint64 from_slot = 11;
   map<string, SubscribeRequestFilterBlockFooter> block_footer = 12;
+  optional SubscribeRequestOrderWrites order_writes = 1002;
+  optional SubscribeRequestOrderClose order_close = 1003;
 }
 
 // Hash algorithm used to build the filter. Carried on the wire so future
@@ -210,6 +212,12 @@ message SubscribeUpdate {
     SubscribeUpdateEntryUpdateParent entry_update_parent = 13;
     // Fork-local (cpkt9762). Sent only to clients that opted in.
     SubscribeUpdateOwnerRejectExemption owner_reject_exemption = 1001;
+    SubscribeUpdateTransactionOrder transaction_order = 1002;
+    SubscribeUpdateOrderCoverageAck order_coverage_ack = 1003;
+    SubscribeUpdateOrderSlotSeal order_slot_seal = 1004;
+    SubscribeUpdateOrderEpochSeal order_epoch_seal = 1005;
+    SubscribeUpdateOrderGap order_gap = 1006;
+    SubscribeUpdateOrderRejected order_rejected = 1007;
   }
   google.protobuf.Timestamp created_at = 11;
 }
@@ -531,4 +539,132 @@ message IsBlockhashValidRequest {
 message IsBlockhashValidResponse {
   uint64 slot = 1;
   bool valid = 2;
+}
+
+// Fork-local source protocol. Presence of every scalar is part of the contract.
+message OrderContext {
+  optional uint32 protocol_version = 1;
+  bytes source_stream_id = 2;
+  bytes source_epoch = 3;
+  optional uint64 request_version = 4;
+}
+message OrderCapabilities {
+  optional string name = 1;
+  optional uint32 protocol_version = 2;
+  optional string permission_semantics = 3;
+  optional CommitmentLevel commitment = 4;
+  optional string encoder_profile = 5;
+  optional bool bank_scoped = 6;
+  optional bool zero_write_seals = 7;
+  optional bool full_target_unchanged = 8;
+}
+message OrderKeyCoverage {
+  bytes pubkey = 1;
+  optional uint64 active_from_slot = 2;
+  optional uint64 owner_exempt_active_from_slot = 3;
+}
+message SubscribeRequestOrderWrites {
+  optional uint32 protocol_version = 1;
+  optional uint64 request_version = 2;
+  optional bytes previous_epoch = 3;
+  repeated bytes tracked_keys = 4;
+  bytes request_sha256 = 5;
+}
+message SubscribeRequestOrderClose {
+  OrderContext context = 1;
+  bytes tracked_keys_sha256 = 2;
+}
+message SubscribeUpdateOrderCoverageAck {
+  OrderContext context = 1;
+  bytes request_sha256 = 2;
+  bytes tracked_keys_sha256 = 3;
+  repeated OrderKeyCoverage keys = 4;
+  optional uint64 active_from_slot = 5;
+  optional bytes previous_epoch = 6;
+  optional bytes previous_epoch_seal_sha256 = 7;
+  optional uint64 observed_callback_slot_high_watermark = 8;
+  bytes owner_exemption_update_sha256 = 9;
+  OrderCapabilities capabilities = 10;
+}
+enum OrderPermissionsState {
+  ORDER_PERMISSIONS_UNSPECIFIED = 0;
+  KNOWN = 1;
+  UNKNOWN_SCOPE_ALL = 2;
+}
+message SubscribeUpdateTransactionOrder {
+  OrderContext context = 1;
+  optional uint64 source_seq = 2;
+  optional uint64 slot = 3;
+  optional uint64 bank_id = 4;
+  optional uint64 index = 5;
+  bytes signature = 6;
+  optional bool is_vote = 7;
+  solana.storage.ConfirmedBlock.Transaction transaction = 8;
+  solana.storage.ConfirmedBlock.TransactionError err = 9;
+  repeated bytes loaded_writable = 10;
+  repeated bytes loaded_readonly = 11;
+  optional OrderPermissionsState permissions_state = 12;
+}
+message SubscribeUpdateOrderSlotSeal {
+  OrderContext context = 1;
+  optional uint64 slot = 2;
+  optional uint64 bank_id = 3;
+  optional uint64 event_count = 4;
+  optional uint64 first_source_seq = 5;
+  optional uint64 last_source_seq = 6;
+  bytes ordered_events_sha256 = 7;
+  bytes confirmed_update_sha256 = 8;
+  bytes block_meta_update_sha256 = 9;
+  optional uint64 observed_transaction_count = 10;
+  optional uint64 executed_transaction_count = 11;
+  optional bool complete_bank = 12;
+}
+enum OrderEpochSealReason {
+  ORDER_EPOCH_SEAL_UNSPECIFIED = 0;
+  REPLACED = 1;
+  NORMAL_END = 2;
+  ERROR = 3;
+}
+message SubscribeUpdateOrderEpochSeal {
+  OrderContext context = 1;
+  optional uint64 event_count = 2;
+  optional uint64 last_source_seq = 3;
+  bytes ordered_events_sha256 = 4;
+  optional uint64 slot_seal_count = 5;
+  bytes ordered_slot_seals_sha256 = 6;
+  optional OrderEpochSealReason reason = 7;
+  bytes tracked_keys_sha256 = 8;
+}
+enum OrderGapReason {
+  ORDER_GAP_UNSPECIFIED = 0;
+  UNKNOWN_UNENCODABLE = 1;
+  SOURCE_COUNT_MISMATCH = 2;
+  INCOMPLETE_BANK = 3;
+  QUEUE_OR_BROADCAST_GAP = 4;
+  SUBSCRIPTION_PROTOCOL = 5;
+  RESOURCE_LIMIT = 6;
+  SOURCE_AFTER_SEAL = 7;
+  SHUTDOWN = 8;
+}
+message SubscribeUpdateOrderGap {
+  OrderContext context = 1;
+  optional uint64 next_source_seq = 2;
+  optional OrderGapReason reason = 3;
+  optional uint64 slot = 4;
+  optional uint64 bank_id = 5;
+  string detail = 6;
+}
+enum OrderRejectReason {
+  ORDER_REJECT_UNSPECIFIED = 0;
+  INVALID_REQUEST = 1;
+  UNSUPPORTED_CAPABILITY = 2;
+  SCOPE_COVERAGE_INVALID = 3;
+  PENDING_EXISTS = 4;
+}
+message SubscribeUpdateOrderRejected {
+  bytes source_stream_id = 1;
+  optional uint64 request_version = 2;
+  optional bytes request_sha256 = 3;
+  optional OrderRejectReason reason = 4;
+  string detail = 5;
 }

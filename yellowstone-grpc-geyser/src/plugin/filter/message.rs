@@ -15,6 +15,7 @@ use {
         buf::{Buf, BufMut},
         Bytes,
     },
+    prost::Message as _,
     prost::{
         encoding::{
             encode_key, encode_varint, encoded_len_varint, key_len, message, DecodeContext,
@@ -140,6 +141,11 @@ impl WeightScales {
     /// weigh `1`.
     pub(crate) fn update_weight(&self, update: &FilteredUpdate) -> u32 {
         let scale = match &update.message {
+            FilteredUpdateOneof::Order(message) => {
+                return u32::try_from(message.encoded_len())
+                    .unwrap_or(u32::MAX)
+                    .max(1);
+            }
             FilteredUpdateOneof::Account(update) => {
                 return self
                     .account
@@ -196,6 +202,10 @@ pub struct FilteredUpdate {
 
 impl prost::Message for FilteredUpdate {
     fn encode_raw(&self, buf: &mut impl BufMut) {
+        if let FilteredUpdateOneof::Order(update) = &self.message {
+            update.encode_raw(buf);
+            return;
+        }
         for name in self.filters.iter().map(|filter| filter.as_ref()) {
             encode_key(1u32, WireType::LengthDelimited, buf);
             encode_varint(name.len() as u64, buf);
@@ -206,6 +216,9 @@ impl prost::Message for FilteredUpdate {
     }
 
     fn encoded_len(&self) -> usize {
+        if let FilteredUpdateOneof::Order(update) = &self.message {
+            return update.encoded_len();
+        }
         prost_repeated_encoded_len_map!(1u32, self.filters, |filter| filter.as_ref().len())
             + self.message.encoded_len()
             + message::encoded_len(11u32, &self.created_at)
@@ -293,6 +306,7 @@ impl FilteredUpdate {
 
     pub fn as_subscribe_update(&self) -> SubscribeUpdate {
         let message = match &self.message {
+            FilteredUpdateOneof::Order(update) => return *update.clone(),
             FilteredUpdateOneof::Account(msg) => UpdateOneof::Account(SubscribeUpdateAccount {
                 account: Some(Self::as_subscribe_update_account(
                     &msg.account,
@@ -393,6 +407,8 @@ pub type FilteredUpdateFilters = SmallVec<[FilterName; 4]>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilteredUpdateOneof {
+    /// Complete generated-prost envelope: new messages must use prost_order_v1.
+    Order(Box<SubscribeUpdate>),
     Account(FilteredUpdateAccount),                            // 2
     Slot(FilteredUpdateSlot),                                  // 3
     Transaction(FilteredUpdateTransaction),                    // 4
@@ -469,6 +485,7 @@ impl FilteredUpdateOneof {
 impl prost::Message for FilteredUpdateOneof {
     fn encode_raw(&self, buf: &mut impl BufMut) {
         match self {
+            Self::Order(update) => update.encode_raw(buf),
             Self::EntryUpdateParent(msg) => message::encode(13u32, &msg.update_parent, buf),
             Self::Account(msg) => message::encode(2u32, msg, buf),
             Self::Slot(msg) => message::encode(3u32, msg, buf),
@@ -489,6 +506,7 @@ impl prost::Message for FilteredUpdateOneof {
 
     fn encoded_len(&self) -> usize {
         match self {
+            Self::Order(update) => update.encoded_len(),
             Self::EntryUpdateParent(msg) => message::encoded_len(13u32, &msg.update_parent),
             Self::Account(msg) => message::encoded_len(2u32, msg),
             Self::Slot(msg) => message::encoded_len(3u32, msg),

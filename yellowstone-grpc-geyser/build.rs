@@ -1,5 +1,6 @@
 use {
     cargo_lock::Lockfile,
+    sha2::{Digest, Sha256},
     std::collections::HashSet,
     tonic_prost_build::manual::{Builder, Method, Service},
 };
@@ -14,6 +15,26 @@ fn main() -> anyhow::Result<()> {
     println!(
         "cargo:rustc-env=GIT_VERSION={}",
         git_version::git_version!()
+    );
+
+    // Build metadata is derived from this exact worktree and schema.
+    println!(
+        "cargo:rustc-env=ORDER_GIT_SHA={}",
+        git_version::git_version!(args = ["--always", "--abbrev=40", "--exclude=*"])
+    );
+    let schemas = ["geyser.proto", "solana-storage.proto"];
+    let mut entries = Vec::new();
+    for name in schemas {
+        let path = format!("../yellowstone-grpc-proto/proto/{name}");
+        println!("cargo:rerun-if-changed={path}");
+        let bytes = std::fs::read(&path)?;
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        entries.push(format!("{{\"name\":\"{name}\",\"sha256\":\"{hash}\"}}"));
+    }
+    let canonical = format!("[{}]", entries.join(","));
+    println!(
+        "cargo:rustc-env=ORDER_PROTO_SHA256={:x}",
+        Sha256::digest(canonical.as_bytes())
     );
 
     // Extract packages version
