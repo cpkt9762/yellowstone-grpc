@@ -461,6 +461,19 @@ impl OrderSession {
         raw: &SubscribeRequest,
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| validate_coverage(raw, &p.request.tracked_keys).is_err())
+        {
+            if let Some(pending) = self.pending.take() {
+                send(self.reject(
+                    Some(&pending.request),
+                    OrderRejectReason::ScopeCoverageInvalid,
+                    "installed A update removed pending scope coverage",
+                ))?;
+            }
+        }
         if let Some(epoch) = &self.active {
             let keys = epoch
                 .keys
@@ -475,6 +488,22 @@ impl OrderSession {
                     send,
                 )?;
             }
+        }
+        Ok(())
+    }
+    pub const fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+    /// The caller has just installed this filter and enqueued this actual full owner ack.
+    pub fn refresh_pending_owner(&mut self, owner: &FilteredUpdate) -> Result<()> {
+        if let Some(pending) = self.pending.as_mut() {
+            let Some(subscribe_update::UpdateOneof::OwnerRejectExemption(current)) =
+                owner.as_subscribe_update().update_oneof
+            else {
+                anyhow::bail!("pending scope requires actual owner registry acknowledgement");
+            };
+            pending.owner = current;
+            pending.owner_hash = sha256(&owner.encode_to_vec());
         }
         Ok(())
     }

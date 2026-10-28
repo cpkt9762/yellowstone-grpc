@@ -2004,6 +2004,7 @@ impl GrpcService {
                             let _admission=filter_new.order_admission.take();
                             let wire_error=filter_new.order_wire_error.clone();
                             let order_source=filter_new.order_source.clone();
+                            let pending_conflict=session.order.has_pending();
                             if let Some(raw)=order_source.as_ref() {
                                 if raw.order_writes.is_some() && raw.ping.is_some() {
                                     let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,"B control cannot carry ping"));
@@ -2050,8 +2051,13 @@ impl GrpcService {
                                 }
                             }
 
+                            if session.order.has_pending(){
+                                if let Some(owner)=owner_ack.as_ref(){b_step!(session.order.refresh_pending_owner(owner));}
+                            }
                             if let Some(raw)=order_source.as_ref().filter(|r|r.order_writes.is_some() && watch_ready) {
-                                if let Some(error)=wire_error.as_ref() {
+                                if pending_conflict {
+                                    let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::PendingExists,"another B scope was pending when this request arrived"));
+                                }else if let Some(error)=wire_error.as_ref() {
                                     let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,error));
                                 }else if let Some(owner)=owner_ack.as_ref() {
                                     b_step!(session.order.request(raw, owner, broadcast.callback_watermark.load(Ordering::SeqCst), &mut b_send));

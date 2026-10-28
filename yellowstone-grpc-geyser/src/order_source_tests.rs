@@ -915,3 +915,148 @@ async fn revision_r1_zero_b_callback_pipeline_matches_3a3d1cd_without_order_work
         "zero B: no B queue/timer/client scheduling"
     );
 }
+
+fn revision_request(
+    keys: &[u8],
+    previous: Option<&yellowstone_grpc_proto::prelude::OrderContext>,
+) -> SubscribeRequest {
+    let mut r = request(previous.is_some());
+    r.accounts.get_mut("accounts").expect("accounts").account = keys
+        .iter()
+        .map(|k| Pubkey::new_from_array([*k; 32]).to_string())
+        .collect();
+    if let Some(context) = previous {
+        let order = r.order_writes.as_mut().expect("B request");
+        order.request_version = context.request_version.and_then(|v| v.checked_add(1));
+        order.previous_epoch = Some(context.source_epoch.clone());
+        order.tracked_keys = keys.iter().map(|k| vec![*k; 32]).collect();
+        order.request_sha256 = request_digest(order);
+    }
+    r
+}
+fn revision_tracked_filter(r: &SubscribeRequest) -> Filter {
+    // The real inbound stream retains subsequent A requests once B was requested.
+    let mut f = filter(r);
+    f.order_source = Some(Arc::new(r.clone()));
+    f
+}
+#[tokio::test]
+async fn revision_r2_pending_scope_removed_by_installed_a_filter_is_rejected() {
+    for second_b in [false, true] {
+        let b = SubscriberChannels::new(64, 64, 64);
+        let mut c = spawn(b.clone());
+        let initial = install(&mut c, &request(true)).await.expect("initial");
+        begin(&b, 10, false);
+        for _ in 0..4 {
+            read(&mut c.1).await;
+        }
+        let replace = revision_request(&[1, 2], initial.context.as_ref());
+        let pending_hash = replace
+            .order_writes
+            .as_ref()
+            .expect("replace")
+            .request_sha256
+            .clone();
+        c.0.send(Some((None, revision_tracked_filter(&replace))))
+            .expect("pending replace");
+        assert!(matches!(
+            read(&mut c.1).await.message,
+            FilteredUpdateOneof::OwnerRejectExemption(_)
+        ));
+        let next = if second_b {
+            revision_request(&[1, 3], initial.context.as_ref())
+        } else {
+            revision_request(&[1], None)
+        };
+        c.0.send(Some((None, revision_tracked_filter(&next))))
+            .expect("A removes pending K1");
+        let mut seen = Vec::new();
+        loop {
+            let u = read(&mut c.1).await;
+            let owner = matches!(u.message, FilteredUpdateOneof::OwnerRejectExemption(_));
+            seen.push(u);
+            if owner {
+                break;
+            }
+        }
+        meta(&b, 10);
+        end(&b, 10);
+        b.send(
+            CommitmentLevel::Confirmed,
+            Arc::new(vec![Message::Slot(Arc::new(fixtures::message_slot(
+                20,
+                SlotStatus::CreatedBank,
+            )))]),
+        );
+        loop {
+            let u = read(&mut c.1).await;
+            let done = matches!(&u.message,FilteredUpdateOneof::Slot(s)if s.slot==20);
+            seen.push(u);
+            if done {
+                break;
+            }
+        }
+        assert!(!seen.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderCoverageAck(a))if a.context.as_ref().and_then(|c|c.request_version)==Some(2))),"pending K1 scope cannot activate after installed A removes its coverage");
+        assert!(seen.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderRejected(r))if r.reason==Some(3) && r.request_sha256==Some(pending_hash.clone()))),"cancelled pending request needs its own explicit rejection");
+        if second_b {
+            let hash = next
+                .order_writes
+                .as_ref()
+                .expect("second B")
+                .request_sha256
+                .clone();
+            assert!(seen.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderRejected(r))if r.reason==Some(4) && r.request_sha256==Some(hash.clone()))),"second concurrent B remains PENDING_EXISTS");
+        }
+        let close = SubscribeRequest {
+            order_close: Some(SubscribeRequestOrderClose {
+                context: initial.context,
+                tracked_keys_sha256: initial.tracked_keys_sha256,
+            }),
+            ..Default::default()
+        };
+        c.0.send(Some((None, Filter::order_control(close))))
+            .expect("old scope still usable");
+        assert!(
+            matches!(read(&mut c.1).await.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderEpochSeal(s))if s.reason==Some(2))
+        );
+        c.2.abort();
+    }
+}
+#[tokio::test]
+async fn revision_r2_pending_ack_binds_latest_installed_owner_registry() {
+    let b = SubscriberChannels::new(64, 64, 64);
+    let mut c = spawn(b.clone());
+    let initial = install(&mut c, &request(true)).await.expect("initial");
+    begin(&b, 10, false);
+    for _ in 0..4 {
+        read(&mut c.1).await;
+    }
+    let replace = revision_request(&[1, 2], initial.context.as_ref());
+    c.0.send(Some((None, revision_tracked_filter(&replace))))
+        .expect("replace");
+    read(&mut c.1).await;
+    let a = revision_request(&[1, 2, 3], None);
+    c.0.send(Some((None, revision_tracked_filter(&a))))
+        .expect("retained pending keys");
+    let owner = read(&mut c.1).await;
+    assert!(matches!(
+        owner.message,
+        FilteredUpdateOneof::OwnerRejectExemption(_)
+    ));
+    meta(&b, 10);
+    end(&b, 10);
+    for _ in 0..4 {
+        read(&mut c.1).await;
+    }
+    let Some(UpdateOneof::OrderCoverageAck(ack)) =
+        read(&mut c.1).await.as_subscribe_update().update_oneof
+    else {
+        panic!("new ack");
+    };
+    assert_eq!(
+        ack.owner_exemption_update_sha256,
+        crate::order_protocol::sha256(&owner.encode_to_vec()),
+        "activation must attest the current installed owner registry"
+    );
+    c.2.abort();
+}
