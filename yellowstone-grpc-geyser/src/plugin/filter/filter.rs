@@ -147,6 +147,7 @@ macro_rules! filtered_updates_once_ref {
 
 #[derive(Debug, Clone)]
 pub struct Filter {
+    pub(crate) order_admission: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(crate) order_wire_error: Option<String>,
     pub(crate) order_source: Option<Arc<SubscribeRequest>>,
     accounts: FilterAccounts,
@@ -165,6 +166,7 @@ pub struct Filter {
 impl Default for Filter {
     fn default() -> Self {
         Self {
+            order_admission: None,
             order_wire_error: None,
             order_source: None,
             accounts: FilterAccounts::default(),
@@ -263,6 +265,7 @@ impl Filter {
             return Err(FilterError::OwnerRejectReplay);
         }
         Ok(Self {
+            order_admission: None,
             order_wire_error: None,
             order_source: Some(Arc::new(config.clone())),
             accounts: FilterAccounts::new(&config.accounts, &limits.accounts, names)?,

@@ -283,6 +283,7 @@ impl BankBuffer {
         ));
 
         FrozenBank {
+            order_source_valid: std::sync::atomic::AtomicBool::new(true),
             bank_id: self.bank_id,
             slot: self.slot,
             original_messages: Arc::new(dedup_messages),
@@ -296,6 +297,7 @@ impl BankBuffer {
 }
 
 pub struct FrozenBank {
+    order_source_valid: std::sync::atomic::AtomicBool,
     bank_id: BankId,
     slot: Slot,
     // The bank's content in arrival order, without its `CreatedBank`.
@@ -310,6 +312,10 @@ pub struct FrozenBank {
 }
 
 impl FrozenBank {
+    pub fn order_source_valid(&self) -> bool {
+        self.order_source_valid
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
     pub fn get_message_block(&self) -> Arc<MessageBlock> {
         Arc::clone(&self.pre_computed_message_block)
     }
@@ -424,6 +430,7 @@ impl<'storage> Iterator for ReplayIter<'storage> {
 /// are still being resolved; the moment any commitment status update names a `bank_id` as
 /// the canonical bank for its slot, every sibling buffer for that slot is discarded.
 pub struct BlockMachineStorage {
+    pub(crate) order_integrity: Option<Arc<crate::order_integrity::OrderIntegrity>>,
     // Bank instances still accumulating content, keyed by bank_id.
     banks: FoldHashMap<BankId, BankBuffer>,
     // Every bank_id ever seen for a slot, so the losers can be found once a winner is known.
@@ -479,6 +486,7 @@ pub struct BlockMachineStorage {
 impl BlockMachineStorage {
     pub fn new(replayed_capacity: usize) -> Self {
         Self {
+            order_integrity: None,
             banks: FoldHashMap::with_capacity(replayed_capacity),
             slot_to_banks: FoldHashMap::with_capacity(replayed_capacity),
             discarded_bank_ids: FoldHashMap::new(),
@@ -499,7 +507,16 @@ impl BlockMachineStorage {
     pub fn add(&mut self, message: Message) {
         self.observe_slot(message.get_slot());
         match message {
-            Message::Slot(message_slot) => self.handle_slot_status(&message_slot),
+            Message::Slot(message_slot) => {
+                if message_slot.status == SlotStatus::Confirmed {
+                    if let (Some(integrity), Some(bank_id)) =
+                        (&self.order_integrity, message_slot.bank_id)
+                    {
+                        integrity.note_pending((message_slot.slot, bank_id));
+                    }
+                }
+                self.handle_slot_status(&message_slot)
+            }
             Message::Account(_) | Message::Transaction(_) | Message::Entry(_) => {
                 self.handle_block_data(message);
             }
@@ -890,6 +907,9 @@ impl BlockMachineStorage {
     /// resolved winner and the slot already has a known commitment floor -- e.g. inherited
     /// from a descendant before this bank even sealed -- its delivery is emitted now too.
     fn on_bank_sealed(&mut self, slot: Slot, bank_id: BankId, frozen: Arc<FrozenBank>) {
+        if let Some(integrity) = &self.order_integrity {
+            integrity.register_bank((slot, bank_id));
+        }
         self.min_slot = Some(self.min_slot.map_or(slot, |m| m.min(slot)));
         self.add_replay_candidate(slot, frozen);
         self.try_infer_sole_candidate_winner(slot);
@@ -989,6 +1009,14 @@ impl BlockMachineStorage {
             // reconstruction, so it's ignored here rather than buffered.
             return;
         };
+        if let Some(integrity) = &self.order_integrity {
+            integrity.note_late((slot, bank_id));
+        }
+        if let Some(frozen) = self.replay_candidate(slot, bank_id) {
+            frozen
+                .order_source_valid
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.discarded_bank_ids.contains_key(&bank_id) {
             return;
         }
@@ -1012,6 +1040,14 @@ impl BlockMachineStorage {
     fn handle_block_meta(&mut self, block_meta: Arc<MessageBlockMeta>) {
         let bank_id = block_meta.bank_id;
         let slot = block_meta.slot;
+        if let Some(integrity) = &self.order_integrity {
+            integrity.note_late((slot, bank_id));
+        }
+        if let Some(frozen) = self.replay_candidate(slot, bank_id) {
+            frozen
+                .order_source_valid
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.discarded_bank_ids.contains_key(&bank_id) {
             return;
         }
@@ -1033,6 +1069,14 @@ impl BlockMachineStorage {
     fn handle_block_footer(&mut self, block_footer: Arc<MessageBlockFooter>) {
         let bank_id = block_footer.bank_id;
         let slot = block_footer.slot;
+        if let Some(integrity) = &self.order_integrity {
+            integrity.note_late((slot, bank_id));
+        }
+        if let Some(frozen) = self.replay_candidate(slot, bank_id) {
+            frozen
+                .order_source_valid
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.discarded_bank_ids.contains_key(&bank_id) {
             return;
         }

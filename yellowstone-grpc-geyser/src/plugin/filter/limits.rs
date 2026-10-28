@@ -23,6 +23,7 @@ pub type FilterLimitsCheckResult = Result<(), FilterLimitsCheckError>;
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FilterLimits {
+    pub order: FilterLimitsOrder,
     pub accounts: FilterLimitsAccounts,
     pub slots: FilterLimitsSlots,
     pub transactions: FilterLimitsTransactions,
@@ -281,4 +282,26 @@ where
                 .map_err(|error| de::Error::custom(format!("Invalid pubkey: {value} ({error:?})")))
         })
         .collect::<Result<_, _>>()
+}
+
+/// Independent source protocol budgets, never additions to legacy A capacity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilterLimitsOrder {
+    pub max_watchers: usize,
+    pub max_banks_per_stream: usize,
+    pub max_notifications: usize,
+    pub queue_bytes: usize,
+    pub control_bytes: usize,
+}
+impl Default for FilterLimitsOrder {
+    fn default() -> Self {
+        Self {
+            max_watchers: 32,
+            max_banks_per_stream: 16384,
+            max_notifications: 1024,
+            queue_bytes: 4 * 1024 * 1024,
+            control_bytes: 16 * 1024,
+        }
+    }
 }

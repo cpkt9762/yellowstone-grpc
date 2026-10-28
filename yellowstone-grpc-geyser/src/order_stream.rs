@@ -28,6 +28,11 @@ pub struct BankGroup {
     pub valid: bool,
 }
 impl BankGroup {
+    pub(crate) fn from_frozen(frozen: &crate::block_reconstruction_v2::FrozenBank) -> Self {
+        let mut group = Self::from_block(&frozen.get_message_block());
+        group.valid &= frozen.order_source_valid();
+        group
+    }
     pub fn from_block(block: &MessageBlock) -> Self {
         let mut indices = HashSet::new();
         let mut signatures = HashSet::new();
@@ -51,6 +56,7 @@ impl BankGroup {
 pub enum GroupBoundary {
     Begin(BankGroup),
     End { slot: u64, bank_id: u64 },
+    Late { slot: u64, bank_id: u64 },
 }
 #[derive(Debug, Clone)]
 pub struct BroadcastEnvelope {
@@ -92,6 +98,8 @@ struct Group {
 }
 
 pub struct OrderSession {
+    watch: Option<crate::order_integrity::OrderWatch>,
+    historical: Vec<(OrderContext, u64)>,
     stream: Vec<u8>,
     active: Option<Epoch>,
     pending: Option<Pending>,
@@ -103,6 +111,8 @@ pub struct OrderSession {
 impl Default for OrderSession {
     fn default() -> Self {
         Self {
+            watch: None,
+            historical: Vec::new(),
             stream: uuid::Uuid::new_v4().as_bytes().to_vec(),
             active: None,
             pending: None,
@@ -155,6 +165,65 @@ pub fn validate_coverage(request: &SubscribeRequest, keys: &[Vec<u8>]) -> Result
 }
 
 impl OrderSession {
+    pub fn register_watch(
+        &mut self,
+        registry: &Arc<crate::order_integrity::OrderIntegrity>,
+    ) -> Result<()> {
+        if self.watch.is_none() {
+            self.watch = Some(registry.register()?);
+        }
+        Ok(())
+    }
+    pub fn late(
+        &mut self,
+        bank: crate::order_integrity::BankRef,
+        send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
+    ) -> Result<()> {
+        let epoch = match self.watch.as_ref() {
+            Some(w) => w.epoch(bank)?,
+            None => None,
+        };
+        let Some(epoch) = epoch else {
+            return Ok(());
+        };
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|e| e.context.source_epoch == epoch)
+        {
+            return self.fail(
+                OrderGapReason::SourceAfterSeal,
+                Some(bank),
+                "source data after immutable Bank seal",
+                send,
+            );
+        }
+        if let Some((context, seq)) = self
+            .historical
+            .iter()
+            .find(|(c, _)| c.source_epoch == epoch)
+        {
+            let update = control(subscribe_update::UpdateOneof::OrderGap(
+                SubscribeUpdateOrderGap {
+                    context: Some(context.clone()),
+                    next_source_seq: Some(*seq),
+                    reason: Some(OrderGapReason::SourceAfterSeal as i32),
+                    slot: Some(bank.0),
+                    bank_id: Some(bank.1),
+                    detail: "source data after sealed historical epoch".into(),
+                },
+            ));
+            send(update)?;
+            self.fail(
+                OrderGapReason::SourceAfterSeal,
+                Some(bank),
+                "historical B epoch revoked",
+                send,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn ever_requested(&self) -> bool {
         self.ever
     }
@@ -266,6 +335,9 @@ impl OrderSession {
             return Ok(());
         };
         let previous = self.active.take();
+        if let Some(epoch) = &previous {
+            self.historical.push((epoch.context.clone(), epoch.seq));
+        }
         let previous_epoch = previous.as_ref().map(|e| e.context.source_epoch.clone());
         let previous_hash = if let Some(epoch) = &previous {
             let seal = Self::epoch_seal(epoch, OrderEpochSealReason::Replaced);
@@ -388,13 +460,21 @@ impl OrderSession {
             return Ok(());
         }
         self.closing = Some(Instant::now());
-        if self.group.is_none() {
+        if self.group.is_none()
+            && !self
+                .watch
+                .as_ref()
+                .map(|w| w.pending())
+                .transpose()?
+                .unwrap_or(false)
+        {
             self.finish_close(send)?;
         }
         Ok(())
     }
     fn finish_close(&mut self, send: &mut impl FnMut(FilteredUpdate) -> Result<()>) -> Result<()> {
         if let Some(epoch) = self.active.take() {
+            self.historical.push((epoch.context.clone(), epoch.seq));
             send(Self::epoch_seal(&epoch, OrderEpochSealReason::NormalEnd))?;
         }
         self.closing = None;
@@ -440,6 +520,20 @@ impl OrderSession {
                 "bank count/index/signature mismatch",
                 send,
             )?;
+        }
+        if covered {
+            if let (Some(watch), Some(epoch)) = (&self.watch, &self.active) {
+                if let Err(error) =
+                    watch.bind((bank.slot, bank.bank_id), &epoch.context.source_epoch)
+                {
+                    self.fail(
+                        OrderGapReason::SourceAfterSeal,
+                        Some((bank.slot, bank.bank_id)),
+                        &error.to_string(),
+                        send,
+                    )?;
+                }
+            }
         }
         self.group = Some(Group {
             bank,
@@ -622,6 +716,26 @@ impl OrderSession {
         &mut self,
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
+        if let Some(watch) = self.watch.as_ref() {
+            if watch.incomplete()? {
+                self.fail(
+                    OrderGapReason::IncompleteBank,
+                    None,
+                    "confirmed source Bank never became complete",
+                    send,
+                )?;
+            }
+        }
+        if let Some(watch) = self.watch.as_ref() {
+            if let Err(error) = watch.check() {
+                self.fail(
+                    OrderGapReason::ResourceLimit,
+                    None,
+                    &error.to_string(),
+                    send,
+                )?;
+            }
+        }
         if self
             .closing
             .is_some_and(|t| t.elapsed() >= Duration::from_secs(15))

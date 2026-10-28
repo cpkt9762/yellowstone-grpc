@@ -9,7 +9,7 @@ use {
     thiserror::Error,
     tokio::sync::{
         mpsc::{UnboundedReceiver, UnboundedSender},
-        Semaphore, TryAcquireError,
+        OwnedSemaphorePermit, Semaphore, TryAcquireError,
     },
 };
 
@@ -146,7 +146,7 @@ impl<T> Weigher for UnitWeigher<T> {
 struct Shared {
     /// One permit per unit of weight. A sender acquires the item weight before queueing and the
     /// receiver gives it back on dequeue. Waiting senders are served in strict FIFO order.
-    semaphore: Semaphore,
+    semaphore: Arc<Semaphore>,
     /// Total weight the channel can hold.
     capacity: usize,
 }
@@ -177,7 +177,7 @@ impl Shared {
 /// clone of the [`Weigher`] `W`.
 pub struct LoadAwareSender<T, W> {
     shared: Arc<Shared>,
-    inner: UnboundedSender<(u32, T)>,
+    inner: UnboundedSender<(OwnedSemaphorePermit, T)>,
     weigher: W,
 }
 
@@ -204,7 +204,7 @@ impl<T, W: Clone> Clone for LoadAwareSender<T, W> {
 /// Dropping it closes the channel and wakes every sender waiting for capacity.
 pub struct LoadAwareReceiver<T> {
     shared: Arc<Shared>,
-    inner: UnboundedReceiver<(u32, T)>,
+    inner: UnboundedReceiver<(OwnedSemaphorePermit, T)>,
 }
 
 impl<T> Drop for LoadAwareReceiver<T> {
@@ -252,7 +252,7 @@ where
     );
     let (inner_sender, inner_receiver) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
-        semaphore: Semaphore::new(weighted_capacity),
+        semaphore: Arc::new(Semaphore::new(weighted_capacity)),
         capacity: weighted_capacity,
     });
     let sender = LoadAwareSender {
@@ -296,51 +296,68 @@ where
     /// Returns the `item` back in a [`SendError`] if the [`LoadAwareReceiver`] is dropped.
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
         let weight = self.admitted_weight(&item);
-        // Fast path: skip building the `Acquire` future when capacity is available. A failed try
-        // never takes capacity ahead of a waiting sender, so falling through keeps FIFO order.
-        match self.shared.semaphore.try_acquire_many(weight) {
-            Ok(permit) => permit.forget(),
+        if self.inner.is_closed() {
+            return Err(SendError(item));
+        }
+        let permit = match Arc::clone(&self.shared.semaphore).try_acquire_many_owned(weight) {
+            Ok(permit) => permit,
             Err(TryAcquireError::Closed) => return Err(SendError(item)),
             Err(TryAcquireError::NoPermits) => {
-                match self.shared.semaphore.acquire_many(weight).await {
-                    Ok(permit) => permit.forget(),
-                    Err(_closed) => return Err(SendError(item)),
+                tokio::select! {
+                    _ = self.inner.closed() => return Err(SendError(item)),
+                    result = Arc::clone(&self.shared.semaphore).acquire_many_owned(weight) => match result {
+                        Ok(permit) => permit,
+                        Err(_) => return Err(SendError(item)),
+                    }
                 }
             }
-        }
+        };
         self.inner
-            .send((weight, item))
+            .send((permit, item))
             .map_err(|err| SendError(err.0 .1))
     }
 
-    /// Sends an item without waiting.
-    ///
-    /// Fails with [`TrySendError::Full`] when the channel does not have enough free weight, or
-    /// when another sender is already waiting for capacity, so it never jumps the queue.
-    ///
-    /// # Arguments
-    ///
-    /// * `item` - The item to queue, weighed by the sender's [`Weigher`].
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` once the item is queued.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `item` back in a [`TrySendError`]: [`TrySendError::Full`] if there is no
-    /// capacity for it right now, [`TrySendError::Closed`] if the [`LoadAwareReceiver`] is
-    /// dropped.
+    /// Independent credit pool, sharing exactly the same ordered mpsc queue.
+    /// No legacy capacity is consumed. Oversized items are explicitly rejected.
+    pub fn with_budget(&self, capacity: usize) -> Result<Self, &'static str>
+    where
+        W: Clone,
+    {
+        if capacity == 0 || capacity > MAX_CAPACITY {
+            return Err("invalid queue credit capacity");
+        }
+        Ok(Self {
+            shared: Arc::new(Shared {
+                semaphore: Arc::new(Semaphore::new(capacity)),
+                capacity,
+            }),
+            inner: self.inner.clone(),
+            weigher: self.weigher.clone(),
+        })
+    }
+
+    /// Sends without waiting; preserves FIFO and releases the correct lane's permits.
     pub fn try_send(&self, item: T) -> Result<(), TrySendError<T>> {
+        if self.inner.is_closed() {
+            return Err(TrySendError::Closed(item));
+        }
         let weight = self.admitted_weight(&item);
-        match self.shared.semaphore.try_acquire_many(weight) {
-            Ok(permit) => permit.forget(),
+        let permit = match Arc::clone(&self.shared.semaphore).try_acquire_many_owned(weight) {
+            Ok(permit) => permit,
             Err(TryAcquireError::NoPermits) => return Err(TrySendError::Full(item)),
             Err(TryAcquireError::Closed) => return Err(TrySendError::Closed(item)),
-        }
+        };
         self.inner
-            .send((weight, item))
+            .send((permit, item))
             .map_err(|err| TrySendError::Closed(err.0 .1))
+    }
+
+    /// Strict admission for B: never clamp a message larger than its byte budget.
+    pub fn try_send_strict(&self, item: T) -> Result<(), TrySendError<T>> {
+        if self.weigher.weight(&item) as usize > self.shared.capacity {
+            return Err(TrySendError::Full(item));
+        }
+        self.try_send(item)
     }
 
     /// Returns the weight currently held by the channel.
@@ -380,8 +397,8 @@ impl<T> LoadAwareReceiver<T> {
     /// [`LoadAwareSender`] is dropped. [`Poll::Pending`] otherwise.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         self.inner.poll_recv(cx).map(|maybe| {
-            maybe.map(|(weight, item)| {
-                self.shared.semaphore.add_permits(weight as usize);
+            maybe.map(|(permit, item)| {
+                drop(permit);
                 item
             })
         })
@@ -685,5 +702,30 @@ mod tests {
 
         assert_eq!(next_seq, [ITEMS_PER_SENDER; SENDERS]);
         assert_eq!(probe.current_weight(), 0);
+    }
+}
+
+#[cfg(test)]
+mod order_writes_v1 {
+    use super::*;
+    #[tokio::test]
+    async fn b_full_and_reserved_full_preserve_a_capacity_and_fifo() {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
+        let b = a.with_budget(1).expect("B credit");
+        let control = a.with_budget(1).expect("control credit");
+        b.try_send(1).expect("B event");
+        assert!(matches!(b.try_send(2), Err(TrySendError::Full(2))));
+        control.try_send(3).expect("gap reserve");
+        assert!(matches!(control.try_send(4), Err(TrySendError::Full(4))));
+        a.try_send(5)
+            .expect("A capacity remains independently available");
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(3));
+        assert_eq!(rx.recv().await, Some(5));
+        assert_eq!(a.current_weight(), 0);
+        assert_eq!(b.current_weight(), 0);
+        assert_eq!(control.current_weight(), 0);
+        drop(rx);
+        assert!(matches!(b.try_send(6), Err(TrySendError::Closed(6))));
     }
 }
