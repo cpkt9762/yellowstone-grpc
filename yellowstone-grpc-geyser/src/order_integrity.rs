@@ -17,10 +17,16 @@ struct BankWatch {
     late: bool,
     reported: bool,
 }
+// Slot facts live until this watcher closes, independently of replay/pending GC.
+#[derive(Debug, Default)]
+struct SlotWatch {
+    bank_id: Option<u64>,
+    conflicted: bool,
+}
 #[derive(Debug, Default)]
 struct WatchState {
     banks: HashMap<BankRef, BankWatch>,
-    authoritative: HashMap<u64, u64>,
+    authoritative: HashMap<u64, SlotWatch>,
     pending: HashMap<BankRef, std::time::Instant>,
     overflow: bool,
 }
@@ -111,7 +117,17 @@ impl OrderIntegrity {
                     watcher.overflow = true;
                     continue;
                 }
-                watcher.banks.insert(bank, BankWatch::default());
+                let late = watcher
+                    .authoritative
+                    .get(&bank.0)
+                    .is_some_and(|s| s.conflicted);
+                watcher.banks.insert(
+                    bank,
+                    BankWatch {
+                        late,
+                        ..Default::default()
+                    },
+                );
             }
             Ok(())
         })();
@@ -210,10 +226,18 @@ impl OrderIntegrity {
                 .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
             let mut conflict = false;
             for watcher in state.watchers.values_mut() {
-                if let Some(previous) = watcher.authoritative.get(&slot) {
-                    conflict |= *previous != bank_id;
+                if let Some(previous) = watcher.authoritative.get_mut(&slot) {
+                    previous.conflicted |= previous.bank_id.is_some_and(|id| id != bank_id);
+                    previous.bank_id.get_or_insert(bank_id);
+                    conflict |= previous.conflicted;
                 } else if watcher.authoritative.len() < self.limits.max_banks_per_stream {
-                    watcher.authoritative.insert(slot, bank_id);
+                    watcher.authoritative.insert(
+                        slot,
+                        SlotWatch {
+                            bank_id: Some(bank_id),
+                            conflicted: false,
+                        },
+                    );
                 } else {
                     watcher.overflow = true;
                 }
@@ -242,6 +266,19 @@ impl OrderIntegrity {
             let mut notices = HashSet::new();
             let mut overflow = false;
             for watcher in state.watchers.values_mut() {
+                if let Some(identity) = watcher.authoritative.get_mut(&slot) {
+                    identity.conflicted = true;
+                } else if watcher.authoritative.len() < self.limits.max_banks_per_stream {
+                    watcher.authoritative.insert(
+                        slot,
+                        SlotWatch {
+                            bank_id: None,
+                            conflicted: true,
+                        },
+                    );
+                } else {
+                    watcher.overflow = true;
+                }
                 for (bank, entry) in watcher.banks.iter_mut().filter(|((s, _), _)| *s == slot) {
                     if !entry.late {
                         entry.late = true;
@@ -321,6 +358,21 @@ impl OrderWatch {
         }))
     }
 
+    pub fn conflicted(&self, floor: u64) -> Result<bool> {
+        let state = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+        let watcher = state
+            .watchers
+            .get(&self.id)
+            .ok_or_else(|| anyhow::anyhow!("B watcher missing"))?;
+        Ok(watcher
+            .authoritative
+            .iter()
+            .any(|(slot, fact)| *slot >= floor && fact.conflicted))
+    }
     pub fn check(&self) -> Result<()> {
         ensure!(
             !self.owner.broken.load(Ordering::SeqCst),
@@ -345,10 +397,20 @@ impl OrderWatch {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
-        let entry = s
+        let watcher = s
             .watchers
             .get_mut(&self.id)
-            .and_then(|w| w.banks.get_mut(&bank))
+            .ok_or_else(|| anyhow::anyhow!("B watcher missing"))?;
+        ensure!(
+            !watcher
+                .authoritative
+                .get(&bank.0)
+                .is_some_and(|s| s.conflicted),
+            "source has conflicting authoritative Bank identities"
+        );
+        let entry = watcher
+            .banks
+            .get_mut(&bank)
             .ok_or_else(|| anyhow::anyhow!("Bank was not registered before broadcast"))?;
         ensure!(
             !entry.late,
@@ -452,6 +514,44 @@ impl Drop for OrderWatch {
 #[cfg(test)]
 mod order_writes_v1 {
     use super::*;
+    #[test]
+    fn revision2_n1_conflict_lifetime_inheritance_and_bound() {
+        let registry = Arc::new(OrderIntegrity::new(FilterLimitsOrder {
+            max_banks_per_stream: 2,
+            ..Default::default()
+        }));
+        let watch = registry.register().expect("watch");
+        registry.note_authoritative(20, 200);
+        registry.note_authoritative(20, 201);
+        registry.note_pending((20, 201));
+        registry.resolve_pending_slot(20, 200);
+        registry.note_authoritative(20, 200);
+        assert!(watch.conflicted(20).expect("sticky slot fact"));
+        assert!(!watch.conflicted(21).expect("before coverage"));
+        assert!(!watch.pending(20).expect("pending cleanup"));
+        for bank in [200, 201] {
+            registry.register_bank((20, bank));
+            assert!(
+                watch.bind((20, bank), &[1; 16]).is_err(),
+                "later Banks inherit conflict"
+            );
+        }
+        registry.note_conflict(21);
+        registry.note_conflict(22);
+        assert!(
+            watch.check().is_err(),
+            "slot facts obey existing resource limit"
+        );
+        assert_eq!(
+            registry.state.lock().expect("state").watchers[&watch.id]
+                .authoritative
+                .len(),
+            2
+        );
+        drop(watch);
+        let next = registry.register().expect("new watcher");
+        assert!(!next.conflicted(0).expect("new lifetime"));
+    }
     #[test]
     fn references_survive_replay_gc_and_registration_precedes_slow_client() {
         let registry = Arc::new(OrderIntegrity::new(FilterLimitsOrder::default()));

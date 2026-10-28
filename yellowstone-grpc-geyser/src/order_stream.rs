@@ -885,6 +885,16 @@ impl OrderSession {
             self.late(bank, send)?;
         }
         if let (Some(watch), Some(floor)) = (self.watch.as_ref(), self.coverage_floor()) {
+            if watch.conflicted(floor)? {
+                self.fail(
+                    OrderGapReason::SourceAfterSeal,
+                    None,
+                    "source has conflicting authoritative Bank identities",
+                    send,
+                )?;
+            }
+        }
+        if let (Some(watch), Some(floor)) = (self.watch.as_ref(), self.coverage_floor()) {
             if watch.incomplete(floor)? {
                 self.fail(
                     OrderGapReason::IncompleteBank,

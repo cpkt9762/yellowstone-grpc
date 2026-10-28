@@ -1406,3 +1406,159 @@ async fn revision_r5_real_reconstruction_exposes_conflicting_confirmed_and_prese
     on.2.abort();
     off.2.abort();
 }
+
+// Exercise the real callback queue, reconstruction and client, before either Bank freezes.
+async fn revision2_prefreeze_conflict_case(replace: bool, repeat_confirmed: bool) {
+    let mut b = SubscriberChannels::new(128, 128, 128);
+    b.revision_timestamp = Some(REVISION_TIMESTAMP);
+    let mut on = spawn(b.clone());
+    let mut off = spawn(b.clone());
+    let initial = install(&mut on, &request(true)).await.expect("B ack");
+    install(&mut off, &request(false)).await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (source_tx, source_rx) = mpsc::unbounded_channel();
+    let ingress = tokio::spawn(GrpcService::geyser_loop(
+        crate::stream::tokio::BatchStreamUnboundedReceiver::new(rx),
+        b.clone(),
+        source_tx,
+    ));
+    let source = tokio::spawn(GrpcService::block_reconstruction_loop(
+        crate::stream::tokio::BatchStreamUnboundedReceiver::new(source_rx),
+        b.clone(),
+        None,
+        None,
+        16,
+    ));
+    let send = |m: Message| {
+        b.observe_callback(m.get_slot());
+        tx.send(m).expect("callback queue");
+    };
+    let status = |bank, status| {
+        let mut s = fixtures::message_slot(20, status);
+        s.bank_id = Some(bank);
+        s.created_at = REVISION_TIMESTAMP;
+        Message::Slot(Arc::new(s))
+    };
+    send(status(200, SlotStatus::CreatedBank));
+    send(status(201, SlotStatus::CreatedBank));
+    send(status(200, SlotStatus::Confirmed));
+    send(status(201, SlotStatus::Confirmed));
+    // Only now supply the input that can freeze the winning Bank.
+    for m in revision_callbacks(20, 200) {
+        if !matches!(&m, Message::Slot(s) if matches!(s.status,
+            SlotStatus::CreatedBank | SlotStatus::Confirmed | SlotStatus::Finalized))
+        {
+            send(m);
+        }
+    }
+    send(status(
+        200,
+        if repeat_confirmed {
+            SlotStatus::Confirmed
+        } else {
+            SlotStatus::Finalized
+        },
+    ));
+    // A later complete Bank supplies a deterministic processing barrier.
+    for m in revision_callbacks(22, 220) {
+        send(m);
+    }
+    let mut a_on = Vec::new();
+    let mut gap = false;
+    loop {
+        let u = read(&mut on.1).await;
+        if matches!(
+            u.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::OrderGap(_))
+        ) {
+            gap = true;
+        }
+        assert!(
+            !matches!(
+                u.as_subscribe_update().update_oneof,
+                Some(UpdateOneof::OrderEpochSeal(_))
+            ),
+            "no normal epoch seal after prefreeze conflict"
+        );
+        let done = matches!(&u.message, FilteredUpdateOneof::Slot(s) if s.slot == 22 && s.status == SlotStatus::Finalized);
+        if !matches!(u.message, FilteredUpdateOneof::Order(_)) {
+            a_on.push(u.encode_to_vec());
+        }
+        if done {
+            break;
+        }
+    }
+    let mut a_off = Vec::new();
+    loop {
+        let u = read(&mut off.1).await;
+        let done = matches!(&u.message, FilteredUpdateOneof::Slot(s) if s.slot == 22 && s.status == SlotStatus::Finalized);
+        a_off.push(u.encode_to_vec());
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        a_on, a_off,
+        "prefreeze conflict must preserve A raw projection byte for byte"
+    );
+    if replace {
+        on.0.send(Some((
+            None,
+            revision_tracked_filter(&revision_request(&[1, 2], initial.context.as_ref())),
+        )))
+        .expect("replace exit");
+    } else {
+        let close = SubscribeRequest {
+            order_close: Some(SubscribeRequestOrderClose {
+                context: initial.context,
+                tracked_keys_sha256: initial.tracked_keys_sha256,
+            }),
+            ..Default::default()
+        };
+        on.0.send(Some((None, Filter::order_control(close))))
+            .expect("close exit");
+    }
+    while let Ok(Some(u)) = tokio::time::timeout(Duration::from_millis(100), on.1.recv()).await {
+        let u = u.expect("A transport healthy");
+        if matches!(
+            u.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::OrderGap(_))
+        ) {
+            gap = true;
+        }
+        assert!(
+            !matches!(
+                u.as_subscribe_update().update_oneof,
+                Some(UpdateOneof::OrderEpochSeal(_))
+            ),
+            "close/replace must never seal an epoch after a prefreeze authoritative conflict"
+        );
+    }
+    assert!(
+        gap,
+        "prefreeze authoritative conflict must remain sticky after winner/pending cleanup"
+    );
+    assert!(!on.2.is_finished());
+    assert!(!off.2.is_finished());
+    drop(tx);
+    ingress.await.expect("ingress");
+    source.abort();
+    on.2.abort();
+    off.2.abort();
+}
+#[tokio::test]
+async fn revision2_n1_prefreeze_finalized_close() {
+    revision2_prefreeze_conflict_case(false, false).await;
+}
+#[tokio::test]
+async fn revision2_n1_prefreeze_finalized_replace() {
+    revision2_prefreeze_conflict_case(true, false).await;
+}
+#[tokio::test]
+async fn revision2_n1_prefreeze_reconfirmed_close() {
+    revision2_prefreeze_conflict_case(false, true).await;
+}
+#[tokio::test]
+async fn revision2_n1_prefreeze_reconfirmed_replace() {
+    revision2_prefreeze_conflict_case(true, true).await;
+}
