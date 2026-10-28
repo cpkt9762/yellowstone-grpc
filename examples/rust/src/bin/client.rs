@@ -644,6 +644,8 @@ impl Action {
 
                 Some((
                     SubscribeRequest {
+                        order_writes: None,
+                        order_close: None,
                         slots,
                         accounts,
                         transactions,
@@ -1072,6 +1074,8 @@ async fn geyser_subscribe(
 
             subscribe_tx
                 .send(SubscribeRequest {
+                    order_writes: None,
+                    order_close: None,
                     block_footer: Default::default(),
                     slots: new_slots.clone(),
                     accounts: HashMap::default(),

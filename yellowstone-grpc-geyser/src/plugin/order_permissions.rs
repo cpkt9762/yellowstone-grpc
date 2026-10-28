@@ -91,6 +91,11 @@ fn writable_keys(
             "lookup/loaded count mismatch"
         );
     }
+    let total = n
+        .checked_add(writable_loaded.len())
+        .and_then(|v| v.checked_add(readonly_loaded.len()))
+        .context("resolved key count overflow")?;
+    ensure!(total <= 256, "too many resolved keys");
     let keys = message
         .account_keys
         .iter()

@@ -15,6 +15,18 @@ use {
 pub const CAPABILITY: &str = "order_writes_v1";
 pub const MAX_TRACKED_KEYS: usize = 1800;
 
+pub fn bounded_detail(value: &str) -> String {
+    let mut end = value.len().min(1024);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        "B protocol error".into()
+    } else {
+        value[..end].to_owned()
+    }
+}
+
 pub fn sha256(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
 }
@@ -223,7 +235,11 @@ pub fn decode_subscription(raw: &[u8]) -> Result<OrderSubscribeRequest> {
                 let bytes = &input[..len];
                 input.advance(len);
                 if tag == 1002 {
-                    decode_request(bytes)?;
+                    let decoded = SubscribeRequestOrderWrites::decode(bytes)?;
+                    ensure!(
+                        decoded.encode_to_vec() == bytes,
+                        "noncanonical order request encoding"
+                    );
                 } else {
                     let close = SubscribeRequestOrderClose::decode(bytes)?;
                     ensure!(
@@ -254,7 +270,9 @@ pub fn decode_subscription(raw: &[u8]) -> Result<OrderSubscribeRequest> {
 }
 
 #[derive(Default)]
-pub struct OrderCodec;
+pub struct OrderCodec {
+    _private: (),
+}
 #[derive(Default)]
 pub struct OrderEncoder;
 #[derive(Default)]

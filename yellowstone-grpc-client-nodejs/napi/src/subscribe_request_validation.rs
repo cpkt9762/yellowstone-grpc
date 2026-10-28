@@ -478,6 +478,8 @@ mod tests {
     );
 
     SubscribeRequest {
+      order_writes: None,
+      order_close: None,
       block_footer: Default::default(),
       accounts,
       slots,
@@ -563,6 +565,8 @@ mod tests {
   #[test]
   fn accepts_request_when_accounts_map_is_empty() {
     let request = SubscribeRequest {
+      order_writes: None,
+      order_close: None,
       block_footer: Default::default(),
       accounts: HashMap::new(),
       slots: HashMap::new(),

@@ -3,7 +3,7 @@ use {
     crate::{
         order_protocol::*,
         plugin::{
-            filter::message::FilteredUpdate,
+            filter::message::{FilteredUpdate, FilteredUpdateOneof},
             message::{Message as SourceMessage, MessageBlock, SlotStatus},
             order_permissions::Permissions,
         },
@@ -26,19 +26,33 @@ pub struct BankGroup {
     pub observed: u64,
     pub executed: u64,
     pub valid: bool,
+    pub resource_limit: bool,
+    pub source_after_seal: bool,
 }
 impl BankGroup {
-    pub(crate) fn from_frozen(frozen: &crate::block_reconstruction_v2::FrozenBank) -> Self {
-        let mut group = Self::from_block(&frozen.get_message_block());
-        group.valid &= frozen.order_source_valid();
+    pub(crate) fn from_frozen(
+        frozen: &crate::block_reconstruction_v2::FrozenBank,
+        limits: &crate::plugin::filter::limits::FilterLimitsOrder,
+    ) -> Self {
+        let mut group = Self::with_limit(
+            &frozen.get_message_block(),
+            limits.max_transactions_per_bank,
+        );
+        group.source_after_seal = !frozen.order_source_valid();
+        group.valid &= !group.source_after_seal;
         group
     }
     pub fn from_block(block: &MessageBlock) -> Self {
+        Self::with_limit(block, 65536)
+    }
+    fn with_limit(block: &MessageBlock, max_transactions: usize) -> Self {
         let mut indices = HashSet::new();
         let mut signatures = HashSet::new();
         let executed = block.meta.executed_transaction_count;
         let observed = block.transactions.len() as u64;
-        let valid = observed == executed
+        let resource_limit = block.transactions.len() > max_transactions;
+        let valid = !resource_limit
+            && observed == executed
             && block.transactions.iter().all(|tx| {
                 let i = tx.transaction.index as u64;
                 i < executed && indices.insert(i) && signatures.insert(tx.transaction.signature)
@@ -49,6 +63,8 @@ impl BankGroup {
             observed,
             executed,
             valid,
+            resource_limit,
+            source_after_seal: false,
         }
     }
 }
@@ -56,12 +72,12 @@ impl BankGroup {
 pub enum GroupBoundary {
     Begin(BankGroup),
     End { slot: u64, bank_id: u64 },
-    Late { slot: u64, bank_id: u64 },
 }
 #[derive(Debug, Clone)]
 pub struct BroadcastEnvelope {
     pub messages: Arc<Vec<SourceMessage>>,
     pub group: Option<GroupBoundary>,
+    pub late: Arc<Vec<crate::order_integrity::BankRef>>,
 }
 impl Deref for BroadcastEnvelope {
     type Target = Vec<SourceMessage>;
@@ -137,7 +153,7 @@ pub fn validate_coverage(request: &SubscribeRequest, keys: &[Vec<u8>]) -> Result
         request
             .slots
             .values()
-            .any(|f| f.interslot_updates != Some(false))
+            .any(|f| f.interslot_updates == Some(true))
             && !request.blocks_meta.is_empty(),
         "B needs complete slot and BlockMeta filters"
     );
@@ -180,7 +196,7 @@ impl OrderSession {
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
         let epoch = match self.watch.as_ref() {
-            Some(w) => w.epoch(bank)?,
+            Some(w) => w.consume_epoch(bank)?,
             None => None,
         };
         let Some(epoch) = epoch else {
@@ -224,10 +240,10 @@ impl OrderSession {
         Ok(())
     }
 
-    pub fn ever_requested(&self) -> bool {
+    pub const fn ever_requested(&self) -> bool {
         self.ever
     }
-    pub fn has_active(&self) -> bool {
+    pub const fn has_active(&self) -> bool {
         self.active.is_some()
     }
     pub fn reject(
@@ -244,7 +260,7 @@ impl OrderSession {
                     .filter(|r| r.request_sha256.len() == 32)
                     .map(|r| r.request_sha256.clone()),
                 reason: Some(reason as i32),
-                detail: detail.chars().take(512).collect(),
+                detail: bounded_detail(detail),
             },
         ))
     }
@@ -259,6 +275,25 @@ impl OrderSession {
         let Some(request) = raw.order_writes.as_ref() else {
             return Ok(());
         };
+        let precheck = if self.pending.is_some() || self.closing.is_some() {
+            Some((
+                OrderRejectReason::PendingExists,
+                "another B control is pending".to_owned(),
+            ))
+        } else if request.protocol_version != Some(1) {
+            Some((
+                OrderRejectReason::UnsupportedCapability,
+                "unsupported source protocol version".to_owned(),
+            ))
+        } else {
+            validate_coverage(raw, &request.tracked_keys)
+                .err()
+                .map(|e| (OrderRejectReason::ScopeCoverageInvalid, e.to_string()))
+        };
+        if let Some((reason, detail)) = precheck {
+            send(self.reject(Some(request), reason, &detail))?;
+            return Ok(());
+        }
         let result = (|| {
             ensure!(!self.stopped, "B already stopped; start a new stream/run");
             ensure!(raw.order_close.is_none(), "mutually exclusive B controls");
@@ -442,8 +477,10 @@ impl OrderSession {
         let Some(close) = &raw.order_close else {
             return Ok(());
         };
-        let mut only = SubscribeRequest::default();
-        only.order_close = Some(close.clone());
+        let only = SubscribeRequest {
+            order_close: Some(close.clone()),
+            ..Default::default()
+        };
         let valid = *raw == only
             && self.pending.is_none()
             && self.closing.is_none()
@@ -515,13 +552,29 @@ impl OrderSession {
         });
         if covered && !bank.valid {
             self.fail(
-                OrderGapReason::SourceCountMismatch,
+                if bank.resource_limit {
+                    OrderGapReason::ResourceLimit
+                } else if bank.source_after_seal {
+                    OrderGapReason::SourceAfterSeal
+                } else {
+                    OrderGapReason::SourceCountMismatch
+                },
                 Some((bank.slot, bank.bank_id)),
                 "bank count/index/signature mismatch",
                 send,
             )?;
         }
         if covered {
+            if let Some(watch) = self.watch.as_ref() {
+                if let Err(error) = watch.check() {
+                    self.fail(
+                        OrderGapReason::ResourceLimit,
+                        Some((bank.slot, bank.bank_id)),
+                        &error.to_string(),
+                        send,
+                    )?;
+                }
+            }
             if let (Some(watch), Some(epoch)) = (&self.watch, &self.active) {
                 if let Err(error) =
                     watch.bind((bank.slot, bank.bank_id), &epoch.context.source_epoch)
@@ -555,7 +608,22 @@ impl OrderSession {
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
         if let SourceMessage::Slot(slot) = message {
-            if slot.status == SlotStatus::Dead && self.active.is_some() {
+            if slot.status == SlotStatus::Dead {
+                let banks = match &self.watch {
+                    Some(w) => w.banks_at_slot(slot.slot)?,
+                    None => Vec::new(),
+                };
+                for bank in banks {
+                    self.late(bank, send)?;
+                }
+            }
+            if slot.status == SlotStatus::Dead
+                && self.active.as_ref().is_some_and(|e| {
+                    e.keys
+                        .iter()
+                        .any(|k| k.active_from_slot.is_some_and(|s| s <= slot.slot))
+                })
+            {
                 self.fail(
                     OrderGapReason::IncompleteBank,
                     None,
@@ -585,16 +653,16 @@ impl OrderSession {
             return Ok(());
         }
         for update in updates {
-            match &update.as_subscribe_update().update_oneof {
-                Some(subscribe_update::UpdateOneof::BlockMeta(meta))
+            match &update.message {
+                FilteredUpdateOneof::BlockMeta(meta)
                     if meta.slot == group.bank.slot && meta.bank_id == group.bank.bank_id =>
                 {
                     group.meta_hash = Some(sha256(&update.encode_to_vec()))
                 }
-                Some(subscribe_update::UpdateOneof::Slot(slot))
+                FilteredUpdateOneof::Slot(slot)
                     if slot.slot == group.bank.slot
                         && slot.bank_id == Some(group.bank.bank_id)
-                        && slot.status == 1 =>
+                        && slot.status == SlotStatus::Confirmed =>
                 {
                     group.confirmed_hash = Some(sha256(&update.encode_to_vec()))
                 }
@@ -716,6 +784,14 @@ impl OrderSession {
         &mut self,
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
+        // Sticky source notifications also cover an idle stream after NORMAL_END.
+        let late = match &self.watch {
+            Some(w) => w.pending_lates()?,
+            None => Vec::new(),
+        };
+        for bank in late {
+            self.late(bank, send)?;
+        }
         if let Some(watch) = self.watch.as_ref() {
             if watch.incomplete()? {
                 self.fail(
@@ -771,7 +847,7 @@ impl OrderSession {
                     reason: Some(reason as i32),
                     slot: bank.map(|b| b.0),
                     bank_id: bank.map(|b| b.1),
-                    detail: detail.chars().take(512).collect(),
+                    detail: bounded_detail(detail),
                 },
             )))?;
         }
@@ -780,229 +856,5 @@ impl OrderSession {
 }
 
 #[cfg(test)]
-mod order_writes_v1 {
-    use super::*;
-    use crate::plugin::{
-        filter::{fixtures, message::FilteredUpdateOneof},
-        message::MessageSlot,
-    };
-    pub fn request(
-        keys: Vec<Vec<u8>>,
-        version: u64,
-        previous: Option<Vec<u8>>,
-    ) -> (SubscribeRequest, FilteredUpdate) {
-        let mut order = SubscribeRequestOrderWrites {
-            protocol_version: Some(1),
-            request_version: Some(version),
-            previous_epoch: previous,
-            tracked_keys: keys.clone(),
-            ..Default::default()
-        };
-        order.request_sha256 = request_digest(&order);
-        let accounts = keys
-            .iter()
-            .map(|key| bs58::encode(key).into_string())
-            .collect::<Vec<_>>();
-        let req = SubscribeRequest {
-            commitment: Some(1),
-            order_writes: Some(order),
-            accounts: HashMap::from([(
-                "accounts".into(),
-                SubscribeRequestFilterAccounts {
-                    account: accounts.clone(),
-                    include_owner_rejected: Some(true),
-                    ..Default::default()
-                },
-            )]),
-            slots: HashMap::from([(
-                "slots".into(),
-                SubscribeRequestFilterSlots {
-                    interslot_updates: Some(true),
-                    ..Default::default()
-                },
-            )]),
-            blocks_meta: HashMap::from([("meta".into(), SubscribeRequestFilterBlocksMeta {})]),
-            ..Default::default()
-        };
-        let owner = FilteredUpdate::new_empty(FilteredUpdateOneof::OwnerRejectExemption(
-            SubscribeUpdateOwnerRejectExemption {
-                accounts: accounts
-                    .into_iter()
-                    .map(|pubkey| OwnerRejectExemptAccount {
-                        pubkey,
-                        active_from_slot: 1,
-                    })
-                    .collect(),
-                owner_reject: vec![],
-            },
-        ));
-        (req, owner)
-    }
-    fn send_group(session: &mut OrderSession, slot: u64, out: &mut Vec<FilteredUpdate>) {
-        session
-            .begin(
-                BankGroup {
-                    slot,
-                    bank_id: slot,
-                    observed: 0,
-                    executed: 0,
-                    valid: true,
-                },
-                &mut |u| {
-                    out.push(u);
-                    Ok(())
-                },
-            )
-            .expect("begin");
-        let mut meta = fixtures::message_block_meta(slot);
-        Arc::make_mut(&mut meta).block_meta.bank_id = slot;
-        let m = SourceMessage::BlockMeta(Arc::clone(&meta));
-        let update = FilteredUpdate::new_empty(FilteredUpdateOneof::BlockMeta(meta));
-        session
-            .observe_sent(&m, &[update], &mut |u| {
-                out.push(u);
-                Ok(())
-            })
-            .expect("meta");
-        let slot_msg = MessageSlot {
-            slot,
-            parent: Some(slot - 1),
-            status: SlotStatus::Confirmed,
-            dead_error: None,
-            created_at: Default::default(),
-            bank_id: Some(slot),
-        };
-        let m = SourceMessage::Slot(Arc::new(slot_msg.clone()));
-        let update = FilteredUpdate::new_empty(FilteredUpdateOneof::slot(slot_msg));
-        session
-            .observe_sent(&m, &[update], &mut |u| {
-                out.push(u);
-                Ok(())
-            })
-            .expect("confirmed");
-        session
-            .end(slot, slot, slot, &mut |u| {
-                out.push(u);
-                Ok(())
-            })
-            .expect("end");
-    }
-    #[test]
-    fn zero_write_seal_close_and_full_scope_ack() {
-        let mut session = OrderSession::default();
-        let mut out = Vec::new();
-        let (req, owner) = request(vec![vec![1; 32]], 1, None);
-        session
-            .request(&req, &owner, 3, &mut |u| {
-                out.push(u);
-                Ok(())
-            })
-            .expect("request");
-        let ack = out[0].as_subscribe_update();
-        let Some(subscribe_update::UpdateOneof::OrderCoverageAck(ack)) = ack.update_oneof else {
-            panic!("ack");
-        };
-        assert_eq!(ack.active_from_slot, Some(4));
-        assert_eq!(ack.keys.len(), 1);
-        assert_eq!(
-            ack.owner_exemption_update_sha256,
-            sha256(&owner.encode_to_vec())
-        );
-        send_group(&mut session, 5, &mut out);
-        let Some(subscribe_update::UpdateOneof::OrderSlotSeal(seal)) =
-            out[1].as_subscribe_update().update_oneof
-        else {
-            panic!("zero seal");
-        };
-        assert_eq!(seal.event_count, Some(0));
-        assert_eq!(seal.first_source_seq, None);
-        assert_eq!(seal.ordered_events_sha256, sha256(&[]));
-        let close = SubscribeRequest {
-            order_close: Some(SubscribeRequestOrderClose {
-                context: ack.context,
-                tracked_keys_sha256: ack.tracked_keys_sha256,
-            }),
-            ..Default::default()
-        };
-        session
-            .close(&close, &mut |u| {
-                out.push(u);
-                Ok(())
-            })
-            .expect("close");
-        let Some(subscribe_update::UpdateOneof::OrderEpochSeal(seal)) =
-            out[2].as_subscribe_update().update_oneof
-        else {
-            panic!("epoch seal");
-        };
-        assert_eq!(seal.reason, Some(2));
-        assert_eq!(seal.slot_seal_count, Some(1));
-        assert!(!session.has_active());
-    }
-    #[test]
-    fn replace_waits_for_group_and_pending_is_not_coalesced() {
-        let mut s = OrderSession::default();
-        let mut out = Vec::new();
-        let (req, owner) = request(vec![vec![1; 32]], 1, None);
-        s.request(&req, &owner, 3, &mut |u| {
-            out.push(u);
-            Ok(())
-        })
-        .expect("initial");
-        let old = s
-            .active
-            .as_ref()
-            .expect("active")
-            .context
-            .source_epoch
-            .clone();
-        // A warmup group is still a switching barrier.
-        s.begin(
-            BankGroup {
-                slot: 2,
-                bank_id: 2,
-                observed: 0,
-                executed: 0,
-                valid: true,
-            },
-            &mut |u| {
-                out.push(u);
-                Ok(())
-            },
-        )
-        .expect("warmup");
-        let (req, owner) = request(vec![vec![1; 32], vec![2; 32]], 2, Some(old.clone()));
-        s.request(&req, &owner, 6, &mut |u| {
-            out.push(u);
-            Ok(())
-        })
-        .expect("pending");
-        assert_eq!(out.len(), 1);
-        s.request(&req, &owner, 6, &mut |u| {
-            out.push(u);
-            Ok(())
-        })
-        .expect("rejected second pending");
-        assert!(matches!(
-            out[1].as_subscribe_update().update_oneof,
-            Some(subscribe_update::UpdateOneof::OrderRejected(_))
-        ));
-        s.end(2, 2, 8, &mut |u| {
-            out.push(u);
-            Ok(())
-        })
-        .expect("switch");
-        assert!(matches!(
-            out[2].as_subscribe_update().update_oneof,
-            Some(subscribe_update::UpdateOneof::OrderEpochSeal(_))
-        ));
-        let Some(subscribe_update::UpdateOneof::OrderCoverageAck(ack)) =
-            out[3].as_subscribe_update().update_oneof
-        else {
-            panic!("replacement ack");
-        };
-        assert_eq!(ack.previous_epoch, Some(old));
-        assert_eq!(ack.keys[0].active_from_slot, Some(4));
-        assert_eq!(ack.keys[1].active_from_slot, Some(9));
-    }
-}
+#[path = "order_stream_tests.rs"]
+mod order_writes_v1;

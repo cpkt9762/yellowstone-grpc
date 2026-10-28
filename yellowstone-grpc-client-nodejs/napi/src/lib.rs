@@ -637,6 +637,8 @@ mod tests {
     );
 
     SubscribeRequest {
+      order_writes: None,
+      order_close: None,
       block_footer: Default::default(),
       accounts,
       slots: HashMap::new(),

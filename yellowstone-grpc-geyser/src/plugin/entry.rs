@@ -78,6 +78,7 @@ impl PluginInner {
 
     // Sends messages to the deshred subscribers if their filter allows it.
     fn send_deshred_message(&self, message: Message) {
+        self.broadcast_channel.observe_callback(message.get_slot());
         if let Ok(count) = self.deshred_channel.send(message) {
             metrics::deshred_queue_size_inc(count as i64);
         }
@@ -617,7 +618,7 @@ impl GeyserPlugin for Plugin {
     fn pre_accounts_program_ids_shared(&self) -> Option<Arc<ArcSwap<HashSet<Pubkey>>>> {
         self.inner
             .as_ref()
-            .map(|inner| inner.dynamic_pre_accounts_program_ids.clone())
+            .map(|inner| Arc::clone(&inner.dynamic_pre_accounts_program_ids))
     }
 
     fn notify_entry_update_parent(

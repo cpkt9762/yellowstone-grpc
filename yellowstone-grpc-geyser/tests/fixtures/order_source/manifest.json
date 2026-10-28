@@ -1,0 +1,265 @@
+{
+  "encoder_note": "prost_order_v1 generated envelope encodes filters, update_oneof, created_at (1,1002,11); only the no-map request canonical is tag ascending.",
+  "input_collector_binary_sha256": "c02cb28af3123437150ae68e6cc5b0229078ec0e0b5d060bf226e441362a6e74",
+  "input_collector_git_sha": "77ebd03cf4efa05de1ab1cf9f9489a0258f8e79f",
+  "legacy_subscribe_request_sha256": "c723ba9e110bd4b1725c5c02dfa4e2bbfe798b325894c374c9114c514b8f455d",
+  "note": "Original v1 collector decoded-message bytes; bank_id fields omitted by its older schema. Native new order output is synthetic, not deployed source wire. No vote real input available.",
+  "source": "arb-t6 7ba05036-5c85-4c45-8c9c-717381ebeb53",
+  "source_events_sha256": "79dd25db84f1051d8762cfc61296d6b8a6c3b198d355039bd8c3b36c799360f6",
+  "synthetic_request_sha256": "2cb9e3630071d9211ed6988165e4582a3994de398a6113e0c75b88671b92414d",
+  "vectors": [
+    {
+      "emitted_output": "emitted_output_synthetic",
+      "event_seq": 6,
+      "expected_writable": [
+        "2tjCix5KX7fFq67fEb5a5KJkuhwa1VLA4rG66i3WJcYi",
+        "3HBG5DRj71ZGkoF5imZYv7zrjfALfpxvjuBCUSbMu2VE",
+        "CSCid5uybcJX9Fwg64YHWXgwAMBPESskWXKMJAJJzKTD",
+        "E9mkNsRAJJrQLVpdwUDESZGjhWLvuPgMmGQXHtw3pdPN",
+        "Fussijx8su8t5on31SaiyL8tPkPTPVqZP63RLgTCc5K5",
+        "GEtgDoZGebKHSP2CbEbxiWPDccyaoi31BL6pybLwGM6E"
+      ],
+      "file": "v0-readonly.bin",
+      "full_filter_order": [
+        "adapter_writable_0"
+      ],
+      "sha256": "37c3c06c9f33382fc73c39b3f2c1513925f0f858a7fa851f296219d6db2d15e7",
+      "source_input": "source_input_real",
+      "success": false,
+      "synthetic_order_file": "v0-readonly-synthetic-order.bin",
+      "synthetic_order_sha256": "d371483398c6b1be84aaaca272f902e2f9b7bdf42ca15bee01ece1217e65e187",
+      "tracked_intersection": [],
+      "tracked_present": [
+        "So11111111111111111111111111111111111111112"
+      ],
+      "version": "v0"
+    },
+    {
+      "emitted_output": "emitted_output_synthetic",
+      "event_seq": 8,
+      "expected_writable": [
+        "23dYyRgpMFkEGTh6ynW1qD9B5a1cvGyJBhB7z9KbGBSs",
+        "4N6jzxFK4do3R4CHT8WTWxs7jwNH3yrV1fL2fE2vs6jv",
+        "5A4zS1asu9A4DVJGfSMUfQxCT1Q2Q9NyAyY1dfr9nqo8",
+        "5M27empixegY4mP9tX2ki9rRkfu8azza9be76ghqdvfg",
+        "5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6",
+        "5dBdMPDAGQPbNf56UtZkdZ7SZ9ght3ZCfCjxWrP8RvFL",
+        "5oyBtu516hcRXuHnfGKQXwr6mA4HZrHNUZoyD9gpuG5j",
+        "62o9CKJbkFMLbhbkejc78DXSMEQLUx4SEkDHMRMbPYun",
+        "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+        "6RmEkvPuHFVVKJQcsqUHwwNEJ7KTXqWj2new4EGaUdri",
+        "77bdKFAuv4VF9sYNP3KDn8Ae8pXX9BzMHJS4tnoRF5FN",
+        "9RadymBPxM3v9V6DCjeZDoR2cmUqMe8bMEVcg3zgv3WR",
+        "CSEMKqpcdAsmJoPoNAqWZxxtj3UDJ84JgwHVhu7nsqzt",
+        "CnTeYCBA7Hzj9r2s99SaEXKYpiWixtMUkqZWHwyNbm3g",
+        "FYUL4ZTJ5AKbtKEeo4kVYp9rokG8NXenzxHwpYeXtmAc"
+      ],
+      "file": "v1-writer.bin",
+      "full_filter_order": [
+        "adapter_writable_2"
+      ],
+      "sha256": "ab97b121d1d052ca510a727d13ec6ba733662a531cd9ea99967ca6a969121a57",
+      "source_input": "source_input_real",
+      "success": false,
+      "synthetic_order_file": "v1-writer-synthetic-order.bin",
+      "synthetic_order_sha256": "36fb068a6f0ff3455027392b102122e1dbac52eaf47d5d5941bd79646378403d",
+      "tracked_intersection": [
+        "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"
+      ],
+      "tracked_present": [
+        "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV"
+      ],
+      "version": "v1"
+    },
+    {
+      "emitted_output": "emitted_output_synthetic",
+      "event_seq": 12,
+      "expected_writable": [
+        "2Sfw8APTEmc2QXPbKmmT5QL38fHHDv5L9dBcif5U62Gt",
+        "31pkb1MRGxRoAHYc9JhM3Lc7Kuammnk9fK4aaYFjtmmT",
+        "4Asr5V2VputY6nRMqaEu94WaFYiXXYML7aNwA3b7YUeq",
+        "4NQM2Ly4opQmdo9JQUH945MBbHiWk5BJh4aZCndkSDfy",
+        "4RmpTfLwfaMEeGnzYysn9HJ5J7ubeJXywmjSG66d1bEr",
+        "4wrMA2SUGAMyscPYq4KiRC7LB55ZHnCKfZFGBLcpnHyc",
+        "57siuv8HfvXjRapodcKP3fdGK63JpqNJLhb7v6QjVDNL",
+        "5EeYy84co8D2r6yavmrAZ2cZGPopfo3epQj1Yrx2Tpkw",
+        "5N2eygRaN12jFuSpcjNWs6AYoibCHQujLd8EELDwPjrS",
+        "5taHU75sokmvuyBM4PTwjAtptEFkaqJ7m3dhV2hkLYT4",
+        "6uZHj21TSGuLYkFDvVsLvzF8gvGdMQc2fQedZEGLTST2",
+        "7j13CapqLC4dGaGYFCxgL8t31R7B1Gt93uBh8EdoRp9H",
+        "8i6cdMykqPY5uF67G8u8fcMbudmFFqHnJAb6rDbxgELA",
+        "95w5FFPst4qUv5dUUYcoN8FsUumn9CjjfmfwrEw5VTKi",
+        "99BzVQA71EmRaiF7rEgu1raoFSSkDPhfwTLCYTwkKuCb",
+        "9LaKY6piRbsd9EjBFhYw33aPZHXhrFu3JPp9oHfDRknp",
+        "9jYVD4nYeNWaQhRuzVKwkPAP9RYiNYYb6EnCbQryyQhJ",
+        "AYCUq3YZr5HZTVuvjmuG7DFSCL9eQ2ibRsepDhgVAoUV",
+        "Ax4YgkRLpRW6SZwxFo6jvFbvEWcx1wWYSVqKbvxRXZHP",
+        "Bmbnyc9mMb71VRoTCTdGK4m69e7KfQ4XeJMaVMyA4Gk4",
+        "C5Z9kEGvRsD4DwB1tMj64FhbECZZscKuhuPctCvCLtHG",
+        "CA7v8gHfbquYXyDnDx6QxWW8hmL1H7X6Y2RYDrGLnuck",
+        "Cxz9ktTZryYqY31fYyCZn6g5nTgBr3i12JH2yhoH3xHa",
+        "DD2qmUU6f1a8eSp8DYebKTSJK8eEB8RZRVWCt34CP4FA",
+        "DHXzEmuHxBkqynGuWcqVSnxZghPnKQktdZiwvp4yoBmD",
+        "E3yE42dQZCmwzsGBCZfFYPU9SaQjT5uR4WATdXDcf6tu",
+        "EGdwMhYGgzaN7KhY4DeD5bkmfqY2ZN3dYUnvc69WGVFm",
+        "EPBRnCyyZfQ5Uo6k2voJnXZNFuaFYfd6XTeNxxFzww4Q",
+        "EaFmtUxpQQzdDtq77YNBDEhyK81hGFSHA7EhuRnpterD",
+        "EtgGH4XrrJqebtSAXSgVspAUYVvuQ2gzfrY11J9G8sp2",
+        "F2zkUbsA7dZg11989toQYeF6kRtjEsfYCZj9HfzdXvpo",
+        "FS4ndN1EbLg3d6DcKKPy3nU6UaWrDzFP1tj1hijEEpDZ",
+        "G6FCtZVFxW1HBgF7XBosj5VTvSZ8oWjBSRFJahh8Y92d",
+        "G87HWiowSmteQe3Cpdq5tq52mVs5UNwK9Jq2rKcrKUpw",
+        "HknqzEAg7Q78CqAGfG1LZRVcnNzbFfczEV1hjKF7ELq9"
+      ],
+      "file": "v1-readonly.bin",
+      "full_filter_order": [
+        "adapter_writable_6",
+        "adapter_writable_4",
+        "adapter_writable_2",
+        "adapter_writable_8",
+        "adapter_writable_0"
+      ],
+      "sha256": "150bc82310a916f448377659532d1d0fd5e86d37271c98e549d13a41ff18fdec",
+      "source_input": "source_input_real",
+      "success": true,
+      "synthetic_order_file": "v1-readonly-synthetic-order.bin",
+      "synthetic_order_sha256": "2ce2707fe207120d3a3f82db8228a0338cbd2d6e818b414dbd8928497d74a85a",
+      "tracked_intersection": [],
+      "tracked_present": [
+        "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx",
+        "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw",
+        "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6",
+        "GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR",
+        "So11111111111111111111111111111111111111112"
+      ],
+      "version": "v1"
+    },
+    {
+      "emitted_output": "emitted_output_synthetic",
+      "event_seq": 26,
+      "expected_writable": [
+        "247KMsF8rXoLsCRfUQ4wXe5nPSY3ntRCzESpb2r5gjsn",
+        "31pkb1MRGxRoAHYc9JhM3Lc7Kuammnk9fK4aaYFjtmmT",
+        "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+        "3rWrb5L77DHt3dQtaBjWY8LSfrZKVNysWDhQmmzYkPhc",
+        "4Asr5V2VputY6nRMqaEu94WaFYiXXYML7aNwA3b7YUeq",
+        "4NQM2Ly4opQmdo9JQUH945MBbHiWk5BJh4aZCndkSDfy",
+        "4RmpTfLwfaMEeGnzYysn9HJ5J7ubeJXywmjSG66d1bEr",
+        "52veWE5LzLo51BMJnPB34M1ZuehtDAHddyb1MP23wdZr",
+        "57siuv8HfvXjRapodcKP3fdGK63JpqNJLhb7v6QjVDNL",
+        "5EeYy84co8D2r6yavmrAZ2cZGPopfo3epQj1Yrx2Tpkw",
+        "5N2eygRaN12jFuSpcjNWs6AYoibCHQujLd8EELDwPjrS",
+        "628tuaH9DuYK7W36wW6s9aPpwcUcWoropaWWL3HfeS6f",
+        "6uZHj21TSGuLYkFDvVsLvzF8gvGdMQc2fQedZEGLTST2",
+        "7AATQD7uMfs6Bq2kdRDKZFrWH2N2xy9iN5dejbxduBCR",
+        "7EcgRnaGdkqoYT2QDKpAkQjRhenRYYipDDN4oaAuirT9",
+        "7Qk9jBNNwpwg2oH2yRLq8CDqEiT11Evod29dQZgsnYzA",
+        "7j13CapqLC4dGaGYFCxgL8t31R7B1Gt93uBh8EdoRp9H",
+        "99BzVQA71EmRaiF7rEgu1raoFSSkDPhfwTLCYTwkKuCb",
+        "9LaKY6piRbsd9EjBFhYw33aPZHXhrFu3JPp9oHfDRknp",
+        "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw",
+        "C9fwxA1XYJGpHy43G4brsMUKyaRYtR1y68hK4g4wYYhp",
+        "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6",
+        "DD2qmUU6f1a8eSp8DYebKTSJK8eEB8RZRVWCt34CP4FA",
+        "DWpvfqzGWuVy9jVSKSShdM2733nrEsnnhsUStYbkj6Nn",
+        "EGdwMhYGgzaN7KhY4DeD5bkmfqY2ZN3dYUnvc69WGVFm",
+        "EPBRnCyyZfQ5Uo6k2voJnXZNFuaFYfd6XTeNxxFzww4Q",
+        "EaFmtUxpQQzdDtq77YNBDEhyK81hGFSHA7EhuRnpterD",
+        "F2zkUbsA7dZg11989toQYeF6kRtjEsfYCZj9HfzdXvpo",
+        "FS4ndN1EbLg3d6DcKKPy3nU6UaWrDzFP1tj1hijEEpDZ",
+        "G6FCtZVFxW1HBgF7XBosj5VTvSZ8oWjBSRFJahh8Y92d",
+        "GSsjV1m637SbHYe4SD1rU3BzJZELnakijLua9Gw19LhM",
+        "GYH1Gae1wJytMSvMvw8JVcv7nuAbxi8i9erNVbERnzXd",
+        "HknqzEAg7Q78CqAGfG1LZRVcnNzbFfczEV1hjKF7ELq9",
+        "J4pc3HHq7r3TrcTTHMXeyo14vKvHU7Xgr4PBVTQY6mpM"
+      ],
+      "file": "v0-writer.bin",
+      "full_filter_order": [
+        "adapter_writable_6",
+        "adapter_writable_4",
+        "adapter_writable_2",
+        "adapter_writable_8",
+        "adapter_writable_0",
+        "adapter_writable_5"
+      ],
+      "sha256": "a4f6a9068d31c839d480f2ee4db700b6f5296250b0348f0eff37ad649eed98ff",
+      "source_input": "source_input_real",
+      "success": true,
+      "synthetic_order_file": "v0-writer-synthetic-order.bin",
+      "synthetic_order_sha256": "f962df11643a49936bcef1a72d12f46b2c64fd43276a1900ea99dc69de284a36",
+      "tracked_intersection": [
+        "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw",
+        "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6"
+      ],
+      "tracked_present": [
+        "5PHirr8joyTMp9JMm6nW7hNDVyEYdkzDqazxPD7RaTjx",
+        "ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw",
+        "C2aFPdENg4A2HQsmrd5rTw5TaYBX5Ku887cWjbFKtZpw",
+        "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6",
+        "GS4CU59F31iL7aR2Q8zVS8DRrcRnXX1yjQ66TqNVQnaR",
+        "So11111111111111111111111111111111111111112"
+      ],
+      "version": "v0"
+    },
+    {
+      "emitted_output": "emitted_output_synthetic",
+      "event_seq": 50,
+      "expected_writable": [
+        "37MT9iPhQwayBytNLeRhYePmcwcjgLTd1JyE5cSC16RH",
+        "3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR",
+        "3C6d4nEkCLCea7pPi1MAtVfzNos3S4qAPbTFHM9V1fKw",
+        "3znYbEaX4cNpepkEqGUk4CPyKsXV82LWxQW78sWUamFq",
+        "51aqseZnqAhrCMCrqPdbSWeyw98Bv96HZkEpVHuAFk89",
+        "6omzPX1UDx8Ke4cGG2rrjTA6xJxYuHinhjfiSc9YJgst",
+        "AVGDRSSNxsSAkn2713eXd72GbKrn6uycnqUmJgKPk5fH",
+        "DF7eRXHnvRQ9QeVCrdfS56a7RpBD6se6mgPvzApHPNr9",
+        "FPTvREv5ZVC1CPWPMYSFFgRWvkmwycrGr6PZmXw1ZpTN",
+        "LandX3uK1cSUF7hbefKo3oL1j4FhvhxitiMRKut99Z6"
+      ],
+      "file": "legacy-readonly.bin",
+      "full_filter_order": [
+        "adapter_writable_0"
+      ],
+      "sha256": "be90d7624901023cb6d65353cafebf2036f36a6fad5214b9578160f15544f545",
+      "source_input": "source_input_real",
+      "success": true,
+      "synthetic_order_file": "legacy-readonly-synthetic-order.bin",
+      "synthetic_order_sha256": "4e982eae88399a25095601af4c2df6e483e315da3f28d007a0acefe8ee4f8caa",
+      "tracked_intersection": [],
+      "tracked_present": [
+        "So11111111111111111111111111111111111111112"
+      ],
+      "version": "legacy"
+    },
+    {
+      "emitted_output": "emitted_output_synthetic",
+      "event_seq": 136,
+      "expected_writable": [
+        "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD",
+        "6omzPX1UDx8Ke4cGG2rrjTA6xJxYuHinhjfiSc9YJgst",
+        "7Hoz6hGMrhvehC5UzMWtUXu17JPUcBzptkAwKF6goLrB",
+        "7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ",
+        "9rP9yxteALCKw2yvbxS72ZrARt228TAcaiHu2x1HfyAj",
+        "C9nUBXomUT9HZksfdFtG23krkB4zftuqBj1boKHYkbmX",
+        "FPTvREv5ZVC1CPWPMYSFFgRWvkmwycrGr6PZmXw1ZpTN",
+        "FWa69aHpgnzJ97vtnLJcSH44dkdupvhv9B1SYongAFA"
+      ],
+      "file": "legacy-writer.bin",
+      "full_filter_order": [
+        "adapter_writable_2"
+      ],
+      "sha256": "ba7af5cfe616aa2355a5ea2edec6530d80bcf8a0505309b7517f4b3a8c38d8e7",
+      "source_input": "source_input_real",
+      "success": false,
+      "synthetic_order_file": "legacy-writer-synthetic-order.bin",
+      "synthetic_order_sha256": "aeb5ea9cf478c5cf09a78152e43ef30ae636030128adb1809a445c2562c30b6e",
+      "tracked_intersection": [
+        "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"
+      ],
+      "tracked_present": [
+        "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"
+      ],
+      "version": "legacy"
+    }
+  ]
+}

@@ -289,6 +289,7 @@ where
 #[serde(default, deny_unknown_fields)]
 pub struct FilterLimitsOrder {
     pub max_watchers: usize,
+    pub max_transactions_per_bank: usize,
     pub max_banks_per_stream: usize,
     pub max_notifications: usize,
     pub queue_bytes: usize,
@@ -298,6 +299,7 @@ impl Default for FilterLimitsOrder {
     fn default() -> Self {
         Self {
             max_watchers: 32,
+            max_transactions_per_bank: 65536,
             max_banks_per_stream: 16384,
             max_notifications: 1024,
             queue_bytes: 4 * 1024 * 1024,

@@ -94,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
     let commitment: CommitmentLevel = args.commitment.unwrap_or_default().into();
     subscribe_tx
         .send(SubscribeRequest {
+            order_writes: None,
+            order_close: None,
             slots: HashMap::new(),
             accounts: HashMap::new(),
             transactions: HashMap::new(),

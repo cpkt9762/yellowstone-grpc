@@ -15,6 +15,7 @@ pub type BankRef = (u64, u64);
 struct BankWatch {
     epoch: Option<Vec<u8>>,
     late: bool,
+    reported: bool,
 }
 #[derive(Debug, Default)]
 struct WatchState {
@@ -43,6 +44,14 @@ impl OrderIntegrity {
         }
     }
     pub fn register(self: &Arc<Self>) -> Result<OrderWatch> {
+        ensure!(
+            !self.broken.load(Ordering::SeqCst),
+            "B integrity source failed"
+        );
+        ensure!(
+            self.limits.control_bytes >= 4096,
+            "B control reserve must fit a complete gap"
+        );
         let mut s = self
             .state
             .lock()
@@ -215,6 +224,40 @@ impl OrderWatch {
         entry.epoch = Some(epoch.to_vec());
         Ok(())
     }
+    pub fn pending_lates(&self) -> Result<Vec<BankRef>> {
+        let s = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+        Ok(s.watchers
+            .get(&self.id)
+            .map(|w| {
+                w.banks
+                    .iter()
+                    .filter(|(_, b)| b.late && !b.reported && b.epoch.is_some())
+                    .map(|(bank, _)| *bank)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+    pub fn banks_at_slot(&self, slot: u64) -> Result<Vec<BankRef>> {
+        let s = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+        Ok(s.watchers
+            .get(&self.id)
+            .map(|w| {
+                w.banks
+                    .keys()
+                    .filter(|(s, _)| *s == slot)
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
     pub fn epoch(&self, bank: BankRef) -> Result<Option<Vec<u8>>> {
         let s = self
             .owner
@@ -225,6 +268,23 @@ impl OrderWatch {
             .get(&self.id)
             .and_then(|w| w.banks.get(&bank))
             .and_then(|b| b.epoch.clone()))
+    }
+    pub fn consume_epoch(&self, bank: BankRef) -> Result<Option<Vec<u8>>> {
+        let mut s = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+        Ok(s.watchers
+            .get_mut(&self.id)
+            .and_then(|w| w.banks.get_mut(&bank))
+            .and_then(|b| {
+                if b.reported {
+                    return None;
+                }
+                b.reported = true;
+                b.epoch.clone()
+            }))
     }
 }
 impl Drop for OrderWatch {

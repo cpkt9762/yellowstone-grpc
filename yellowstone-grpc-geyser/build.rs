@@ -18,10 +18,28 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Build metadata is derived from this exact worktree and schema.
-    println!(
-        "cargo:rustc-env=ORDER_GIT_SHA={}",
-        git_version::git_version!(args = ["--always", "--abbrev=40", "--exclude=*"])
+    let git = |args: &[&str]| -> anyhow::Result<String> {
+        let output = std::process::Command::new("git").args(args).output()?;
+        anyhow::ensure!(output.status.success(), "git metadata command failed");
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    let sha = git(&["rev-parse", "HEAD"])?;
+    anyhow::ensure!(
+        sha.len() == 40
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "invalid full git SHA"
     );
+    println!("cargo:rustc-env=ORDER_GIT_SHA={sha}");
+    let git_dir = git(&["rev-parse", "--absolute-git-dir"])?;
+    println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    let common = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let head = std::fs::read_to_string(format!("{git_dir}/HEAD"))?;
+    if let Some(reference) = head.trim().strip_prefix("ref: ") {
+        println!("cargo:rerun-if-changed={common}/{reference}");
+        println!("cargo:rerun-if-changed={common}/packed-refs");
+    }
     let schemas = ["geyser.proto", "solana-storage.proto"];
     let mut entries = Vec::new();
     for name in schemas {

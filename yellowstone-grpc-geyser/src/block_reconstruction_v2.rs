@@ -2325,4 +2325,39 @@ mod tests {
             ]
         );
     }
+    #[test]
+    fn order_writes_v1_late_drop_and_replay_gc_keep_b_visible_without_changing_a() {
+        let integrity = Arc::new(crate::order_integrity::OrderIntegrity::new(
+            Default::default(),
+        ));
+        let watch = integrity.register().expect("B watcher before callbacks");
+        let mut storage = BlockMachineStorage::new(1);
+        storage.order_integrity = Some(Arc::clone(&integrity));
+        drive_bank_to_processed(&mut storage, 10, 7, Some(9));
+        watch
+            .bind((10, 7), &[4; 16])
+            .expect("source registered before any broadcast");
+        while storage.pop_ready_block().is_some() {}
+        storage.add(make_account_msg(10, 7, Pubkey::new_unique(), 2));
+        assert!(
+            storage.pop_ready_block().is_none(),
+            "old late account remains dropped from A"
+        );
+        assert_eq!(integrity.take_notifications(), vec![(10, 7)]);
+        assert!(!storage
+            .replay_candidate(10, 7)
+            .expect("frozen bank")
+            .order_source_valid());
+        storage.evict_slot(10);
+        assert!(storage.replay_candidate(10, 7).is_none());
+        // A new late kind after GC still references the already promised B epoch.
+        // A watch remains sticky after its first late event; no unbounded duplicate notices.
+        storage.add(make_block_meta_msg(10, 9, 7));
+        assert_eq!(
+            watch.epoch((10, 7)).expect("history survives GC"),
+            Some(vec![4; 16])
+        );
+        assert!(integrity.take_notifications().is_empty());
+        drop(watch);
+    }
 }

@@ -347,6 +347,69 @@ impl Weigher for WeightScales {
 /// Sender half of a Subscribe queue.
 type SubscribeSender = LoadAwareSender<TonicResult<FilteredUpdate>, WeightScales>;
 
+/// One bounded pending revocation keeps a historical NORMAL_END from hiding a
+/// later anomaly while control credit is occupied. Retried by client_loop only.
+struct OrderQueue {
+    data: Result<SubscribeSender, &'static str>,
+    control: Result<SubscribeSender, &'static str>,
+    pending_gap: StdMutex<Option<FilteredUpdate>>,
+}
+impl OrderQueue {
+    fn new(
+        tx: &SubscribeSender,
+        limits: &crate::plugin::filter::limits::FilterLimitsOrder,
+    ) -> Self {
+        Self {
+            data: tx.with_budget(limits.queue_bytes),
+            control: tx.with_budget(limits.control_bytes),
+            pending_gap: StdMutex::new(None),
+        }
+    }
+    fn send(&self, update: FilteredUpdate) -> anyhow::Result<()> {
+        use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
+        let (gap, reserved) = match &update.message {
+            FilteredUpdateOneof::Order(wire) => match wire.update_oneof.as_ref() {
+                Some(UpdateOneof::OrderGap(_)) => (true, true),
+                Some(UpdateOneof::OrderRejected(_)) => (false, true),
+                _ => (false, false),
+            },
+            _ => (false, false),
+        };
+        let sender = if reserved {
+            self.control.as_ref()
+        } else {
+            self.data.as_ref()
+        }
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        match sender.try_send_strict(Ok(update)) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(Ok(update))) if gap => {
+                let mut pending = self
+                    .pending_gap
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("B revocation mutex poisoned"))?;
+                if pending.is_none() {
+                    *pending = Some(update);
+                }
+                Ok(())
+            }
+            Err(_) => anyhow::bail!("B byte credit exhausted or transport closed"),
+        }
+    }
+    fn flush(&self) {
+        match self.pending_gap.lock() {
+            Ok(mut pending) => {
+                if let (Some(update), Ok(sender)) = (pending.as_ref(), self.control.as_ref()) {
+                    if sender.try_send_strict(Ok(update.clone())).is_ok() {
+                        pending.take();
+                    }
+                }
+            }
+            Err(error) => log::error!("B pending revocation lock failed: {error}"),
+        }
+    }
+}
+
 /// Sender half of a SubscribeDeshred queue, which bounds the number of queued updates.
 type DeshredSubscribeSender = LoadAwareSender<
     TonicResult<FilteredUpdateDeshred>,
@@ -401,9 +464,18 @@ impl SubscriberChannels {
         messages: BroadcastedMessage,
         group: Option<crate::order_stream::GroupBoundary>,
     ) {
+        let late = if commitment == CommitmentLevel::Confirmed {
+            self.order_integrity.take_notifications()
+        } else {
+            Vec::new()
+        };
         let _ = self
             .sender(commitment)
-            .send(crate::order_stream::BroadcastEnvelope { messages, group });
+            .send(crate::order_stream::BroadcastEnvelope {
+                messages,
+                group,
+                late: Arc::new(late),
+            });
     }
     #[inline]
     pub fn subscribe(
@@ -1627,9 +1699,6 @@ impl GrpcService {
                         }
                     }
 
-                    for (slot,bank_id) in broadcast.order_integrity.take_notifications() {
-                        broadcast.send_group(CommitmentLevel::Confirmed, Arc::new(Vec::new()), Some(crate::order_stream::GroupBoundary::Late {slot,bank_id}));
-                    }
                     while let Some((slot_update, frozen_block)) = block_machine.pop_ready_block() {
                         let commitment_level = match slot_update.commitment {
                             solana_commitment_config::CommitmentLevel::Processed => CommitmentLevel::Processed,
@@ -1643,7 +1712,7 @@ impl GrpcService {
                             if commitment_level == CommitmentLevel::Confirmed {
                                 broadcast.order_integrity.register_bank((slot_update.slot,slot_update.bank_id));
                             }
-                            let group = (commitment_level == CommitmentLevel::Confirmed).then(|| crate::order_stream::GroupBoundary::Begin(crate::order_stream::BankGroup::from_frozen(&frozen_block)));
+                            let group = (commitment_level == CommitmentLevel::Confirmed).then(|| crate::order_stream::GroupBoundary::Begin(crate::order_stream::BankGroup::from_frozen(&frozen_block,&broadcast.order_integrity.limits)));
                             broadcast.send_group(commitment_level, frozen_block.messages(), group);
                         }
 
@@ -1767,6 +1836,7 @@ impl GrpcService {
         client_unresponsive_timeout: Option<Duration>,
     ) {
         let cancellation_token = session.cancellation_token.clone();
+        let b_queue = OrderQueue::new(&stream_tx, &broadcast.order_integrity.limits);
 
         if let Some(snapshot_rx) = snapshot_rx.take() {
             info!("client #{}: snapshot requested", session.subscriber_id);
@@ -1776,6 +1846,7 @@ impl GrpcService {
                 &mut client_rx,
                 snapshot_rx,
                 cancellation_token.clone(),
+                &b_queue,
             )
             .await;
             match result {
@@ -1828,21 +1899,7 @@ impl GrpcService {
 
         let mut deferred_request = None;
         let mut b_deadline = tokio::time::interval(Duration::from_secs(1));
-        let b_limits = &broadcast.order_integrity.limits;
-        let b_data = stream_tx.with_budget(b_limits.queue_bytes);
-        let b_control = stream_tx.with_budget(b_limits.control_bytes);
-        let mut b_send = |update: FilteredUpdate| -> anyhow::Result<()> {
-            let reserved=matches!(update.as_subscribe_update().update_oneof,Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::OrderGap(_) | yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::OrderRejected(_)));
-            let sender = if reserved {
-                b_control.as_ref()
-            } else {
-                b_data.as_ref()
-            }
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-            sender
-                .try_send_strict(Ok(update))
-                .map_err(|_| anyhow::anyhow!("B byte credit exhausted or transport closed"))
-        };
+        let mut b_send = |update: FilteredUpdate| b_queue.send(update);
         macro_rules! b_step {
             ($step:expr) => {
                 if let Err(error) = $step {
@@ -1857,6 +1914,7 @@ impl GrpcService {
             };
         }
         'outer: loop {
+            b_queue.flush();
             observe_subscriber_queue_size(
                 &session.subscriber_id,
                 stream_tx.current_weight() as u64,
@@ -1900,6 +1958,11 @@ impl GrpcService {
                             let wire_error=filter_new.order_wire_error.clone();
                             let order_source=filter_new.order_source.clone();
                             if let Some(raw)=order_source.as_ref() {
+                                if raw.order_writes.is_some() && raw.ping.is_some() {
+                                    let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,"B control cannot carry ping"));
+                                    if let Some(ping)=&raw.ping {let _=stream_tx.try_send(Ok(FilteredUpdate::new_empty(FilteredUpdateOneof::pong(ping.id))));}
+                                    continue;
+                                }
                                 if raw.order_close.is_some() {
                                     if let Some(error)=wire_error.as_ref() {
                                         let _=b_send(session.order.reject(None,yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,error));
@@ -2056,9 +2119,7 @@ impl GrpcService {
                         }
                     };
 
-                    if let Some(crate::order_stream::GroupBoundary::Late {slot,bank_id})=&messages.group {
-                        b_step!(session.order.late((*slot,*bank_id), &mut b_send));
-                    }
+                    for bank in messages.late.iter() {b_step!(session.order.late(*bank,&mut b_send));}
                     if let Some(crate::order_stream::GroupBoundary::Begin(bank))=&messages.group {
                         b_step!(session.order.begin(bank.clone(), &mut b_send));
                     }
@@ -2125,6 +2186,7 @@ impl GrpcService {
         client_rx: &mut mpsc::UnboundedReceiver<Option<(Option<u64>, Filter)>>,
         snapshot_rx: crossbeam_channel::Receiver<Box<Message>>,
         cancellation_token: CancellationToken,
+        b_queue: &OrderQueue,
     ) -> Result<(), ClientSnapshotReplayError> {
         info!(
             "client #{}: going to receive snapshot data",
@@ -2140,7 +2202,13 @@ impl GrpcService {
                 }
                 maybe = client_rx.recv() => {
                     match maybe {
-                        Some(Some((_from_slot, filter_new))) => {
+                        Some(Some((_from_slot, mut filter_new))) => {
+                            let _admission=filter_new.order_admission.take();
+                            if let Some(raw)=filter_new.order_source.as_ref().filter(|r|r.order_writes.is_some() || r.order_close.is_some()) {
+                                let rejected=session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::ScopeCoverageInvalid,"B startup snapshot unsupported");
+                                if b_queue.send(rejected).is_err(){log::warn!("B startup rejection could not be queued");}
+                                if raw.order_close.is_some() || raw.ping.is_some(){continue;}
+                            }
                             if let Some(msg) = filter_new.get_pong_msg() {
                                 if stream_tx.send(Ok(msg)).await.is_err() {
                                     error!("client #{}: stream closed", session.subscriber_id);
@@ -2603,7 +2671,7 @@ impl Geyser for GrpcService {
                                 } {Ok(permit)=>Some(Arc::new(permit)),Err(_)=>break}
                             }else{None};
                             let wire_error=envelope.order_wire_error.or_else(|| (x_request_snapshot && request.order_writes.is_some()).then(||"B startup snapshot unsupported".to_owned()));
-                            if request.order_close.is_some() {
+                            if request.order_close.is_some() || (request.order_writes.is_some() && request.ping.is_some()) {
                                 let mut filter=Filter::order_control(request);filter.order_wire_error=wire_error;filter.order_admission=admission;
                                 if incoming_client_tx.send(Some((None, filter))).is_err() { break; }
                                 continue;
@@ -4557,3 +4625,7 @@ mod owner_reject_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "order_source_tests.rs"]
+mod order_writes_v1;
