@@ -267,7 +267,8 @@ impl Filter {
         Ok(Self {
             order_admission: None,
             order_wire_error: None,
-            order_source: Some(Arc::new(config.clone())),
+            order_source: (config.order_writes.is_some() || config.order_close.is_some())
+                .then(|| Arc::new(config.clone())),
             accounts: FilterAccounts::new(&config.accounts, &limits.accounts, names)?,
             slots: FilterSlots::new(&config.slots, &limits.slots, names)?,
             transactions: FilterTransactions::new(

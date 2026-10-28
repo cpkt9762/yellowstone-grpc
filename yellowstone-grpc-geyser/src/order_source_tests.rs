@@ -508,7 +508,7 @@ async fn replace_and_close_at_each_original_batch_gap_keep_bank_atomic() {
 async fn startup_rejects_b_explicitly_and_preserves_independent_a_filter() {
     let (tx, mut requests) = mpsc::unbounded_channel();
     let (stream, mut rx) = load_aware_channel(1024, WeightScales::default());
-    let b = OrderQueue::new(&stream, &Default::default());
+    let b = LazyOrderQueue::new(&stream, &Default::default());
     let cancellation = CancellationToken::new();
     let mut session = ClientSession::new(
         0,
@@ -724,4 +724,194 @@ async fn invalid_source_bank_gaps_b_and_keeps_original_a_tail() {
     assert_eq!(old, 5);
     assert!(!c.2.is_finished());
     c.2.abort();
+}
+
+#[allow(dead_code)]
+#[rustfmt::skip]
+#[path = "../tests/fixtures/order_source/revision_baseline_reconstruction.rs"]
+mod revision_baseline;
+const REVISION_TIMESTAMP: Timestamp = Timestamp {
+    seconds: 1700000000,
+    nanos: 123,
+};
+fn revision_callbacks(slot: u64, bank_id: u64) -> Vec<Message> {
+    let mut messages = Vec::new();
+    for key in crate::block_reconstruction_v2::MUST_HAVE_SYSVAR_ACCOUNTS {
+        let mut a = fixtures::simple_message_account(key, Pubkey::default());
+        let m = Arc::make_mut(&mut a);
+        m.slot = slot;
+        m.bank_id = Some(bank_id);
+        m.created_at = REVISION_TIMESTAMP;
+        messages.push(Message::Account(a));
+    }
+    let mut created = fixtures::message_slot(slot, SlotStatus::CreatedBank);
+    created.bank_id = Some(bank_id);
+    created.created_at = REVISION_TIMESTAMP;
+    messages.push(Message::Slot(Arc::new(created)));
+    for mut m in group_content(slot, false) {
+        match &mut m {
+            Message::Account(a) => {
+                let a = Arc::make_mut(a);
+                a.bank_id = Some(bank_id);
+                a.created_at = REVISION_TIMESTAMP;
+            }
+            Message::Transaction(t) => {
+                let t = Arc::make_mut(t);
+                t.bank_id = bank_id;
+                t.created_at = REVISION_TIMESTAMP;
+            }
+            _ => {}
+        }
+        messages.push(m);
+    }
+    let mut entry = fixtures::message_entry(slot, 0);
+    let e = Arc::make_mut(&mut entry);
+    e.bank_id = bank_id;
+    e.created_at = REVISION_TIMESTAMP;
+    e.executed_transaction_count = 1;
+    messages.push(Message::Entry(entry));
+    let mut meta = fixtures::message_block_meta(slot);
+    let m = Arc::make_mut(&mut meta);
+    m.created_at = REVISION_TIMESTAMP;
+    m.block_meta.bank_id = bank_id;
+    m.block_meta.executed_transaction_count = 1;
+    m.block_meta.entries_count = 1;
+    messages.push(Message::BlockMeta(meta));
+    for status in [
+        SlotStatus::Processed,
+        SlotStatus::Confirmed,
+        SlotStatus::Finalized,
+    ] {
+        let mut m = fixtures::message_slot(slot, status);
+        m.bank_id = Some(bank_id);
+        m.created_at = REVISION_TIMESTAMP;
+        messages.push(Message::Slot(Arc::new(m)));
+    }
+    messages
+}
+async fn revision_baseline_loop(
+    mut rx: mpsc::UnboundedReceiver<BlockReconstructionMessage>,
+    broadcast: SubscriberChannels,
+) {
+    let mut machine = revision_baseline::BlockMachineStorage::new(16);
+    while let Some(batch) = rx.recv().await {
+        match batch {
+            BlockReconstructionMessage::Single(m) => machine.add(m),
+            BlockReconstructionMessage::Batch(ms) => {
+                for m in ms.iter() {
+                    machine.add(m.clone());
+                }
+            }
+        }
+        while let Some((u, frozen)) = machine.pop_ready_block() {
+            let level = match u.commitment {
+                solana_commitment_config::CommitmentLevel::Processed => CommitmentLevel::Processed,
+                solana_commitment_config::CommitmentLevel::Confirmed => CommitmentLevel::Confirmed,
+                solana_commitment_config::CommitmentLevel::Finalized => CommitmentLevel::Finalized,
+            };
+            if level != CommitmentLevel::Processed {
+                broadcast.send(level, frozen.messages());
+            }
+            let mut messages = vec![Message::Block(frozen.get_message_block())];
+            if let Some(footer) = frozen.get_block_footer() {
+                messages.push(Message::BlockFooter(footer));
+            }
+            messages.push(Message::BlockMeta(frozen.get_block_meta()));
+            broadcast.send(level, Arc::new(messages));
+            let status = match level {
+                CommitmentLevel::Processed => SlotStatus::Processed,
+                CommitmentLevel::Confirmed => SlotStatus::Confirmed,
+                CommitmentLevel::Finalized => SlotStatus::Finalized,
+            };
+            let m = Arc::new(vec![Message::Slot(Arc::new(MessageSlot {
+                slot: u.slot,
+                parent: u.parent_slot,
+                status,
+                dead_error: None,
+                bank_id: Some(u.bank_id),
+                created_at: REVISION_TIMESTAMP,
+            }))]);
+            for level in [
+                CommitmentLevel::Processed,
+                CommitmentLevel::Confirmed,
+                CommitmentLevel::Finalized,
+            ] {
+                broadcast.send(level, Arc::clone(&m));
+            }
+        }
+    }
+}
+#[tokio::test]
+async fn revision_r1_zero_b_callback_pipeline_matches_3a3d1cd_without_order_work() {
+    async fn run(
+        baseline: bool,
+        shared_filter: Filter,
+    ) -> (Vec<Vec<u8>>, Arc<crate::order_integrity::OrderIntegrity>) {
+        let mut b = SubscriberChannels::new(64, 64, 64);
+        b.revision_timestamp = Some(REVISION_TIMESTAMP);
+        let audit = Arc::clone(&b.order_integrity);
+        let mut client = spawn(b.clone());
+        client
+            .0
+            .send(Some((None, shared_filter)))
+            .expect("A filter");
+        read(&mut client.1).await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (reconstruct_tx, reconstruct_rx) = mpsc::unbounded_channel();
+        let ingress = tokio::spawn(GrpcService::geyser_loop(
+            crate::stream::tokio::BatchStreamUnboundedReceiver::new(rx),
+            b.clone(),
+            reconstruct_tx,
+        ));
+        let reconstruct = if baseline {
+            tokio::spawn(revision_baseline_loop(reconstruct_rx, b.clone()))
+        } else {
+            tokio::spawn(GrpcService::block_reconstruction_loop(
+                crate::stream::tokio::BatchStreamUnboundedReceiver::new(reconstruct_rx),
+                b.clone(),
+                None,
+                None,
+                16,
+            ))
+        };
+        for m in revision_callbacks(10, 10) {
+            tx.send(m).expect("callback queue");
+        }
+        drop(tx);
+        let mut result = Vec::new();
+        loop {
+            let u = read(&mut client.1).await;
+            let done = matches!(&u.message,FilteredUpdateOneof::Slot(s)if s.slot==10 && s.status==SlotStatus::Finalized);
+            result.push(u.encode_to_vec());
+            if done {
+                break;
+            }
+        }
+        ingress.await.expect("ingress");
+        reconstruct.abort();
+        client.2.abort();
+        (result, audit)
+    }
+    let f = filter(&request(false));
+    let (reference, _) = run(true, f.clone()).await;
+    let (actual, audit) = run(false, f).await;
+    assert_eq!(
+        actual, reference,
+        "callback queue to reconstruction to A wire must match frozen 3a3d1cd"
+    );
+    assert_eq!(
+        audit.revision_locks.load(Ordering::Relaxed),
+        0,
+        "zero B: no integrity locks"
+    );
+    assert_eq!(
+        audit.revision_bank_scans.load(Ordering::Relaxed),
+        0,
+        "zero B: no Bank validation scan"
+    );
+    assert_eq!(
+        audit.revision_client_work.load(Ordering::Relaxed),
+        0,
+        "zero B: no B queue/timer/client scheduling"
+    );
 }

@@ -77,7 +77,7 @@ pub enum GroupBoundary {
 pub struct BroadcastEnvelope {
     pub messages: Arc<Vec<SourceMessage>>,
     pub group: Option<GroupBoundary>,
-    pub late: Arc<Vec<crate::order_integrity::BankRef>>,
+    pub late: Option<Arc<Vec<crate::order_integrity::BankRef>>>,
 }
 impl Deref for BroadcastEnvelope {
     type Target = Vec<SourceMessage>;
@@ -116,7 +116,7 @@ struct Group {
 pub struct OrderSession {
     watch: Option<crate::order_integrity::OrderWatch>,
     historical: Vec<(OrderContext, u64)>,
-    stream: Vec<u8>,
+    stream: std::sync::OnceLock<Vec<u8>>,
     active: Option<Epoch>,
     pending: Option<Pending>,
     group: Option<Group>,
@@ -129,7 +129,7 @@ impl Default for OrderSession {
         Self {
             watch: None,
             historical: Vec::new(),
-            stream: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            stream: std::sync::OnceLock::new(),
             active: None,
             pending: None,
             group: None,
@@ -181,6 +181,15 @@ pub fn validate_coverage(request: &SubscribeRequest, keys: &[Vec<u8>]) -> Result
 }
 
 impl OrderSession {
+    fn stream_id(&self) -> Vec<u8> {
+        self.stream
+            .get_or_init(|| uuid::Uuid::new_v4().as_bytes().to_vec())
+            .clone()
+    }
+    pub fn mark_requested(&mut self) {
+        self.ever = true;
+    }
+
     pub fn register_watch(
         &mut self,
         registry: &Arc<crate::order_integrity::OrderIntegrity>,
@@ -254,7 +263,7 @@ impl OrderSession {
     ) -> FilteredUpdate {
         control(subscribe_update::UpdateOneof::OrderRejected(
             SubscribeUpdateOrderRejected {
-                source_stream_id: self.stream.clone(),
+                source_stream_id: self.stream_id(),
                 request_version: request.and_then(|r| r.request_version),
                 request_sha256: request
                     .filter(|r| r.request_sha256.len() == 32)
@@ -416,7 +425,7 @@ impl OrderSession {
         let key_hash = keys_digest(&pending.request.tracked_keys)?;
         let context = OrderContext {
             protocol_version: Some(1),
-            source_stream_id: self.stream.clone(),
+            source_stream_id: self.stream_id(),
             source_epoch: uuid::Uuid::new_v4().as_bytes().to_vec(),
             request_version: pending.request.request_version,
         };

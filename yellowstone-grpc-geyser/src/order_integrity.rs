@@ -5,7 +5,7 @@ use {
     std::{
         collections::{HashMap, HashSet},
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
     },
@@ -31,6 +31,13 @@ struct State {
 }
 #[derive(Debug)]
 pub struct OrderIntegrity {
+    #[cfg(test)]
+    pub(crate) revision_locks: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) revision_bank_scans: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) revision_client_work: std::sync::atomic::AtomicUsize,
+    watchers: AtomicUsize,
     state: Mutex<State>,
     pub limits: FilterLimitsOrder,
     broken: AtomicBool,
@@ -38,10 +45,21 @@ pub struct OrderIntegrity {
 impl OrderIntegrity {
     pub fn new(limits: FilterLimitsOrder) -> Self {
         Self {
+            #[cfg(test)]
+            revision_locks: Default::default(),
+            #[cfg(test)]
+            revision_bank_scans: Default::default(),
+            #[cfg(test)]
+            revision_client_work: Default::default(),
+            watchers: AtomicUsize::new(0),
             state: Mutex::new(State::default()),
             limits,
             broken: AtomicBool::new(false),
         }
+    }
+    /// The source reads this lock-free gate before any B scan or registry lock.
+    pub fn has_watchers(&self) -> bool {
+        self.watchers.load(Ordering::Acquire) != 0
     }
     pub fn register(self: &Arc<Self>) -> Result<OrderWatch> {
         ensure!(
@@ -66,12 +84,18 @@ impl OrderIntegrity {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("watcher id exhausted"))?;
         s.watchers.insert(id, WatchState::default());
+        self.watchers.store(s.watchers.len(), Ordering::Release);
         Ok(OrderWatch {
             owner: Arc::clone(self),
             id,
         })
     }
     pub fn register_bank(&self, bank: BankRef) {
+        if !self.has_watchers() {
+            return;
+        }
+        #[cfg(test)]
+        self.revision_locks.fetch_add(1, Ordering::Relaxed);
         let result = (|| -> Result<()> {
             let mut s = self
                 .state
@@ -93,6 +117,11 @@ impl OrderIntegrity {
         self.record_error(result);
     }
     pub fn note_pending(&self, bank: BankRef) {
+        if !self.has_watchers() {
+            return;
+        }
+        #[cfg(test)]
+        self.revision_locks.fetch_add(1, Ordering::Relaxed);
         let result = (|| -> Result<()> {
             let mut s = self
                 .state
@@ -116,6 +145,11 @@ impl OrderIntegrity {
     }
     /// Called at the original drop sites and before GC could revive a late bank.
     pub fn note_late(&self, bank: BankRef) {
+        if !self.has_watchers() {
+            return;
+        }
+        #[cfg(test)]
+        self.revision_locks.fetch_add(1, Ordering::Relaxed);
         let result = (|| -> Result<()> {
             let mut s = self
                 .state
@@ -142,6 +176,11 @@ impl OrderIntegrity {
         self.record_error(result);
     }
     pub fn take_notifications(&self) -> Vec<BankRef> {
+        if !self.has_watchers() {
+            return Vec::new();
+        }
+        #[cfg(test)]
+        self.revision_locks.fetch_add(1, Ordering::Relaxed);
         match self.state.lock() {
             Ok(mut s) => s.notifications.drain().collect(),
             Err(error) => {
@@ -292,6 +331,9 @@ impl Drop for OrderWatch {
         match self.owner.state.lock() {
             Ok(mut s) => {
                 s.watchers.remove(&self.id);
+                self.owner
+                    .watchers
+                    .store(s.watchers.len(), Ordering::Release);
             }
             Err(error) => {
                 log::error!("B watcher cleanup failed: {error}");
