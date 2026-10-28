@@ -21,6 +21,7 @@ default = []
 bench = ["dep:solana-storage-proto"]
 
 [dependencies]
+uuid = { workspace = true, features = ["v4"] }
 # Reuse the existing locked SHA-256 implementation for protocol digests.
 sha2 = "=0.10.9"
 solana-sdk-ids = "=3.1.0"

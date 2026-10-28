@@ -186,3 +186,114 @@ mod order_writes_v1 {
         assert_eq!(OrderedDigest::default().finish(), sha256(&[]));
     }
 }
+
+/// Preserve B wire errors as data so a separately valid A request remains usable.
+#[derive(Debug)]
+pub struct OrderSubscribeRequest {
+    pub request: SubscribeRequest,
+    pub order_wire_error: Option<String>,
+}
+
+pub fn decode_subscription(raw: &[u8]) -> Result<OrderSubscribeRequest> {
+    use bytes::Buf;
+    use prost::encoding::{decode_key, decode_varint, skip_field, DecodeContext, WireType};
+    let request = SubscribeRequest::decode(raw)?;
+    let checked = (|| -> Result<()> {
+        if request.order_writes.is_none() && request.order_close.is_none() {
+            return Ok(());
+        }
+        let mut input = raw;
+        let mut singular = std::collections::HashSet::new();
+        while input.has_remaining() {
+            let (tag, wire) = decode_key(&mut input)?;
+            ensure!(
+                (1..=12).contains(&tag) || tag == 1002 || tag == 1003,
+                "unknown subscription field"
+            );
+            if matches!(tag, 6 | 9 | 11 | 1002 | 1003) {
+                ensure!(singular.insert(tag), "duplicate subscription singular");
+            }
+            if tag == 1002 || tag == 1003 {
+                ensure!(
+                    wire == WireType::LengthDelimited,
+                    "invalid B control wire type"
+                );
+                let len = usize::try_from(decode_varint(&mut input)?)?;
+                ensure!(len <= input.len(), "truncated B control");
+                let bytes = &input[..len];
+                input.advance(len);
+                if tag == 1002 {
+                    decode_request(bytes)?;
+                } else {
+                    let close = SubscribeRequestOrderClose::decode(bytes)?;
+                    ensure!(
+                        close.encode_to_vec() == bytes,
+                        "noncanonical close encoding"
+                    );
+                    validate_context(
+                        close
+                            .context
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("missing close context"))?,
+                    )?;
+                    ensure!(
+                        close.tracked_keys_sha256.len() == 32,
+                        "invalid close key hash"
+                    );
+                }
+            } else {
+                skip_field(wire, tag, &mut input, DecodeContext::default())?;
+            }
+        }
+        Ok(())
+    })();
+    Ok(OrderSubscribeRequest {
+        request,
+        order_wire_error: checked.err().map(|e| e.to_string()),
+    })
+}
+
+#[derive(Default)]
+pub struct OrderCodec;
+#[derive(Default)]
+pub struct OrderEncoder;
+#[derive(Default)]
+pub struct OrderDecoder;
+impl tonic::codec::Codec for OrderCodec {
+    type Encode = FilteredUpdate;
+    type Decode = OrderSubscribeRequest;
+    type Encoder = OrderEncoder;
+    type Decoder = OrderDecoder;
+    fn encoder(&mut self) -> Self::Encoder {
+        OrderEncoder
+    }
+    fn decoder(&mut self) -> Self::Decoder {
+        OrderDecoder
+    }
+}
+impl tonic::codec::Encoder for OrderEncoder {
+    type Item = FilteredUpdate;
+    type Error = tonic::Status;
+    fn encode(
+        &mut self,
+        item: Self::Item,
+        buf: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> std::result::Result<(), Self::Error> {
+        item.encode(buf)
+            .map_err(|e| tonic::Status::internal(e.to_string()))
+    }
+}
+impl tonic::codec::Decoder for OrderDecoder {
+    type Item = OrderSubscribeRequest;
+    type Error = tonic::Status;
+    fn decode(
+        &mut self,
+        buf: &mut tonic::codec::DecodeBuf<'_>,
+    ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+        use bytes::Buf;
+        let raw = buf.copy_to_bytes(buf.remaining());
+        decode_subscription(&raw)
+            .map(Some)
+            .map_err(|e| tonic::Status::internal(e.to_string()))
+    }
+}

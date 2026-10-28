@@ -147,6 +147,8 @@ macro_rules! filtered_updates_once_ref {
 
 #[derive(Debug, Clone)]
 pub struct Filter {
+    pub(crate) order_wire_error: Option<String>,
+    pub(crate) order_source: Option<Arc<SubscribeRequest>>,
     accounts: FilterAccounts,
     slots: FilterSlots,
     transactions: FilterTransactions,
@@ -163,6 +165,8 @@ pub struct Filter {
 impl Default for Filter {
     fn default() -> Self {
         Self {
+            order_wire_error: None,
+            order_source: None,
             accounts: FilterAccounts::default(),
             slots: FilterSlots::default(),
             transactions: FilterTransactions {
@@ -234,6 +238,17 @@ pub struct FilterStats {
 }
 
 impl Filter {
+    pub(crate) fn order_control(config: SubscribeRequest) -> Self {
+        Self {
+            order_source: Some(Arc::new(config)),
+            ..Self::default()
+        }
+    }
+    pub(crate) fn has_order_control(&self) -> bool {
+        self.order_source
+            .as_ref()
+            .is_some_and(|r| r.order_writes.is_some() || r.order_close.is_some())
+    }
     pub fn new(
         config: &SubscribeRequest,
         limits: &FilterLimits,
@@ -248,6 +263,8 @@ impl Filter {
             return Err(FilterError::OwnerRejectReplay);
         }
         Ok(Self {
+            order_wire_error: None,
+            order_source: Some(Arc::new(config.clone())),
             accounts: FilterAccounts::new(&config.accounts, &limits.accounts, names)?,
             slots: FilterSlots::new(&config.slots, &limits.slots, names)?,
             transactions: FilterTransactions::new(

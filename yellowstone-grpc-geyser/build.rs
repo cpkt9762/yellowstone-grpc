@@ -60,9 +60,9 @@ fn main() -> anyhow::Result<()> {
             Method::builder()
                 .name("subscribe")
                 .route_name("Subscribe")
-                .input_type("yellowstone_grpc_proto::geyser::SubscribeRequest")
+                .input_type("crate::order_protocol::OrderSubscribeRequest")
                 .output_type("crate::plugin::filter::message::FilteredUpdate")
-                .codec_path("tonic_prost::ProstCodec")
+                .codec_path("crate::order_protocol::OrderCodec")
                 .client_streaming()
                 .server_streaming()
                 .build(),

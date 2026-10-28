@@ -70,6 +70,7 @@ pub struct PluginInner {
 impl PluginInner {
     // Sends messages to the geyser_loop
     fn send_message(&self, message: Message) {
+        self.broadcast_channel.observe_callback(message.get_slot());
         if self.grpc_channel.send(message).is_ok() {
             metrics::message_queue_size_inc();
         }
@@ -306,6 +307,7 @@ impl GeyserPlugin for Plugin {
         slot: u64,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            inner.broadcast_channel.observe_callback(slot);
             let account = match account {
                 ReplicaAccountInfoVersions::V0_0_1(_info) => {
                     unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")
@@ -351,6 +353,7 @@ impl GeyserPlugin for Plugin {
         bank_id: BankId,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            inner.broadcast_channel.observe_callback(slot);
             let account = match account {
                 ReplicaAccountInfoVersions::V0_0_1(_info) => {
                     unreachable!("ReplicaAccountInfoVersions::V0_0_1 is not supported")

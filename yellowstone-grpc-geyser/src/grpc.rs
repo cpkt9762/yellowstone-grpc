@@ -355,14 +355,16 @@ type DeshredSubscribeSender = LoadAwareSender<
 
 #[derive(Debug, Clone)]
 pub struct SubscriberChannels {
-    processed: broadcast::Sender<BroadcastedMessage>,
-    confirmed: broadcast::Sender<BroadcastedMessage>,
-    finalized: broadcast::Sender<BroadcastedMessage>,
+    pub(crate) callback_watermark: Arc<AtomicU64>,
+    processed: broadcast::Sender<crate::order_stream::BroadcastEnvelope>,
+    confirmed: broadcast::Sender<crate::order_stream::BroadcastEnvelope>,
+    finalized: broadcast::Sender<crate::order_stream::BroadcastEnvelope>,
 }
 
 impl SubscriberChannels {
     pub fn new(processed: usize, confirmed: usize, finalized: usize) -> Self {
         Self {
+            callback_watermark: Arc::new(AtomicU64::new(0)),
             processed: broadcast::channel(processed).0,
             confirmed: broadcast::channel(confirmed).0,
             finalized: broadcast::channel(finalized).0,
@@ -370,7 +372,10 @@ impl SubscriberChannels {
     }
 
     #[inline]
-    const fn sender(&self, commitment: CommitmentLevel) -> &broadcast::Sender<BroadcastedMessage> {
+    const fn sender(
+        &self,
+        commitment: CommitmentLevel,
+    ) -> &broadcast::Sender<crate::order_stream::BroadcastEnvelope> {
         match commitment {
             CommitmentLevel::Processed => &self.processed,
             CommitmentLevel::Confirmed => &self.confirmed,
@@ -380,14 +385,27 @@ impl SubscriberChannels {
 
     #[inline]
     pub fn send(&self, commitment: CommitmentLevel, messages: BroadcastedMessage) {
-        let _ = self.sender(commitment).send(messages);
+        self.send_group(commitment, messages, None);
     }
 
+    pub fn observe_callback(&self, slot: u64) {
+        self.callback_watermark.fetch_max(slot, Ordering::SeqCst);
+    }
+    pub(crate) fn send_group(
+        &self,
+        commitment: CommitmentLevel,
+        messages: BroadcastedMessage,
+        group: Option<crate::order_stream::GroupBoundary>,
+    ) {
+        let _ = self
+            .sender(commitment)
+            .send(crate::order_stream::BroadcastEnvelope { messages, group });
+    }
     #[inline]
     pub fn subscribe(
         &self,
         commitment: CommitmentLevel,
-    ) -> broadcast::Receiver<BroadcastedMessage> {
+    ) -> broadcast::Receiver<crate::order_stream::BroadcastEnvelope> {
         self.sender(commitment).subscribe()
     }
 }
@@ -598,6 +616,7 @@ struct ClientSession {
     subscriber_id: String,
     endpoint: String,
     filter: Filter,
+    order: crate::order_stream::OrderSession,
     owner_reject: OwnerRejectSubscription,
     owner_reject_owners: Vec<Pubkey>,
     cancellation_token: CancellationToken,
@@ -623,6 +642,7 @@ impl ClientSession {
             subscriber_id,
             endpoint,
             filter,
+            order: crate::order_stream::OrderSession::default(),
             owner_reject: OwnerRejectSubscription::new(Arc::new(OwnerRejectRegistry::default())),
             owner_reject_owners: Vec::new(),
             cancellation_token,
@@ -1609,7 +1629,8 @@ impl GrpcService {
                         // we only need to send Message::Block for block subscriber downstream.
                         // While, confirmed,finalized must be sent in the two flavors: as a stream of individual events and block.
                         if commitment_level != CommitmentLevel::Processed {
-                            broadcast.send(commitment_level, frozen_block.messages());
+                            let group = (commitment_level == CommitmentLevel::Confirmed).then(|| crate::order_stream::GroupBoundary::Begin(crate::order_stream::BankGroup::from_block(&frozen_block.get_message_block())));
+                            broadcast.send_group(commitment_level, frozen_block.messages(), group);
                         }
 
                         let mut block_messages = Vec::with_capacity(3);
@@ -1635,7 +1656,8 @@ impl GrpcService {
 
                         let slot_message_singleton_vec = Arc::new(vec![slot_message]);
                         for commitment_level in ALL_COMMITMENT_LEVELS {
-                            broadcast.send(commitment_level, Arc::clone(&slot_message_singleton_vec));
+                            let group = (commitment_level == CommitmentLevel::Confirmed && slot_update.commitment == solana_commitment_config::CommitmentLevel::Confirmed).then_some(crate::order_stream::GroupBoundary::End { slot: slot_update.slot, bank_id: slot_update.bank_id });
+                            broadcast.send_group(commitment_level, Arc::clone(&slot_message_singleton_vec), group);
                         }
                     }
 
@@ -1790,6 +1812,26 @@ impl GrpcService {
         }
         let mut held_banks: Vec<BankId> = Vec::new();
 
+        let mut deferred_request = None;
+        let mut b_deadline = tokio::time::interval(Duration::from_secs(1));
+        let mut b_send = |update: FilteredUpdate| -> anyhow::Result<()> {
+            stream_tx
+                .try_send(Ok(update))
+                .map_err(|error| anyhow::anyhow!("B enqueue failed: {error:?}"))
+        };
+        macro_rules! b_step {
+            ($step:expr) => {
+                if let Err(error) = $step {
+                    log::warn!("order_writes_v1 stopped: {error}");
+                    let _ = session.order.fail(
+                        yellowstone_grpc_proto::prelude::OrderGapReason::ResourceLimit,
+                        None,
+                        &error.to_string(),
+                        &mut b_send,
+                    );
+                }
+            };
+        }
         'outer: loop {
             observe_subscriber_queue_size(
                 &session.subscriber_id,
@@ -1804,11 +1846,19 @@ impl GrpcService {
                     session.disconnect_reason = "server_shutdown";
                     break 'outer;
                 }
-                mut message = client_rx.recv() => {
+                _ = b_deadline.tick() => {
+                    b_step!(session.order.check_deadline(&mut b_send));
+                }
+                mut message = async {
+                    if let Some(message) = deferred_request.take() {Some(message)} else {client_rx.recv().await}
+                } => {
                     // forward to latest filter
-                    loop {
+                    while !session.order.ever_requested() && !message.as_ref().and_then(|m|m.as_ref()).is_some_and(|(_,f)|f.has_order_control()) {
                         match client_rx.try_recv() {
                             Ok(message_new) => {
+                                if message_new.as_ref().is_some_and(|(_,f)|f.has_order_control()) {
+                                    deferred_request=Some(message_new);break;
+                                }
                                 message = Some(message_new);
                             }
                             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -1821,6 +1871,17 @@ impl GrpcService {
 
                     match message {
                         Some(Some((from_slot, filter_new))) => {
+                            let wire_error=filter_new.order_wire_error.clone();
+                            let order_source=filter_new.order_source.clone();
+                            if let Some(raw)=order_source.as_ref() {
+                                if raw.order_close.is_some() {
+                                    if let Some(error)=wire_error.as_ref() {
+                                        let _=b_send(session.order.reject(None,yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,error));
+                                    }else{b_step!(session.order.close(raw, &mut b_send));}
+                                    continue;
+                                }
+                                b_step!(session.order.coverage_changed(raw, &mut b_send));
+                            }
                             let commitment_new = filter_new.get_commitment_level();
                             if commitment_new != commitment {
                                 commitment = commitment_new;
@@ -1836,6 +1897,7 @@ impl GrpcService {
                                 }
                             };
                             info!("client #{}: filter updated", session.subscriber_id);
+                            let owner_ack=notification.clone();
                             if let Some(notification) = notification {
                                 if tokio::select! {
                                     _ = cancellation_token.cancelled() => true,
@@ -1843,6 +1905,17 @@ impl GrpcService {
                                 } {
                                     session.disconnect_reason = "client_closed";
                                     break 'outer;
+                                }
+                            }
+
+                            if let Some(raw)=order_source.as_ref().filter(|r|r.order_writes.is_some()) {
+                                if let Some(error)=wire_error.as_ref() {
+                                    let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,error));
+                                }else if let Some(owner)=owner_ack.as_ref() {
+                                    b_step!(session.order.request(raw, owner, broadcast.callback_watermark.load(Ordering::SeqCst), &mut b_send));
+                                } else {
+                                    let rejected=session.order.reject(raw.order_writes.as_ref(), yellowstone_grpc_proto::prelude::OrderRejectReason::ScopeCoverageInvalid, "no actual owner exemption ack");
+                                    let _=b_send(rejected);
                                 }
                             }
 
@@ -1951,6 +2024,9 @@ impl GrpcService {
                         }
                     };
 
+                    if let Some(crate::order_stream::GroupBoundary::Begin(bank))=&messages.group {
+                        b_step!(session.order.begin(bank.clone(), &mut b_send));
+                    }
                     for message in messages.iter() {
                         let sealed_block = if held_banks.is_empty() {
                             None
@@ -1979,15 +2055,12 @@ impl GrpcService {
                                 .and_then(|()| session.filter.try_for_each_block_content_update(block, try_send)),
                             None => Ok(()),
                         };
-                        let sent = sealed_content_sent.and_then(|()| {
-                            session
-                                .filter
-                                .get_updates(message, Some(commitment))
-                                .into_iter()
-                                .try_for_each(try_send)
-                        });
+                        let updates=session.filter.get_updates(message, Some(commitment));
+                        let sent = sealed_content_sent.and_then(|()| updates.iter().cloned().try_for_each(try_send));
                         match sent {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                b_step!(session.order.observe_sent(message, &updates, &mut b_send));
+                            }
                             Err(TrySendFailure::Full) => {
                                 error!("client #{}: lagged to send an update", session.subscriber_id);
                                 task_tracker.spawn(async move {
@@ -2002,6 +2075,9 @@ impl GrpcService {
                                 break 'outer;
                             }
                         }
+                    }
+                    if let Some(crate::order_stream::GroupBoundary::End {slot,bank_id})=&messages.group {
+                        b_step!(session.order.end(*slot,*bank_id,broadcast.callback_watermark.load(Ordering::SeqCst), &mut b_send));
                     }
                 }
             }
@@ -2367,7 +2443,7 @@ impl Geyser for GrpcService {
 
     async fn subscribe(
         &self,
-        mut request: Request<Streaming<SubscribeRequest>>,
+        mut request: Request<Streaming<crate::order_protocol::OrderSubscribeRequest>>,
     ) -> TonicResult<Response<Self::SubscribeStream>> {
         incr_grpc_method_call_count("subscribe");
 
@@ -2482,14 +2558,22 @@ impl Geyser for GrpcService {
                         break;
                     }
                     message = request.get_mut().message() => match message {
-                        Ok(Some(request)) => {
+                        Ok(Some(envelope)) => {
+                            let request=envelope.request;
+                            let wire_error=envelope.order_wire_error.or_else(|| (x_request_snapshot && request.order_writes.is_some()).then(||"B startup snapshot unsupported".to_owned()));
+                            if request.order_close.is_some() {
+                                let mut filter=Filter::order_control(request);filter.order_wire_error=wire_error;
+                                if incoming_client_tx.send(Some((None, filter))).is_err() { break; }
+                                continue;
+                            }
                             filter_names.try_clean();
 
                             Self::maybe_update_pre_accounts_program_ids(&request, &dyn_program_ids);
                             Self::maybe_update_shm_subscription(&request, &shm_state, shm_path.as_deref());
 
                             if let Err(error) = match Filter::new(&request, &config_filter_limits, &mut filter_names) {
-                                Ok(filter) => {
+                                Ok(mut filter) => {
+                                    filter.order_wire_error=wire_error;
                                     if let Some(msg) = filter.get_pong_msg() {
                                         if incoming_stream_tx.send(Ok(msg)).await.is_err() {
                                             error!("client #{subscriber_id:?}/{id}: stream closed");
@@ -2868,7 +2952,8 @@ impl Geyser for GrpcService {
     ) -> Result<Response<GetVersionResponse>, Status> {
         incr_grpc_method_call_count("get_version");
         Ok(Response::new(GetVersionResponse {
-            version: serde_json::to_string(&GrpcVersionInfo::default()).unwrap(),
+            version: serde_json::to_string(&GrpcVersionInfo::default())
+                .map_err(|error| Status::internal(error.to_string()))?,
         }))
     }
 }
@@ -3634,7 +3719,7 @@ mod tests {
         }
 
         async fn wait_broadcast(
-            rx: &mut broadcast::Receiver<BroadcastedMessage>,
+            rx: &mut broadcast::Receiver<crate::order_stream::BroadcastEnvelope>,
             mut found: impl FnMut(&Message) -> bool,
         ) {
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -3882,7 +3967,7 @@ mod tests {
         struct Harness {
             messages_tx: mpsc::UnboundedSender<Message>,
             #[allow(dead_code)]
-            broadcast_rx: broadcast::Receiver<BroadcastedMessage>,
+            broadcast_rx: broadcast::Receiver<crate::order_stream::BroadcastEnvelope>,
             deshred_tx: broadcast::Sender<DeshredBroadcastedMessage>,
             deshred_rx: broadcast::Receiver<DeshredBroadcastedMessage>,
             handle: tokio::task::JoinHandle<()>,

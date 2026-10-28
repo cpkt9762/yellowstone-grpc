@@ -8316,6 +8316,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "url",
+ "uuid",
  "vergen",
  "wincode",
  "yellowstone-grpc-proto",
