@@ -727,7 +727,6 @@ async fn invalid_source_bank_gaps_b_and_keeps_original_a_tail() {
 }
 
 #[allow(dead_code)]
-#[rustfmt::skip]
 #[path = "../tests/fixtures/order_source/revision_baseline_reconstruction.rs"]
 mod revision_baseline;
 const REVISION_TIMESTAMP: Timestamp = Timestamp {
