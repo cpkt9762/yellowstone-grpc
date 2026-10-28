@@ -238,6 +238,7 @@ pub fn message_transaction(
             pre_encoded: OnceLock::new(),
             token_owners_all: OnceLock::new(),
             token_owners_changed: OnceLock::new(),
+            order_permissions: Default::default(),
         },
         slot: 100,
         created_at: Timestamp::default(),

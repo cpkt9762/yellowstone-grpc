@@ -8293,6 +8293,7 @@ dependencies = [
  "solana-logger",
  "solana-message",
  "solana-pubkey 4.4.0",
+ "solana-sdk-ids",
  "solana-shm-accounts",
  "solana-signature",
  "solana-signer 4.0.0",

@@ -269,6 +269,7 @@ pub struct MessageTransactionInfo {
     pub token_owners_all: OnceLock<FoldHashSet<Pubkey>>,
     /// Per-tx cache of token-balance owners under
     /// `TokenAccountsMode::BalanceChanged`. Same laziness as above.
+    pub order_permissions: OnceLock<crate::plugin::order_permissions::Permissions>,
     pub token_owners_changed: OnceLock<FoldHashSet<Pubkey>>,
 }
 
@@ -304,6 +305,7 @@ impl MessageTransactionInfo {
             pre_encoded: OnceLock::new(),
             token_owners_all: OnceLock::new(),
             token_owners_changed: OnceLock::new(),
+            order_permissions: OnceLock::new(),
         }
     }
 
@@ -343,7 +345,18 @@ impl MessageTransactionInfo {
             pre_encoded: OnceLock::new(),
             token_owners_all: OnceLock::new(),
             token_owners_changed: OnceLock::new(),
+            order_permissions: OnceLock::new(),
         }
+    }
+
+    pub fn order_permissions(&self) -> &crate::plugin::order_permissions::Permissions {
+        self.order_permissions.get_or_init(|| {
+            crate::plugin::order_permissions::Permissions::classify(
+                self.signature.as_ref(),
+                &self.transaction,
+                &self.meta,
+            )
+        })
     }
 
     pub fn fill_account_keys(&mut self) -> FromUpdateOneofResult<()> {

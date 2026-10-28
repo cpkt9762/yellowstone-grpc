@@ -4,6 +4,7 @@ pub mod entry;
 pub mod filter;
 pub mod message;
 pub mod owner_reject;
+pub mod order_permissions;
 pub mod shm;
 
 pub mod proto {

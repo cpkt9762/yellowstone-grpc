@@ -23,6 +23,7 @@ bench = ["dep:solana-storage-proto"]
 [dependencies]
 # Reuse the existing locked SHA-256 implementation for protocol digests.
 sha2 = "=0.10.9"
+solana-sdk-ids = "=3.1.0"
 foldhash = { workspace = true }
 arc-swap = { workspace = true }
 anyhow = { workspace = true }
