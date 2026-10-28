@@ -164,7 +164,7 @@ pub struct OrderWatch {
     id: u64,
 }
 impl OrderWatch {
-    pub fn pending(&self) -> Result<bool> {
+    pub fn pending(&self, floor: u64) -> Result<bool> {
         let s = self
             .owner
             .state
@@ -172,18 +172,18 @@ impl OrderWatch {
             .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
         Ok(s.watchers
             .get(&self.id)
-            .is_some_and(|w| !w.pending.is_empty()))
+            .is_some_and(|w| w.pending.keys().any(|(slot, _)| *slot >= floor)))
     }
-    pub fn incomplete(&self) -> Result<bool> {
+    pub fn incomplete(&self, floor: u64) -> Result<bool> {
         let s = self
             .owner
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
         Ok(s.watchers.get(&self.id).is_some_and(|w| {
-            w.pending
-                .values()
-                .any(|start| start.elapsed() >= std::time::Duration::from_secs(15))
+            w.pending.iter().any(|((slot, _), start)| {
+                *slot >= floor && start.elapsed() >= std::time::Duration::from_secs(15)
+            })
         }))
     }
 
@@ -333,5 +333,30 @@ mod order_writes_v1 {
             watch.epoch((1, 1)).expect("retained history"),
             Some(vec![4; 16])
         );
+    }
+    #[test]
+    fn warmup_pending_banks_do_not_become_false_coverage_gaps_or_delay_close() {
+        let registry = Arc::new(OrderIntegrity::new(Default::default()));
+        let watch = registry.register().expect("watch");
+        registry.note_pending((2, 2));
+        {
+            let mut state = registry.state.lock().expect("state");
+            *state
+                .watchers
+                .get_mut(&watch.id)
+                .expect("watcher")
+                .pending
+                .get_mut(&(2, 2))
+                .expect("pending bank") =
+                std::time::Instant::now() - std::time::Duration::from_secs(16);
+        }
+        assert!(!watch.pending(4).expect("warmup is before coverage"));
+        assert!(!watch
+            .incomplete(4)
+            .expect("warmup timeout is not B missing data"));
+        assert!(watch.pending(1).expect("inside promised coverage"));
+        assert!(watch
+            .incomplete(1)
+            .expect("promised incomplete Bank must fail"));
     }
 }

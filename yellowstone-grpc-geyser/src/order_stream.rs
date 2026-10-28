@@ -469,6 +469,11 @@ impl OrderSession {
         }
         Ok(())
     }
+    fn coverage_floor(&self) -> Option<u64> {
+        self.active
+            .as_ref()
+            .and_then(|e| e.keys.iter().filter_map(|k| k.active_from_slot).min())
+    }
     pub fn close(
         &mut self,
         raw: &SubscribeRequest,
@@ -496,12 +501,15 @@ impl OrderSession {
             ))?;
             return Ok(());
         }
+        let floor = self
+            .coverage_floor()
+            .context("active close coverage missing")?;
         self.closing = Some(Instant::now());
         if self.group.is_none()
             && !self
                 .watch
                 .as_ref()
-                .map(|w| w.pending())
+                .map(|w| w.pending(floor))
                 .transpose()?
                 .unwrap_or(false)
         {
@@ -792,8 +800,8 @@ impl OrderSession {
         for bank in late {
             self.late(bank, send)?;
         }
-        if let Some(watch) = self.watch.as_ref() {
-            if watch.incomplete()? {
+        if let (Some(watch), Some(floor)) = (self.watch.as_ref(), self.coverage_floor()) {
+            if watch.incomplete(floor)? {
                 self.fail(
                     OrderGapReason::IncompleteBank,
                     None,

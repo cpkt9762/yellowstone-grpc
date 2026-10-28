@@ -546,3 +546,182 @@ async fn startup_rejects_b_explicitly_and_preserves_independent_a_filter() {
         "A account subscription remains installed"
     );
 }
+
+#[tokio::test]
+async fn legacy_latest_request_coalescing_is_preserved_without_b() {
+    let b = SubscriberChannels::new(64, 64, 64);
+    let (tx, requests) = mpsc::unbounded_channel();
+    let (stream, mut rx) = load_aware_channel(64, WeightScales::default());
+    let session = ClientSession::new(
+        0,
+        Some("coalesce".into()),
+        "coalesce".into(),
+        CancellationToken::new(),
+        None,
+    );
+    // Queue both before starting the consumer; the legacy branch must install only the latest.
+    tx.send(Some((None, filter(&request(false)))))
+        .expect("first request");
+    let mut latest = request(false);
+    latest
+        .accounts
+        .get_mut("accounts")
+        .expect("account filter")
+        .account = vec![Pubkey::new_from_array([2; 32]).to_string()];
+    tx.send(Some((None, filter(&latest))))
+        .expect("latest request");
+    let handle = tokio::spawn(GrpcService::client_loop(
+        session,
+        stream,
+        requests,
+        None,
+        b.clone(),
+        None,
+        TaskTracker::new(),
+        None,
+    ));
+    let Some(UpdateOneof::OwnerRejectExemption(owner)) =
+        read(&mut rx).await.as_subscribe_update().update_oneof
+    else {
+        panic!("latest filter owner ack");
+    };
+    assert_eq!(owner.accounts.len(), 1);
+    assert_eq!(
+        owner.accounts[0].pubkey,
+        Pubkey::new_from_array([2; 32]).to_string()
+    );
+    b.send(
+        CommitmentLevel::Confirmed,
+        Arc::new(vec![Message::Slot(Arc::new(fixtures::message_slot(
+            12,
+            SlotStatus::CreatedBank,
+        )))]),
+    );
+    assert!(
+        matches!(read(&mut rx).await.message, FilteredUpdateOneof::Slot(_)),
+        "no intermediate filter owner ack remains queued"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn same_slot_competing_bank_ids_are_not_overwritten_in_seals() {
+    let b = SubscriberChannels::new(64, 64, 64);
+    let mut c = spawn(b.clone());
+    install(&mut c, &request(true)).await;
+    for bank_id in [100, 101] {
+        b.observe_callback(10);
+        b.order_integrity.register_bank((10, bank_id));
+        b.send_group(
+            CommitmentLevel::Confirmed,
+            Arc::new(vec![]),
+            Some(GroupBoundary::Begin(BankGroup {
+                slot: 10,
+                bank_id,
+                observed: 0,
+                executed: 0,
+                valid: true,
+                resource_limit: false,
+                source_after_seal: false,
+            })),
+        );
+        let mut m = fixtures::message_block_meta(10);
+        Arc::make_mut(&mut m).block_meta.bank_id = bank_id;
+        b.send(
+            CommitmentLevel::Confirmed,
+            Arc::new(vec![Message::BlockMeta(m)]),
+        );
+        let mut slot = fixtures::message_slot(10, SlotStatus::Confirmed);
+        slot.bank_id = Some(bank_id);
+        b.send_group(
+            CommitmentLevel::Confirmed,
+            Arc::new(vec![Message::Slot(Arc::new(slot))]),
+            Some(GroupBoundary::End { slot: 10, bank_id }),
+        );
+        for _ in 0..2 {
+            read(&mut c.1).await;
+        }
+        let Some(UpdateOneof::OrderSlotSeal(seal)) =
+            read(&mut c.1).await.as_subscribe_update().update_oneof
+        else {
+            panic!("separate Bank seal");
+        };
+        assert_eq!(seal.slot, Some(10));
+        assert_eq!(seal.bank_id, Some(bank_id));
+        assert_eq!(seal.event_count, Some(0));
+    }
+    // Two conflicting confirmed banks remain explicit evidence for the reader to reject;
+    // source envelopes cannot silently collapse them into a slot-only entry.
+    c.2.abort();
+}
+
+#[tokio::test]
+async fn broadcast_lag_is_transport_failure_and_cannot_be_normal_b_end() {
+    let b = SubscriberChannels::new(1, 1, 1);
+    let mut c = spawn(b.clone());
+    install(&mut c, &request(true)).await;
+    for slot in 10..14 {
+        b.send(
+            CommitmentLevel::Confirmed,
+            Arc::new(vec![Message::Slot(Arc::new(fixtures::message_slot(
+                slot,
+                SlotStatus::CreatedBank,
+            )))]),
+        );
+    }
+    let failure = tokio::time::timeout(Duration::from_secs(2), c.1.recv())
+        .await
+        .expect("lag is observable")
+        .expect("transport status")
+        .expect_err("old A lag policy reports transport error");
+    assert!(failure.message().contains("lagged"));
+    tokio::time::timeout(Duration::from_secs(2), c.2)
+        .await
+        .expect("client exits after real broadcast lag")
+        .expect("client task returns normally");
+}
+
+#[tokio::test]
+async fn invalid_source_bank_gaps_b_and_keeps_original_a_tail() {
+    let b = SubscriberChannels::new(64, 64, 64);
+    let mut c = spawn(b.clone());
+    install(&mut c, &request(true)).await;
+    b.observe_callback(10);
+    b.order_integrity.register_bank((10, 10));
+    b.send_group(
+        CommitmentLevel::Confirmed,
+        Arc::new(group_content(10, false)),
+        Some(GroupBoundary::Begin(BankGroup {
+            slot: 10,
+            bank_id: 10,
+            observed: 2,
+            executed: 1,
+            valid: false,
+            resource_limit: false,
+            source_after_seal: false,
+        })),
+    );
+    meta(&b, 10);
+    end(&b, 10);
+    let mut gap = false;
+    let mut old = 0;
+    for _ in 0..6 {
+        let update = read(&mut c.1).await;
+        match update.as_subscribe_update().update_oneof {
+            Some(UpdateOneof::OrderGap(g)) => {
+                gap = true;
+                assert_eq!(g.reason, Some(2));
+            }
+            Some(
+                UpdateOneof::OrderSlotSeal(_)
+                | UpdateOneof::OrderEpochSeal(_)
+                | UpdateOneof::TransactionOrder(_),
+            ) => panic!("invalid Bank cannot produce complete coverage"),
+            _ => old += 1,
+        }
+    }
+    assert!(gap);
+    assert_eq!(old, 5);
+    assert!(!c.2.is_finished());
+    c.2.abort();
+}
