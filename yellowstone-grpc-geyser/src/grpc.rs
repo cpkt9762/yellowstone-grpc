@@ -347,12 +347,12 @@ impl Weigher for WeightScales {
 /// Sender half of a Subscribe queue.
 type SubscribeSender = LoadAwareSender<TonicResult<FilteredUpdate>, WeightScales>;
 
-/// One bounded pending revocation keeps a historical NORMAL_END from hiding a
-/// later anomaly while control credit is occupied. Retried by client_loop only.
+/// Bounded per-epoch revocations survive occupied control credit. There can be
+/// at most MAX_TRACKED_KEYS strictly expanding accepted epochs on one stream.
 struct OrderQueue {
     data: Result<SubscribeSender, &'static str>,
     control: Result<SubscribeSender, &'static str>,
-    pending_gap: StdMutex<Option<FilteredUpdate>>,
+    pending_gap: StdMutex<std::collections::VecDeque<FilteredUpdate>>,
 }
 impl OrderQueue {
     fn new(
@@ -362,8 +362,37 @@ impl OrderQueue {
         Self {
             data: tx.with_budget(limits.queue_bytes),
             control: tx.with_budget(limits.control_bytes),
-            pending_gap: StdMutex::new(None),
+            pending_gap: StdMutex::new(std::collections::VecDeque::new()),
         }
+    }
+    fn gap_epoch(update: &FilteredUpdate) -> Option<&[u8]> {
+        use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
+        match &update.message {
+            FilteredUpdateOneof::Order(wire) => match &wire.update_oneof {
+                Some(UpdateOneof::OrderGap(gap)) => {
+                    gap.context.as_ref().map(|c| c.source_epoch.as_slice())
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn retain_gap(
+        pending: &mut std::collections::VecDeque<FilteredUpdate>,
+        update: FilteredUpdate,
+    ) -> anyhow::Result<()> {
+        if pending
+            .iter()
+            .any(|old| Self::gap_epoch(old) == Self::gap_epoch(&update))
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            pending.len() < crate::order_protocol::MAX_TRACKED_KEYS,
+            "B revocation epoch budget exhausted"
+        );
+        pending.push_back(update);
+        Ok(())
     }
     fn send(&self, update: FilteredUpdate) -> anyhow::Result<()> {
         use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
@@ -381,27 +410,34 @@ impl OrderQueue {
             self.data.as_ref()
         }
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-        match sender.try_send_strict(Ok(update)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(Ok(update))) if gap => {
-                let mut pending = self
-                    .pending_gap
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("B revocation mutex poisoned"))?;
-                if pending.is_none() {
-                    *pending = Some(update);
-                }
-                Ok(())
+        if gap {
+            let mut pending = self
+                .pending_gap
+                .lock()
+                .map_err(|_| anyhow::anyhow!("B revocation mutex poisoned"))?;
+            if !pending.is_empty() {
+                return Self::retain_gap(&mut pending, update);
             }
-            Err(_) => anyhow::bail!("B byte credit exhausted or transport closed"),
+            match sender.try_send_strict(Ok(update)) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(Ok(update))) => Self::retain_gap(&mut pending, update),
+                Err(_) => anyhow::bail!("B revocation transport closed"),
+            }
+        } else {
+            sender
+                .try_send_strict(Ok(update))
+                .map_err(|_| anyhow::anyhow!("B byte credit exhausted or transport closed"))
         }
     }
     fn flush(&self) {
         match self.pending_gap.lock() {
             Ok(mut pending) => {
-                if let (Some(update), Ok(sender)) = (pending.as_ref(), self.control.as_ref()) {
-                    if sender.try_send_strict(Ok(update.clone())).is_ok() {
-                        pending.take();
+                if let Ok(sender) = self.control.as_ref() {
+                    while let Some(update) = pending.front() {
+                        if sender.try_send_strict(Ok(update.clone())).is_err() {
+                            break;
+                        }
+                        pending.pop_front();
                     }
                 }
             }

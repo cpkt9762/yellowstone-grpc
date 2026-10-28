@@ -362,14 +362,14 @@ async fn saturated_control_reserve_retries_revocation_without_normal_seal_or_a_s
         },
     ));
     q.send(gap).expect("bounded pending revocation");
-    assert!(q.pending_gap.lock().expect("pending lock").is_some());
+    assert!(!q.pending_gap.lock().expect("pending lock").is_empty());
     a.try_send(Ok(FilteredUpdate::new_empty(FilteredUpdateOneof::ping())))
         .expect("A has original capacity");
     for _ in 0..queued {
         read(&mut rx).await;
     }
     q.flush();
-    assert!(q.pending_gap.lock().expect("pending lock").is_none());
+    assert!(q.pending_gap.lock().expect("pending lock").is_empty());
     assert!(matches!(
         read(&mut rx).await.message,
         FilteredUpdateOneof::Ping
@@ -1059,4 +1059,221 @@ async fn revision_r2_pending_ack_binds_latest_installed_owner_registry() {
         "activation must attest the current installed owner registry"
     );
     c.2.abort();
+}
+
+async fn revision_sealed_history(
+    q: &OrderQueue,
+    rx: &mut LoadAwareReceiver<TonicResult<FilteredUpdate>>,
+) -> (
+    crate::order_stream::OrderSession,
+    Arc<crate::order_integrity::OrderIntegrity>,
+    Vec<yellowstone_grpc_proto::prelude::OrderContext>,
+) {
+    let registry = Arc::new(crate::order_integrity::OrderIntegrity::new(
+        Default::default(),
+    ));
+    let mut order = crate::order_stream::OrderSession::default();
+    order.register_watch(&registry).expect("watch");
+    let mut client = ClientSession::new(
+        0,
+        Some("history".into()),
+        "history".into(),
+        CancellationToken::new(),
+        None,
+    );
+    let acks = std::cell::RefCell::new(Vec::new());
+    {
+        let mut send = |u: FilteredUpdate| -> anyhow::Result<()> {
+            if let Some(UpdateOneof::OrderCoverageAck(ack)) = u.as_subscribe_update().update_oneof {
+                acks.borrow_mut().push(ack);
+            }
+            q.send(u)
+        };
+        for (slot, keys) in [(10, vec![1]), (20, vec![1, 2])] {
+            let r = if slot == 10 {
+                request(true)
+            } else {
+                revision_request(
+                    &keys,
+                    acks.borrow().last().and_then(
+                        |a: &yellowstone_grpc_proto::prelude::SubscribeUpdateOrderCoverageAck| {
+                            a.context.as_ref()
+                        },
+                    ),
+                )
+            };
+            let owner = client
+                .install_filter(revision_tracked_filter(&r))
+                .expect("install")
+                .expect("actual owner ack");
+            order
+                .request(&r, &owner, slot - 10, &mut send)
+                .expect("scope");
+            registry.register_bank((slot, slot));
+            order
+                .begin(
+                    BankGroup {
+                        slot,
+                        bank_id: slot,
+                        observed: 0,
+                        executed: 0,
+                        valid: true,
+                        resource_limit: false,
+                        source_after_seal: false,
+                    },
+                    &mut send,
+                )
+                .expect("group");
+            let mut meta = fixtures::message_block_meta(slot);
+            Arc::make_mut(&mut meta).block_meta.bank_id = slot;
+            let m = Message::BlockMeta(meta);
+            let updates = client
+                .filter
+                .get_updates(&m, Some(CommitmentLevel::Confirmed));
+            order
+                .observe_sent(&m, &updates, &mut send)
+                .expect("metadata");
+            let m = Message::Slot(Arc::new(fixtures::message_slot(
+                slot,
+                SlotStatus::Confirmed,
+            )));
+            let updates = client
+                .filter
+                .get_updates(&m, Some(CommitmentLevel::Confirmed));
+            order
+                .observe_sent(&m, &updates, &mut send)
+                .expect("Confirmed");
+            order.end(slot, slot, slot, &mut send).expect("slot seal");
+        }
+        let ack = acks.borrow().last().expect("last ack").clone();
+        order
+            .close(
+                &SubscribeRequest {
+                    order_close: Some(SubscribeRequestOrderClose {
+                        context: ack.context,
+                        tracked_keys_sha256: ack.tracked_keys_sha256,
+                    }),
+                    ..Default::default()
+                },
+                &mut send,
+            )
+            .expect("close second historical epoch");
+    }
+    let mut seals = 0;
+    for _ in 0..6 {
+        if matches!(
+            read(rx).await.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::OrderEpochSeal(_))
+        ) {
+            seals += 1;
+        }
+    }
+    assert_eq!(seals, 2, "two epochs were actually sealed on the queue");
+    let contexts = acks
+        .into_inner()
+        .into_iter()
+        .map(|a| a.context.expect("context"))
+        .collect();
+    (order, registry, contexts)
+}
+fn revision_fill_control(q: &OrderQueue) -> usize {
+    let control = q.control.as_ref().expect("control lane");
+    let mut count = 0;
+    loop {
+        let remaining = 4096 - control.current_weight();
+        let mut selected = None;
+        for len in (1..=1024).rev() {
+            let update = crate::order_protocol::control(UpdateOneof::OrderRejected(
+                yellowstone_grpc_proto::prelude::SubscribeUpdateOrderRejected {
+                    source_stream_id: vec![1; 16],
+                    reason: Some(1),
+                    detail: "x".repeat(len),
+                    ..Default::default()
+                },
+            ));
+            if update.encoded_len() <= remaining {
+                selected = Some(update);
+                break;
+            }
+        }
+        let Some(update) = selected else {
+            break;
+        };
+        q.send(update).expect("fill exact control credit");
+        count += 1;
+    }
+    assert!(
+        4096 - control.current_weight() < 80,
+        "even a small historical gap cannot fit"
+    );
+    count
+}
+#[tokio::test]
+async fn revision_r3_all_sealed_epochs_are_revoked_after_control_credit_returns() {
+    let (a, mut rx) = load_aware_channel(1, WeightScales::default());
+    let q = OrderQueue::new(
+        &a,
+        &crate::plugin::filter::limits::FilterLimitsOrder {
+            control_bytes: 4096,
+            ..Default::default()
+        },
+    );
+    let (mut order, registry, contexts) = revision_sealed_history(&q, &mut rx).await;
+    let filled = revision_fill_control(&q);
+    registry.note_late((10, 10));
+    registry.note_late((20, 20));
+    order
+        .late((10, 10), &mut |u| q.send(u))
+        .expect("retain E1 revocation");
+    order
+        .late((20, 20), &mut |u| q.send(u))
+        .expect("retain E2 revocation");
+    a.try_send(Ok(FilteredUpdate::new_empty(FilteredUpdateOneof::ping())))
+        .expect("A original capacity remains available");
+    for _ in 0..filled {
+        read(&mut rx).await;
+    }
+    q.flush();
+    let mut epochs = std::collections::HashSet::new();
+    let mut a_seen = false;
+    while let Ok(Some(update)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+        let update = update.expect("healthy stream");
+        match update.as_subscribe_update().update_oneof {
+            Some(UpdateOneof::OrderGap(g)) => {
+                assert_eq!(g.reason, Some(7));
+                epochs.insert(g.context.expect("affected context").source_epoch);
+            }
+            Some(UpdateOneof::Ping(_)) => a_seen = true,
+            _ => panic!("unexpected normal seal/update during revocation"),
+        }
+    }
+    assert!(a_seen);
+    assert_eq!(
+        epochs,
+        contexts.into_iter().map(|c| c.source_epoch).collect(),
+        "every sealed epoch needs its own explicit revocation; one gap cannot mask another"
+    );
+}
+#[tokio::test]
+async fn revision_r3_reported_changes_only_after_gap_is_queued_or_retained() {
+    let (a, mut rx) = load_aware_channel(1, WeightScales::default());
+    let q = OrderQueue::new(&a, &Default::default());
+    let (mut order, registry, contexts) = revision_sealed_history(&q, &mut rx).await;
+    registry.note_late((10, 10));
+    assert!(order
+        .late((10, 10), &mut |_| anyhow::bail!(
+            "injected enqueue/retention failure"
+        ))
+        .is_err());
+    order
+        .check_deadline(&mut |u| q.send(u))
+        .expect("sticky retry");
+    let update = tokio::time::timeout(Duration::from_millis(50), rx.recv())
+        .await
+        .expect("failed enqueue must not consume the source notice")
+        .expect("gap")
+        .expect("stream");
+    assert!(
+        matches!(update.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderGap(g))if g.context.as_ref()==Some(&contexts[0]))
+    );
 }

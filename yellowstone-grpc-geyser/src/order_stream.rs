@@ -205,7 +205,7 @@ impl OrderSession {
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
         let epoch = match self.watch.as_ref() {
-            Some(w) => w.consume_epoch(bank)?,
+            Some(w) => w.unreported_epoch(bank)?,
             None => None,
         };
         let Some(epoch) = epoch else {
@@ -216,12 +216,16 @@ impl OrderSession {
             .as_ref()
             .is_some_and(|e| e.context.source_epoch == epoch)
         {
-            return self.fail(
+            self.fail(
                 OrderGapReason::SourceAfterSeal,
                 Some(bank),
                 "source data after immutable Bank seal",
                 send,
-            );
+            )?;
+            if let Some(watch) = self.watch.as_ref() {
+                watch.mark_reported(bank, &epoch)?;
+            }
+            return Ok(());
         }
         if let Some((context, seq)) = self
             .historical
@@ -239,6 +243,9 @@ impl OrderSession {
                 },
             ));
             send(update)?;
+            if let Some(watch) = self.watch.as_ref() {
+                watch.mark_reported(bank, &epoch)?;
+            }
             self.fail(
                 OrderGapReason::SourceAfterSeal,
                 Some(bank),
@@ -524,7 +531,8 @@ impl OrderSession {
             order_close: Some(close.clone()),
             ..Default::default()
         };
-        let valid = *raw == only
+        let valid = !self.stopped
+            && *raw == only
             && self.pending.is_none()
             && self.closing.is_none()
             && self.active.as_ref().is_some_and(|e| {
@@ -583,6 +591,9 @@ impl OrderSession {
         bank: BankGroup,
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
         if self.group.is_some() {
             self.fail(
                 OrderGapReason::IncompleteBank,
@@ -678,6 +689,9 @@ impl OrderSession {
                 )?;
             }
         }
+        if self.stopped {
+            return Ok(());
+        }
         let Some(group) = self.group.as_mut() else {
             if let SourceMessage::Transaction(tx) = message {
                 if self.active.as_ref().is_some_and(|e| {
@@ -766,6 +780,10 @@ impl OrderSession {
         watermark: u64,
         send: &mut impl FnMut(FilteredUpdate) -> Result<()>,
     ) -> Result<()> {
+        if self.stopped {
+            self.group = None;
+            return self.check_deadline(send);
+        }
         if let Some(group) = self.group.take() {
             if group.covered && self.active.is_some() {
                 if group.bank.slot != slot
@@ -885,10 +903,11 @@ impl OrderSession {
         self.stopped = true;
         self.pending = None;
         self.closing = None;
-        if let Some(epoch) = self.active.take() {
+        self.group = None;
+        if let Some(epoch) = self.active.as_ref() {
             send(control(subscribe_update::UpdateOneof::OrderGap(
                 SubscribeUpdateOrderGap {
-                    context: Some(epoch.context),
+                    context: Some(epoch.context.clone()),
                     next_source_seq: Some(epoch.seq),
                     reason: Some(reason as i32),
                     slot: bank.map(|b| b.0),
@@ -896,6 +915,9 @@ impl OrderSession {
                     detail: bounded_detail(detail),
                 },
             )))?;
+        }
+        if let Some(epoch) = self.active.take() {
+            self.historical.push((epoch.context, epoch.seq));
         }
         Ok(())
     }

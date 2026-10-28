@@ -308,22 +308,33 @@ impl OrderWatch {
             .and_then(|w| w.banks.get(&bank))
             .and_then(|b| b.epoch.clone()))
     }
-    pub fn consume_epoch(&self, bank: BankRef) -> Result<Option<Vec<u8>>> {
-        let mut s = self
+    pub fn unreported_epoch(&self, bank: BankRef) -> Result<Option<Vec<u8>>> {
+        let s = self
             .owner
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
         Ok(s.watchers
+            .get(&self.id)
+            .and_then(|w| w.banks.get(&bank))
+            .filter(|b| !b.reported)
+            .and_then(|b| b.epoch.clone()))
+    }
+    /// Only commit the source notice after send() has enqueued or retained its gap.
+    pub fn mark_reported(&self, bank: BankRef, epoch: &[u8]) -> Result<()> {
+        let mut s = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("B integrity mutex poisoned"))?;
+        let b = s
+            .watchers
             .get_mut(&self.id)
             .and_then(|w| w.banks.get_mut(&bank))
-            .and_then(|b| {
-                if b.reported {
-                    return None;
-                }
-                b.reported = true;
-                b.epoch.clone()
-            }))
+            .ok_or_else(|| anyhow::anyhow!("B notice Bank disappeared"))?;
+        ensure!(b.epoch.as_deref() == Some(epoch), "B notice epoch changed");
+        b.reported = true;
+        Ok(())
     }
 }
 impl Drop for OrderWatch {
