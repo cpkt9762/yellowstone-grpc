@@ -6,6 +6,8 @@ pub mod config;
 pub mod contact_info;
 pub mod file_watcher;
 pub mod grpc;
+pub mod history_protocol;
+pub mod history_session;
 pub mod metered;
 pub mod metrics;
 pub mod order_integrity;
@@ -14,6 +16,7 @@ pub mod order_stream;
 pub mod plugin;
 pub mod ratelimit;
 pub mod stream;
+pub mod tracked_history;
 pub mod util;
 pub mod version;
 pub use agave_geyser_plugin_interface as plugin_interface;
@@ -26,3 +29,6 @@ pub fn get_thread_name() -> String {
     let id = ATOMIC_ID.fetch_add(1, Ordering::Relaxed);
     format!("solGeyserGrpc{id:02}")
 }
+
+#[cfg(test)]
+mod history_vectors;

@@ -51,6 +51,8 @@ message SubscribeRequest {
   map<string, SubscribeRequestFilterBlockFooter> block_footer = 12;
   optional SubscribeRequestOrderWrites order_writes = 1002;
   optional SubscribeRequestOrderClose order_close = 1003;
+  optional SubscribeRequestTrackedHistory tracked_account_history = 1004;
+  optional SubscribeRequestTrackedHistoryClose tracked_history_close = 1005;
 }
 
 // Hash algorithm used to build the filter. Carried on the wire so future
@@ -218,6 +220,12 @@ message SubscribeUpdate {
     SubscribeUpdateOrderEpochSeal order_epoch_seal = 1005;
     SubscribeUpdateOrderGap order_gap = 1006;
     SubscribeUpdateOrderRejected order_rejected = 1007;
+    SubscribeUpdateTrackedHistoryAck tracked_history_ack = 1008;
+    SubscribeUpdateTrackedAccountVersion tracked_account_version = 1009;
+    SubscribeUpdateTrackedHistoryBankSeal tracked_account_bank_seal = 1010;
+    SubscribeUpdateTrackedHistoryEpochSeal tracked_history_epoch_seal = 1011;
+    SubscribeUpdateTrackedHistoryGap tracked_history_gap = 1012;
+    SubscribeUpdateTrackedHistoryRejected tracked_history_rejected = 1013;
   }
   google.protobuf.Timestamp created_at = 11;
 }
@@ -662,6 +670,104 @@ enum OrderRejectReason {
   PENDING_EXISTS = 4;
 }
 message SubscribeUpdateOrderRejected {
+  bytes source_stream_id = 1;
+  optional uint64 request_version = 2;
+  optional bytes request_sha256 = 3;
+  optional OrderRejectReason reason = 4;
+  string detail = 5;
+}
+
+// B-only committed/store account history; every scalar preserves presence.
+message HistoryCapabilities {
+  optional string name = 1;
+  optional uint32 protocol_version = 2;
+  optional CommitmentLevel commitment = 3;
+  optional string encoder_profile = 4;
+  optional bool bank_scoped = 5;
+  optional bool zero_write_seals = 6;
+  optional bool rollback_included = 7;
+  optional bool null_writer_preserved = 8;
+  optional bool legacy_projection_unchanged = 9;
+  optional string semantics = 10;
+}
+message TrackedHistoryLimits {
+  optional uint64 retained_bytes = 1;
+  optional uint64 bank_bytes = 2;
+  optional uint64 bank_versions = 3;
+  optional uint64 queue_bytes = 4;
+  optional uint64 control_bytes = 5;
+}
+message SubscribeRequestTrackedHistory {
+  optional uint32 protocol_version = 1;
+  optional uint64 request_version = 2;
+  optional bytes previous_epoch = 3;
+  repeated bytes tracked_keys = 4;
+  bytes request_sha256 = 5;
+  bytes order_request_sha256 = 6;
+}
+message SubscribeRequestTrackedHistoryClose {
+  OrderContext context = 1;
+  bytes tracked_keys_sha256 = 2;
+}
+message SubscribeUpdateTrackedHistoryAck {
+  OrderContext context = 1;
+  bytes request_sha256 = 2;
+  bytes order_coverage_ack_sha256 = 3;
+  bytes tracked_keys_sha256 = 4;
+  repeated OrderKeyCoverage keys = 5;
+  optional uint64 observed_callback_slot_high_watermark = 6;
+  optional uint64 registration_generation = 7;
+  optional bytes previous_epoch = 8;
+  optional bytes previous_history_epoch_seal_sha256 = 9;
+  HistoryCapabilities capabilities = 10;
+  optional uint64 switch_slot = 11;
+  TrackedHistoryLimits source_limits = 12;
+}
+message SubscribeUpdateTrackedAccountVersion {
+  OrderContext context = 1;
+  optional uint64 history_seq = 2;
+  optional uint64 bank_seq = 3;
+  SubscribeUpdateAccount account = 4;
+  optional uint64 callback_ordinal = 5;
+}
+message SubscribeUpdateTrackedHistoryBankSeal {
+  OrderContext context = 1;
+  optional uint64 slot = 2;
+  optional uint64 bank_id = 3;
+  optional uint64 event_count = 4;
+  optional uint64 first_history_seq = 5;
+  optional uint64 last_history_seq = 6;
+  bytes ordered_events_sha256 = 7;
+  bytes order_slot_seal_sha256 = 8;
+  bytes confirmed_update_sha256 = 9;
+  bytes block_meta_update_sha256 = 10;
+  bytes covered_keys_sha256 = 11;
+  optional uint64 null_writer_count = 12;
+  optional uint64 signed_writer_count = 13;
+  optional bool complete_bank = 14;
+  optional uint64 observed_callback_count = 15;
+}
+message SubscribeUpdateTrackedHistoryEpochSeal {
+  OrderContext context = 1;
+  optional uint64 event_count = 2;
+  optional uint64 last_history_seq = 3;
+  bytes ordered_events_sha256 = 4;
+  optional uint64 bank_seal_count = 5;
+  bytes ordered_bank_seals_sha256 = 6;
+  optional OrderEpochSealReason reason = 7;
+  bytes tracked_keys_sha256 = 8;
+  bytes order_epoch_seal_sha256 = 9;
+  optional uint64 end_slot_exclusive = 10;
+}
+message SubscribeUpdateTrackedHistoryGap {
+  OrderContext context = 1;
+  optional uint64 next_history_seq = 2;
+  optional OrderGapReason reason = 3;
+  optional uint64 slot = 4;
+  optional uint64 bank_id = 5;
+  string detail = 6;
+}
+message SubscribeUpdateTrackedHistoryRejected {
   bytes source_stream_id = 1;
   optional uint64 request_version = 2;
   optional bytes request_sha256 = 3;

@@ -24,6 +24,7 @@ pub type FilterLimitsCheckResult = Result<(), FilterLimitsCheckError>;
 #[serde(default, deny_unknown_fields)]
 pub struct FilterLimits {
     pub order: FilterLimitsOrder,
+    pub history: FilterLimitsHistory,
     pub accounts: FilterLimitsAccounts,
     pub slots: FilterLimitsSlots,
     pub transactions: FilterLimitsTransactions,
@@ -304,6 +305,25 @@ impl Default for FilterLimitsOrder {
             max_notifications: 1024,
             queue_bytes: 4 * 1024 * 1024,
             control_bytes: 16 * 1024,
+        }
+    }
+}
+
+/// Immutable B-only global history limits. Values above the protocol hard
+/// limits are rejected by history admission; A configuration stays independent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilterLimitsHistory {
+    pub retained_bytes: usize,
+    pub bank_bytes: usize,
+    pub bank_versions: usize,
+}
+impl Default for FilterLimitsHistory {
+    fn default() -> Self {
+        Self {
+            retained_bytes: 64 * 1024 * 1024,
+            bank_bytes: 16 * 1024 * 1024,
+            bank_versions: 65536,
         }
     }
 }

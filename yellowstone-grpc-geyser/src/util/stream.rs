@@ -144,6 +144,8 @@ impl<T> Weigher for UnitWeigher<T> {
 /// State shared between every [`LoadAwareSender`] and the [`LoadAwareReceiver`].
 #[derive(Debug)]
 struct Shared {
+    prioritize_primary: std::sync::atomic::AtomicBool,
+    cancelled: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     revision_credit_owners: std::sync::atomic::AtomicUsize,
     /// One permit per unit of weight. A sender acquires the item weight before queueing and the
@@ -195,6 +197,19 @@ impl Drop for QueueCredit {
     }
 }
 
+#[derive(Debug)]
+pub struct DeferredCredit {
+    owner: Option<Arc<Shared>>,
+    weight: u32,
+}
+impl Drop for DeferredCredit {
+    fn drop(&mut self) {
+        if let Some(s) = self.owner.take() {
+            s.semaphore.add_permits(self.weight as usize);
+        }
+    }
+}
+
 /// Sender end of the channel created by [`load_aware_channel`].
 ///
 /// It can be cloned freely, every clone shares the same capacity and weighs items with its own
@@ -231,8 +246,11 @@ impl<T, W: Clone> Clone for LoadAwareSender<T, W> {
 pub struct LoadAwareReceiver<T> {
     shared: Arc<Shared>,
     inner: UnboundedReceiver<(QueueCredit, T)>,
+    deferred: std::collections::VecDeque<(QueueCredit, T)>,
 }
 
+// No field is structurally pinned; moving queued values is the receiver API.
+impl<T> Unpin for LoadAwareReceiver<T> {}
 impl<T> Drop for LoadAwareReceiver<T> {
     fn drop(&mut self) {
         self.shared.semaphore.close();
@@ -278,6 +296,8 @@ where
     );
     let (inner_sender, inner_receiver) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
+        prioritize_primary: Default::default(),
+        cancelled: Default::default(),
         #[cfg(test)]
         revision_credit_owners: Default::default(),
         semaphore: Semaphore::new(weighted_capacity),
@@ -293,6 +313,7 @@ where
     let rx = LoadAwareReceiver {
         shared,
         inner: inner_receiver,
+        deferred: std::collections::VecDeque::new(),
     };
 
     (sender, rx)
@@ -302,6 +323,58 @@ impl<T, W> LoadAwareSender<T, W>
 where
     W: Weigher<Item = T>,
 {
+    pub fn cancel_independent(&self) {
+        if self.independent {
+            self.shared
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    pub fn prioritize_primary(&self) {
+        self.shared
+            .prioritize_primary
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn reserve_independent(&self, weight: usize) -> Result<DeferredCredit, &'static str> {
+        if !self.independent || weight > self.shared.capacity {
+            return Err("invalid deferred B credit");
+        }
+        let weight = u32::try_from(weight).map_err(|_| "deferred B weight overflow")?;
+        let permit = self
+            .shared
+            .semaphore
+            .try_acquire_many(weight)
+            .map_err(|_| "shared B queue credit exhausted")?;
+        permit.forget();
+        Ok(DeferredCredit {
+            owner: Some(Arc::clone(&self.shared)),
+            weight,
+        })
+    }
+    pub fn try_send_prepaid(
+        &self,
+        item: T,
+        mut credit: DeferredCredit,
+    ) -> Result<(), TrySendError<T>> {
+        if !self.independent
+            || !credit
+                .owner
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, &self.shared))
+            || credit.weight < self.weigher.weight(&item)
+        {
+            return Err(TrySendError::Full(item));
+        }
+        let queued = QueueCredit {
+            weight: credit.weight,
+            independent: credit.owner.take(),
+        };
+        self.inner.send((queued, item)).map_err(|e| {
+            let (credit, item) = e.0;
+            credit.release(&self.shared);
+            TrySendError::Closed(item)
+        })
+    }
     fn queue_credit(&self, weight: u32) -> QueueCredit {
         let independent = if self.independent {
             #[cfg(test)]
@@ -383,6 +456,8 @@ where
         }
         Ok(Self {
             shared: Arc::new(Shared {
+                prioritize_primary: Default::default(),
+                cancelled: Default::default(),
                 #[cfg(test)]
                 revision_credit_owners: Default::default(),
                 semaphore: Semaphore::new(capacity),
@@ -464,6 +539,43 @@ impl<T> LoadAwareReceiver<T> {
     /// [`Poll::Ready`] with the next item, or with [`None`] once the channel is empty and every
     /// [`LoadAwareSender`] is dropped. [`Poll::Pending`] otherwise.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        if self
+            .shared
+            .prioritize_primary
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            loop {
+                match self.inner.poll_recv(cx) {
+                    Poll::Ready(Some((credit, item))) if credit.independent.is_none() => {
+                        credit.release(&self.shared);
+                        return Poll::Ready(Some(item));
+                    }
+                    Poll::Ready(Some((credit, item))) => {
+                        if credit
+                            .independent
+                            .as_ref()
+                            .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire))
+                        {
+                            credit.release(&self.shared);
+                            drop(item);
+                        } else {
+                            self.deferred.push_back((credit, item));
+                        }
+                    }
+                    Poll::Ready(None) | Poll::Pending => break,
+                }
+            }
+            while let Some((credit, item)) = self.deferred.pop_front() {
+                let cancelled = credit
+                    .independent
+                    .as_ref()
+                    .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire));
+                credit.release(&self.shared);
+                if !cancelled {
+                    return Poll::Ready(Some(item));
+                }
+            }
+        }
         self.inner.poll_recv(cx).map(|maybe| {
             maybe.map(|(credit, item)| {
                 credit.release(&self.shared);
@@ -884,5 +996,44 @@ mod order_writes_v1 {
         assert_eq!(control.current_weight(), 0);
         drop(rx);
         assert!(matches!(b.try_send(6), Err(TrySendError::Closed(6))));
+    }
+}
+
+#[cfg(test)]
+mod tracked_account_history_v1 {
+    use super::*;
+    #[tokio::test]
+    async fn a_priority_and_deferred_shared_credit_preserve_b_fifo() {
+        let (a, mut rx) = load_aware_channel(2, UnitWeigher::<u32>::new());
+        let b = a.with_budget(2).expect("B pool");
+        a.prioritize_primary();
+        let credit = b.reserve_independent(1).expect("deferred credit");
+        b.try_send_strict(1).expect("B queued");
+        assert!(
+            b.try_send_strict(2).is_err(),
+            "deferred plus output share two credits"
+        );
+        a.try_send(10).expect("A reserved capacity");
+        assert_eq!(rx.recv().await, Some(10));
+        b.try_send_prepaid(2, credit)
+            .expect("transfer existing credit");
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(b.current_weight(), 0);
+    }
+    #[tokio::test]
+    async fn cancelling_paired_b_drops_data_and_preserves_control_and_a() {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
+        let b = a.with_budget(1).expect("B");
+        let control = a.with_budget(1).expect("control");
+        a.prioritize_primary();
+        b.try_send_strict(1).expect("B data");
+        control.try_send_strict(2).expect("gap");
+        b.cancel_independent();
+        a.try_send(3).expect("A capacity");
+        assert_eq!(rx.recv().await, Some(3));
+        assert_eq!(rx.recv().await, Some(2));
+        assert_eq!(b.current_weight(), 0);
+        assert_eq!(control.current_weight(), 0);
     }
 }

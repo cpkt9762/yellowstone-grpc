@@ -1572,3 +1572,577 @@ async fn revision2_n1_prefreeze_reconfirmed_close() {
 async fn revision2_n1_prefreeze_reconfirmed_replace() {
     revision2_prefreeze_conflict_case(true, true).await;
 }
+
+mod tracked_account_history_v1 {
+    use super::*;
+    use crate::history_protocol as hp;
+    use yellowstone_grpc_proto::prelude::{
+        SubscribeRequestTrackedHistory, SubscribeRequestTrackedHistoryClose,
+        SubscribeUpdateOrderCoverageAck, TransactionError,
+    };
+    fn paired(mut raw: SubscribeRequest) -> SubscribeRequest {
+        let order = raw.order_writes.as_ref().expect("order request");
+        let mut history = SubscribeRequestTrackedHistory {
+            protocol_version: order.protocol_version,
+            request_version: order.request_version,
+            previous_epoch: order.previous_epoch.clone(),
+            tracked_keys: order.tracked_keys.clone(),
+            order_request_sha256: order.request_sha256.clone(),
+            ..Default::default()
+        };
+        history.request_sha256 = hp::request_digest(&history);
+        raw.tracked_account_history = Some(history);
+        raw
+    }
+    async fn ready(c: &mut Client, r: &SubscribeRequest) -> SubscribeUpdateOrderCoverageAck {
+        let order = install(c, r).await.expect("paired order ack");
+        let history = read(&mut c.1).await;
+        let Some(UpdateOneof::TrackedHistoryAck(history)) =
+            history.as_subscribe_update().update_oneof
+        else {
+            panic!("history ack after order");
+        };
+        assert_eq!(history.context, order.context);
+        assert_eq!(history.keys, order.keys);
+        assert_eq!(history.switch_slot, Some(100));
+        order
+    }
+    fn ingress_accounts(b: &SubscriberChannels, slot: u64) -> Vec<Message> {
+        let normal = group_content(slot, false);
+        let Message::Account(last) = &normal[0] else {
+            panic!("account fixture");
+        };
+        let mut first = last.as_ref().clone();
+        first.account.write_version = 6;
+        first.account.txn_signature = Some(solana_signature::Signature::from([9; 64]));
+        first.account.data = bytes::Bytes::from_static(&[1, 2, 3]);
+        for account in [Arc::new(first), Arc::clone(last)] {
+            b.observe_callback(slot);
+            let mut guard = b.history.enter(
+                slot,
+                Some(slot),
+                Some(account.account.pubkey.to_bytes()),
+                false,
+                false,
+                true,
+            );
+            guard.attach(&account);
+            drop(guard);
+            b.history.retain(&account);
+        }
+        b.history.fence((slot, slot));
+        normal
+    }
+    fn publish(b: &SubscriberChannels, slot: u64, content: Vec<Message>, count: u64) {
+        b.send_group(
+            CommitmentLevel::Confirmed,
+            Arc::new(content),
+            Some(GroupBoundary::Begin(BankGroup {
+                slot,
+                bank_id: slot,
+                observed: count,
+                executed: count,
+                valid: true,
+                resource_limit: false,
+                source_after_seal: false,
+            })),
+        );
+        let mut m = fixtures::message_block_meta(slot);
+        Arc::make_mut(&mut m).block_meta.bank_id = slot;
+        Arc::make_mut(&mut m).block_meta.executed_transaction_count = count;
+        b.send(
+            CommitmentLevel::Confirmed,
+            Arc::new(vec![Message::BlockMeta(m)]),
+        );
+        end(b, slot);
+    }
+    async fn through_bank(c: &mut Client) -> Vec<FilteredUpdate> {
+        let mut out = Vec::new();
+        loop {
+            let u = read(&mut c.1).await;
+            let done = matches!(
+                u.as_subscribe_update().update_oneof,
+                Some(UpdateOneof::TrackedAccountBankSeal(_))
+            );
+            out.push(u);
+            if done {
+                return out;
+            }
+        }
+    }
+    #[tokio::test]
+    async fn all_versions_failed_and_null_writer_preserved_and_a_bytes_equal() {
+        let b = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        let a = SubscriberChannels::new(64, 64, 64);
+        a.observe_callback(99);
+        let mut on = spawn(b.clone());
+        let mut off = spawn(a.clone());
+        ready(&mut on, &paired(request(true))).await;
+        install(&mut off, &request(false)).await;
+        let mut content = ingress_accounts(&b, 100);
+        if let Message::Transaction(tx) = &mut content[1] {
+            Arc::make_mut(tx).transaction.meta.err = Some(TransactionError { err: vec![7] });
+        }
+        publish(&b, 100, content.clone(), 1);
+        publish(&a, 100, content, 1);
+        let emitted = through_bank(&mut on).await;
+        let old = emitted
+            .iter()
+            .filter(|u| !matches!(u.message, FilteredUpdateOneof::Order(_)))
+            .map(|u| u.encode_to_vec())
+            .collect::<Vec<_>>();
+        let mut reference = Vec::new();
+        for _ in 0..old.len() {
+            reference.push(read(&mut off.1).await.encode_to_vec());
+        }
+        assert_eq!(old, reference);
+        let versions = emitted
+            .iter()
+            .filter_map(|u| match u.as_subscribe_update().update_oneof {
+                Some(UpdateOneof::TrackedAccountVersion(v)) => Some(v),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].history_seq, Some(0));
+        assert_eq!(versions[1].bank_seq, Some(1));
+        assert_eq!(
+            versions[0]
+                .account
+                .as_ref()
+                .expect("first version")
+                .account
+                .as_ref()
+                .expect("first account")
+                .txn_signature,
+            Some(vec![9; 64])
+        );
+        assert_eq!(
+            versions[1]
+                .account
+                .as_ref()
+                .expect("null version")
+                .account
+                .as_ref()
+                .expect("null account")
+                .txn_signature,
+            None
+        );
+        assert!(emitted.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(UpdateOneof::TransactionOrder(o)) if o.err.is_some())));
+        let Some(UpdateOneof::TrackedAccountBankSeal(seal)) = emitted
+            .last()
+            .expect("history seal")
+            .as_subscribe_update()
+            .update_oneof
+        else {
+            panic!("history seal");
+        };
+        assert_eq!(
+            (
+                seal.event_count,
+                seal.observed_callback_count,
+                seal.null_writer_count,
+                seal.signed_writer_count
+            ),
+            (Some(2), Some(2), Some(1), Some(1))
+        );
+        on.0.send(None).expect("close on");
+        off.0.send(None).expect("close off");
+        on.2.await.expect("on task");
+        off.2.await.expect("off task");
+    }
+    #[tokio::test]
+    async fn zero_write_paired_close_and_late_after_normal_end_revoke() {
+        let b = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        let mut c = spawn(b.clone());
+        let ack = ready(&mut c, &paired(request(true))).await;
+        drop(b.history.enter(100, Some(100), None, false, false, false));
+        b.history.fence((100, 100));
+        b.observe_callback(100);
+        publish(&b, 100, Vec::new(), 0);
+        let outputs = through_bank(&mut c).await;
+        let Some(UpdateOneof::TrackedAccountBankSeal(seal)) = outputs
+            .last()
+            .expect("zero seal")
+            .as_subscribe_update()
+            .update_oneof
+        else {
+            panic!("zero history seal");
+        };
+        assert_eq!(seal.event_count, Some(0));
+        assert!(seal.first_history_seq.is_none() && seal.last_history_seq.is_none());
+        assert_eq!(
+            seal.ordered_events_sha256,
+            crate::order_protocol::sha256(&[])
+        );
+        let close = SubscribeRequest {
+            order_close: Some(SubscribeRequestOrderClose {
+                context: ack.context.clone(),
+                tracked_keys_sha256: ack.tracked_keys_sha256.clone(),
+            }),
+            tracked_history_close: Some(SubscribeRequestTrackedHistoryClose {
+                context: ack.context.clone(),
+                tracked_keys_sha256: ack.tracked_keys_sha256.clone(),
+            }),
+            ..Default::default()
+        };
+        c.0.send(Some((None, Filter::order_control(close))))
+            .expect("paired close");
+        let order = read(&mut c.1).await;
+        let history = read(&mut c.1).await;
+        assert!(
+            matches!(order.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderEpochSeal(e)) if e.reason==Some(2))
+        );
+        assert!(
+            matches!(history.as_subscribe_update().update_oneof,Some(UpdateOneof::TrackedHistoryEpochSeal(e)) if e.reason==Some(2)&&e.end_slot_exclusive==Some(101)&&e.order_epoch_seal_sha256==crate::order_protocol::sha256(&order.encode_to_vec()))
+        );
+        drop(
+            b.history
+                .enter(100, Some(100), Some([1; 32]), false, false, true),
+        );
+        assert!(matches!(
+            read(&mut c.1).await.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::OrderGap(_))
+        ));
+        assert!(matches!(
+            read(&mut c.1).await.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::TrackedHistoryGap(gap)) if gap.slot==Some(100)&&gap.bank_id==Some(100)
+        ));
+        c.0.send(None).expect("disconnect");
+        c.2.await.expect("client task");
+    }
+    #[tokio::test]
+    async fn half_register_half_close_and_reconnect_identity_are_rejected_or_renewed() {
+        let b = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        let mut c = spawn(b.clone());
+        let ack = ready(&mut c, &paired(request(true))).await;
+        let half = SubscribeRequest {
+            order_close: Some(SubscribeRequestOrderClose {
+                context: ack.context.clone(),
+                tracked_keys_sha256: ack.tracked_keys_sha256.clone(),
+            }),
+            ..Default::default()
+        };
+        c.0.send(Some((None, Filter::order_control(half))))
+            .expect("half close");
+        assert!(matches!(
+            read(&mut c.1).await.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::TrackedHistoryRejected(_))
+        ));
+        let mut second = spawn(b.clone());
+        let ack2 = ready(&mut second, &paired(request(true))).await;
+        assert_ne!(
+            ack.context
+                .as_ref()
+                .expect("first context")
+                .source_stream_id,
+            ack2.context
+                .as_ref()
+                .expect("second context")
+                .source_stream_id
+        );
+        assert_ne!(
+            ack.context.as_ref().expect("first context").source_epoch,
+            ack2.context.as_ref().expect("second context").source_epoch
+        );
+        c.0.send(None).expect("close first");
+        second.0.send(None).expect("close second");
+        c.2.await.expect("first task");
+        second.2.await.expect("second task");
+        let mut half = paired(request(true));
+        half.order_writes = None;
+        assert!(hp::validate_pair(&half).is_err());
+    }
+    #[tokio::test]
+    async fn paired_replace_waits_fixed_old_set_and_buffers_new_side() {
+        let b = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        let mut c = spawn(b.clone());
+        let old = ready(&mut c, &paired(request(true))).await;
+        let old_content = ingress_accounts(&b, 100); // retained but not yet broadcast: old-side obligation
+        let mut replacement = request(true);
+        let order = replacement.order_writes.as_mut().expect("order");
+        order.request_version = Some(2);
+        order.previous_epoch = old.context.as_ref().map(|c| c.source_epoch.clone());
+        order.tracked_keys.push(vec![2; 32]);
+        order.request_sha256 = request_digest(order);
+        replacement
+            .accounts
+            .get_mut("accounts")
+            .expect("accounts")
+            .account
+            .push(Pubkey::new_from_array([2; 32]).to_string());
+        replacement = paired(replacement);
+        c.0.send(Some((None, filter(&replacement))))
+            .expect("replace");
+        assert!(matches!(
+            read(&mut c.1).await.message,
+            FilteredUpdateOneof::OwnerRejectExemption(_)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), c.1.recv())
+                .await
+                .is_err(),
+            "no early ack or old seals"
+        );
+        c.0.send(Some((None, filter(&replacement))))
+            .expect("second pending control");
+        assert!(matches!(
+            read(&mut c.1).await.message,
+            FilteredUpdateOneof::OwnerRejectExemption(_)
+        ));
+        assert!(
+            matches!(read(&mut c.1).await.as_subscribe_update().update_oneof,Some(UpdateOneof::TrackedHistoryRejected(r)) if r.reason==Some(4))
+        );
+        let new_content = ingress_accounts(&b, 101);
+        publish(&b, 101, new_content, 1);
+        // A keeps moving while old-side B is pending.
+        for _ in 0..5 {
+            assert!(!matches!(
+                read(&mut c.1).await.message,
+                FilteredUpdateOneof::Order(_)
+            ));
+        }
+        publish(&b, 100, old_content, 1);
+        let old_out = through_bank(&mut c).await;
+        assert!(old_out.iter().any(|u|matches!(u.as_subscribe_update().update_oneof,Some(UpdateOneof::TrackedAccountVersion(v)) if v.context==old.context)));
+        let oe = read(&mut c.1).await;
+        let he = read(&mut c.1).await;
+        let oa = read(&mut c.1).await;
+        let ha = read(&mut c.1).await;
+        assert!(
+            matches!(oe.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderEpochSeal(e)) if e.reason==Some(1))
+        );
+        assert!(
+            matches!(he.as_subscribe_update().update_oneof,Some(UpdateOneof::TrackedHistoryEpochSeal(e)) if e.reason==Some(1)&&e.end_slot_exclusive==Some(101))
+        );
+        assert!(
+            matches!(oa.as_subscribe_update().update_oneof,Some(UpdateOneof::OrderCoverageAck(a)) if a.active_from_slot==Some(101)&&a.keys[0].active_from_slot==Some(100))
+        );
+        assert!(
+            matches!(ha.as_subscribe_update().update_oneof,Some(UpdateOneof::TrackedHistoryAck(a)) if a.switch_slot==Some(101))
+        );
+        through_bank(&mut c).await;
+        c.0.send(None).expect("disconnect");
+        c.2.await.expect("client task");
+    }
+    #[tokio::test]
+    async fn history_and_order_only_share_original_watcher_limit() {
+        let mut b = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        b.order_integrity = Arc::new(crate::order_integrity::OrderIntegrity::new(
+            crate::plugin::filter::limits::FilterLimitsOrder {
+                max_watchers: 1,
+                ..Default::default()
+            },
+        ));
+        let mut paired_client = spawn(b.clone());
+        ready(&mut paired_client, &paired(request(true))).await;
+        let mut legacy_client = spawn(b.clone());
+        legacy_client
+            .0
+            .send(Some((None, filter(&request(true)))))
+            .expect("second B client");
+        let first = read(&mut legacy_client.1).await;
+        let second = read(&mut legacy_client.1).await;
+        assert!(
+            [first, second].iter().any(|u| matches!(
+                u.as_subscribe_update().update_oneof,
+                Some(UpdateOneof::OrderRejected(_))
+            )),
+            "history already owns the sole original B watcher"
+        );
+        paired_client.0.send(None).expect("paired disconnect");
+        legacy_client.0.send(None).expect("legacy disconnect");
+        paired_client.2.await.expect("paired task");
+        legacy_client.2.await.expect("legacy task");
+    }
+    #[tokio::test]
+    async fn limits_above_hard_max_reject_history_and_keep_a_filter() {
+        let mut b = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        b.order_integrity = Arc::new(crate::order_integrity::OrderIntegrity::new(
+            crate::plugin::filter::limits::FilterLimitsOrder {
+                max_transactions_per_bank: 65537,
+                ..Default::default()
+            },
+        ));
+        let mut c = spawn(b.clone());
+        c.0.send(Some((None, filter(&paired(request(true))))))
+            .expect("paired request");
+        assert!(matches!(
+            read(&mut c.1).await.message,
+            FilteredUpdateOneof::OwnerRejectExemption(_)
+        ));
+        assert!(matches!(
+            read(&mut c.1).await.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::TrackedHistoryRejected(_))
+        ));
+        meta(&b, 100);
+        assert!(
+            matches!(
+                read(&mut c.1).await.message,
+                FilteredUpdateOneof::BlockMeta(_)
+            ),
+            "A filter remains installed"
+        );
+        c.0.send(None).expect("disconnect");
+        c.2.await.expect("client task");
+    }
+    #[tokio::test]
+    async fn large_a_metadata_is_not_charged_as_compact_b_payload() {
+        let b = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        let mut c = spawn(b.clone());
+        ready(&mut c, &paired(request(true))).await;
+        let mut content = ingress_accounts(&b, 100);
+        if let Message::Transaction(tx) = &mut content[1] {
+            Arc::make_mut(tx).transaction.meta.log_messages = vec!["x".repeat(4 * 1024 * 1024 + 1)];
+        }
+        publish(&b, 100, content, 1);
+        let emitted = through_bank(&mut c).await;
+        assert!(emitted.iter().any(|u| matches!(
+            u.as_subscribe_update().update_oneof,
+            Some(UpdateOneof::TransactionOrder(_))
+        ) && u.encoded_len() < 4096));
+        c.0.send(None).expect("disconnect");
+        c.2.await.expect("client task");
+    }
+    #[tokio::test]
+    async fn a_wire_subsequence_is_equal_under_history_pressure_stop_gc_and_control_races() {
+        for scenario in [
+            "retention_limit",
+            "queue_full",
+            "stop",
+            "gc_floor",
+            "control_rejection",
+        ] {
+            let mut b = SubscriberChannels::new(64, 64, 64);
+            b.observe_callback(99);
+            if scenario == "queue_full" {
+                b.order_integrity = Arc::new(crate::order_integrity::OrderIntegrity::new(
+                    crate::plugin::filter::limits::FilterLimitsOrder {
+                        queue_bytes: 1024,
+                        ..Default::default()
+                    },
+                ));
+            }
+            let a = SubscriberChannels::new(64, 64, 64);
+            a.observe_callback(99);
+            let mut on = spawn(b.clone());
+            let mut off = spawn(a.clone());
+            let ack = ready(&mut on, &paired(request(true))).await;
+            install(&mut off, &request(false)).await;
+            let hold = if scenario == "retention_limit" {
+                Some(
+                    b.history
+                        .reserve(59 * 1024 * 1024)
+                        .expect("reserve pressure"),
+                )
+            } else {
+                None
+            };
+            if scenario == "gc_floor" {
+                b.history.gc(101);
+            }
+            if scenario == "stop" || scenario == "control_rejection" {
+                let close = SubscribeRequest {
+                    order_close: Some(SubscribeRequestOrderClose {
+                        context: ack.context.clone(),
+                        tracked_keys_sha256: ack.tracked_keys_sha256.clone(),
+                    }),
+                    tracked_history_close: if scenario == "stop" {
+                        Some(SubscribeRequestTrackedHistoryClose {
+                            context: ack.context.clone(),
+                            tracked_keys_sha256: ack.tracked_keys_sha256.clone(),
+                        })
+                    } else {
+                        None
+                    },
+                    ..Default::default()
+                };
+                on.0.send(Some((None, Filter::order_control(close))))
+                    .expect("control");
+                if scenario == "stop" {
+                    assert!(matches!(
+                        read(&mut on.1).await.as_subscribe_update().update_oneof,
+                        Some(UpdateOneof::OrderEpochSeal(_))
+                    ));
+                    assert!(matches!(
+                        read(&mut on.1).await.as_subscribe_update().update_oneof,
+                        Some(UpdateOneof::TrackedHistoryEpochSeal(_))
+                    ));
+                } else {
+                    assert!(matches!(
+                        read(&mut on.1).await.as_subscribe_update().update_oneof,
+                        Some(UpdateOneof::TrackedHistoryRejected(_))
+                    ));
+                }
+            }
+            let mut content = group_content(100, scenario == "queue_full");
+            if scenario == "retention_limit" {
+                if let Message::Account(account) = &mut content[0] {
+                    Arc::make_mut(account).account.data = bytes::Bytes::from(vec![7; 1024 * 1024]);
+                }
+            }
+            for source in &content {
+                let (bank, key, data) = match source {
+                    Message::Account(account) => (
+                        account.bank_id,
+                        Some(account.account.pubkey.to_bytes()),
+                        true,
+                    ),
+                    Message::Transaction(tx) => (Some(tx.bank_id), None, true),
+                    _ => panic!("source fixture"),
+                };
+                b.observe_callback(100);
+                let mut guard = b.history.enter(100, bank, key, false, false, data);
+                if let Message::Account(account) = source {
+                    guard.attach(account);
+                }
+                drop(guard);
+                if let Message::Account(account) = source {
+                    b.history.retain(account);
+                }
+            }
+            b.history.fence((100, 100));
+            publish(&b, 100, content.clone(), 1);
+            publish(&a, 100, content, 1);
+            let mut actual = Vec::new();
+            let mut gap = false;
+            while actual.len() < 5 {
+                let update = read(&mut on.1).await;
+                if matches!(
+                    update.as_subscribe_update().update_oneof,
+                    Some(UpdateOneof::TrackedHistoryGap(_))
+                ) {
+                    gap = true;
+                }
+                if !matches!(update.message, FilteredUpdateOneof::Order(_)) {
+                    actual.push(update.encode_to_vec());
+                }
+            }
+            let mut expected = Vec::new();
+            for _ in 0..5 {
+                expected.push(read(&mut off.1).await.encode_to_vec());
+            }
+            assert_eq!(actual, expected, "A wire under {scenario}");
+            if matches!(scenario, "retention_limit" | "queue_full" | "gc_floor") {
+                while !gap {
+                    gap = matches!(
+                        read(&mut on.1).await.as_subscribe_update().update_oneof,
+                        Some(UpdateOneof::TrackedHistoryGap(_))
+                    );
+                }
+            }
+            on.0.send(None).expect("on disconnect");
+            off.0.send(None).expect("off disconnect");
+            on.2.await.expect("on task");
+            off.2.await.expect("off task");
+            drop(hold);
+        }
+    }
+}

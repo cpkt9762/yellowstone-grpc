@@ -190,6 +190,13 @@ impl OrderSession {
         self.ever = true;
     }
 
+    /// Paired history shares the original watcher and source-reference budgets.
+    pub fn check_watch(&self) -> Result<()> {
+        if let Some(watch) = &self.watch {
+            watch.check()?;
+        }
+        Ok(())
+    }
     pub fn register_watch(
         &mut self,
         registry: &Arc<crate::order_integrity::OrderIntegrity>,

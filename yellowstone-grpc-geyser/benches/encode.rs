@@ -39,30 +39,36 @@ fn bench_account(c: &mut Criterion) {
 
     let updates = create_accounts()
         .into_iter()
-        .map(|(msg, data_slice)| FilteredUpdate {
-            filters: filters.clone(),
-            message: FilteredUpdateOneof::account(Arc::new(msg), data_slice),
-            created_at: Timestamp::from(SystemTime::now()),
+        .map(|(msg, data_slice)| {
+            FilteredUpdate::new(
+                filters.clone(),
+                FilteredUpdateOneof::account(Arc::new(msg), data_slice),
+                Timestamp::from(SystemTime::now()),
+            )
         })
         .collect::<Vec<_>>();
     bench!(&updates, "accounts");
 
     let updates = load_predefined_transactions()
         .into_iter()
-        .map(|transaction| FilteredUpdate {
-            filters: filters.clone(),
-            message: FilteredUpdateOneof::transaction(transaction, true),
-            created_at: Timestamp::from(SystemTime::now()),
+        .map(|transaction| {
+            FilteredUpdate::new(
+                filters.clone(),
+                FilteredUpdateOneof::transaction(transaction, true),
+                Timestamp::from(SystemTime::now()),
+            )
         })
         .collect::<Vec<_>>();
     bench!(&updates, "transactions");
 
     let updates = load_predefined_blocks()
         .into_iter()
-        .map(|block| FilteredUpdate {
-            filters: filters.clone(),
-            message: FilteredUpdateOneof::block(Box::new(block)),
-            created_at: Timestamp::from(SystemTime::now()),
+        .map(|block| {
+            FilteredUpdate::new(
+                filters.clone(),
+                FilteredUpdateOneof::block(Box::new(block)),
+                Timestamp::from(SystemTime::now()),
+            )
         })
         .collect::<Vec<_>>();
     bench!(&updates, "blocks");

@@ -211,7 +211,10 @@ pub fn decode_subscription(raw: &[u8]) -> Result<OrderSubscribeRequest> {
     use prost::encoding::{decode_key, decode_varint, skip_field, DecodeContext, WireType};
     let request = SubscribeRequest::decode(raw)?;
     let checked = (|| -> Result<()> {
-        if request.order_writes.is_none() && request.order_close.is_none() {
+        if request.order_writes.is_none()
+            && request.order_close.is_none()
+            && !crate::history_protocol::has_control(&request)
+        {
             return Ok(());
         }
         let mut input = raw;
@@ -219,13 +222,13 @@ pub fn decode_subscription(raw: &[u8]) -> Result<OrderSubscribeRequest> {
         while input.has_remaining() {
             let (tag, wire) = decode_key(&mut input)?;
             ensure!(
-                (1..=12).contains(&tag) || tag == 1002 || tag == 1003,
+                (1..=12).contains(&tag) || (1002..=1005).contains(&tag),
                 "unknown subscription field"
             );
-            if matches!(tag, 6 | 9 | 11 | 1002 | 1003) {
+            if matches!(tag, 6 | 9 | 11 | 1002 | 1003 | 1004 | 1005) {
                 ensure!(singular.insert(tag), "duplicate subscription singular");
             }
-            if tag == 1002 || tag == 1003 {
+            if (1002..=1005).contains(&tag) {
                 ensure!(
                     wire == WireType::LengthDelimited,
                     "invalid B control wire type"
@@ -239,6 +242,28 @@ pub fn decode_subscription(raw: &[u8]) -> Result<OrderSubscribeRequest> {
                     ensure!(
                         decoded.encode_to_vec() == bytes,
                         "noncanonical order request encoding"
+                    );
+                } else if tag == 1004 {
+                    let decoded = SubscribeRequestTrackedHistory::decode(bytes)?;
+                    ensure!(
+                        decoded.encode_to_vec() == bytes,
+                        "noncanonical history request"
+                    );
+                } else if tag == 1005 {
+                    let decoded = SubscribeRequestTrackedHistoryClose::decode(bytes)?;
+                    ensure!(
+                        decoded.encode_to_vec() == bytes,
+                        "noncanonical history close"
+                    );
+                    validate_context(
+                        decoded
+                            .context
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("missing history close context"))?,
+                    )?;
+                    ensure!(
+                        decoded.tracked_keys_sha256.len() == 32,
+                        "invalid history close key hash"
                     );
                 } else {
                     let close = SubscribeRequestOrderClose::decode(bytes)?;

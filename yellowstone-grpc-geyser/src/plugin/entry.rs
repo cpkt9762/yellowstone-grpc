@@ -365,6 +365,15 @@ impl GeyserPlugin for Plugin {
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
 
+            let mut history_ingress = inner.broadcast_channel.history.enter(
+                slot,
+                Some(bank_id),
+                <[u8; 32]>::try_from(account.pubkey).ok(),
+                false,
+                false,
+                true,
+            );
+
             if let Ok(owner) = Pubkey::try_from(account.owner) {
                 // Only explicitly registered live accounts can bypass the owner drop.
                 if inner.filter_limits.accounts.owner_reject.contains(&owner) {
@@ -375,7 +384,9 @@ impl GeyserPlugin for Plugin {
                         let mut message =
                             MessageAccount::from_geyser(account, slot, false, Some(bank_id));
                         message.owner_reject_exempt = true;
-                        inner.send_message(Message::Account(Arc::new(message)));
+                        let message = Arc::new(message);
+                        history_ingress.attach(&message);
+                        inner.send_message(Message::Account(message));
                     } else {
                         incr_geyser_event_dropped("account");
                     }
@@ -391,6 +402,9 @@ impl GeyserPlugin for Plugin {
                 false,
                 Some(bank_id),
             )));
+            if let Message::Account(account) = &message {
+                history_ingress.attach(account);
+            }
             inner.send_message(message);
             Ok(())
         })
@@ -417,6 +431,15 @@ impl GeyserPlugin for Plugin {
         bank_id: BankId,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            inner.broadcast_channel.observe_callback(slot);
+            let _history_ingress = inner.broadcast_channel.history.enter(
+                slot,
+                Some(bank_id),
+                None,
+                false,
+                matches!(status, SlotStatus::Confirmed | SlotStatus::Rooted),
+                false,
+            );
             if matches!(status, SlotStatus::Processed) {
                 let shm_guard = inner.shm_state.load();
                 if let Some(ref writer) = shm_guard.writer {
@@ -536,6 +559,15 @@ impl GeyserPlugin for Plugin {
         status: &SlotStatus,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            inner.broadcast_channel.observe_callback(slot);
+            let _history_ingress = inner.broadcast_channel.history.enter(
+                slot,
+                None,
+                None,
+                matches!(status, SlotStatus::Dead(_)),
+                false,
+                false,
+            );
             let message = Message::Slot(Arc::new(MessageSlot::from_geyser(
                 slot, parent, status, None,
             )));
@@ -578,6 +610,15 @@ impl GeyserPlugin for Plugin {
         bank_id: BankId,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
+            inner.broadcast_channel.observe_callback(slot);
+            let _history_ingress = inner.broadcast_channel.history.enter(
+                slot,
+                Some(bank_id),
+                None,
+                false,
+                false,
+                true,
+            );
             #[allow(clippy::infallible_destructuring_match)]
             let transaction = match transaction {
                 ReplicaTransactionInfoVersions::V0_0_4(info) => info,
@@ -662,6 +703,16 @@ impl GeyserPlugin for Plugin {
                 ReplicaEntryInfoVersions::V0_0_2(entry) => entry,
             };
 
+            inner.broadcast_channel.observe_callback(entry.slot);
+            let _history_ingress = inner.broadcast_channel.history.enter(
+                entry.slot,
+                Some(bank_id),
+                None,
+                false,
+                false,
+                true,
+            );
+
             let message = Message::Entry(Arc::new(MessageEntry::from_geyser(entry, bank_id)));
             inner.send_message(message);
 
@@ -679,6 +730,16 @@ impl GeyserPlugin for Plugin {
             let blockinfo = match blockinfo {
                 ReplicaBlockInfoVersions::V0_0_5(info) => info,
             };
+
+            inner.broadcast_channel.observe_callback(blockinfo.slot);
+            let _history_ingress = inner.broadcast_channel.history.enter(
+                blockinfo.slot,
+                Some(bank_id),
+                None,
+                false,
+                false,
+                true,
+            );
 
             let message =
                 Message::BlockMeta(Arc::new(MessageBlockMeta::from_geyser(blockinfo, bank_id)));
@@ -720,6 +781,16 @@ impl GeyserPlugin for Plugin {
             let info = match block_footer {
                 ReplicaBlockFooterInfoVersions::V0_0_2(info) => info,
             };
+
+            inner.broadcast_channel.observe_callback(info.slot);
+            let _history_ingress = inner.broadcast_channel.history.enter(
+                info.slot,
+                Some(bank_id),
+                None,
+                false,
+                false,
+                true,
+            );
 
             let message =
                 Message::BlockFooter(Arc::new(MessageBlockFooter::from_geyser(info, bank_id)));

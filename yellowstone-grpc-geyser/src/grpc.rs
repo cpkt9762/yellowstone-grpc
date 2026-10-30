@@ -372,6 +372,9 @@ impl OrderQueue {
                 Some(UpdateOneof::OrderGap(gap)) => {
                     gap.context.as_ref().map(|c| c.source_epoch.as_slice())
                 }
+                Some(UpdateOneof::TrackedHistoryGap(gap)) => {
+                    gap.context.as_ref().map(|c| c.source_epoch.as_slice())
+                }
                 _ => None,
             },
             _ => None,
@@ -383,23 +386,25 @@ impl OrderQueue {
     ) -> anyhow::Result<()> {
         if pending
             .iter()
-            .any(|old| Self::gap_epoch(old) == Self::gap_epoch(&update))
+            .any(|old| Self::gap_epoch(old) == Self::gap_epoch(&update) && matches!((&old.message, &update.message), (FilteredUpdateOneof::Order(a), FilteredUpdateOneof::Order(b)) if a.update_oneof.as_ref().map(std::mem::discriminant) == b.update_oneof.as_ref().map(std::mem::discriminant)))
         {
             return Ok(());
         }
         anyhow::ensure!(
-            pending.len() < crate::order_protocol::MAX_TRACKED_KEYS,
+            pending.len() < crate::order_protocol::MAX_TRACKED_KEYS * if matches!(&update.message, FilteredUpdateOneof::Order(u) if matches!(u.update_oneof,Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::TrackedHistoryGap(_)))) || pending.iter().any(|u|matches!(&u.message,FilteredUpdateOneof::Order(u) if matches!(u.update_oneof,Some(yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof::TrackedHistoryGap(_))))) {2}else{1},
             "B revocation epoch budget exhausted"
         );
         pending.push_back(update);
         Ok(())
     }
-    fn send(&self, update: FilteredUpdate) -> anyhow::Result<()> {
+    fn send(&self, mut update: FilteredUpdate) -> anyhow::Result<()> {
         use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
         let (gap, reserved) = match &update.message {
             FilteredUpdateOneof::Order(wire) => match wire.update_oneof.as_ref() {
-                Some(UpdateOneof::OrderGap(_)) => (true, true),
-                Some(UpdateOneof::OrderRejected(_)) => (false, true),
+                Some(UpdateOneof::OrderGap(_) | UpdateOneof::TrackedHistoryGap(_)) => (true, true),
+                Some(UpdateOneof::OrderRejected(_) | UpdateOneof::TrackedHistoryRejected(_)) => {
+                    (false, true)
+                }
                 _ => (false, false),
             },
             _ => (false, false),
@@ -410,6 +415,13 @@ impl OrderQueue {
             self.data.as_ref()
         }
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(credit) = update.deferred_credit.take() {
+            let credit = Arc::try_unwrap(credit)
+                .map_err(|_| anyhow::anyhow!("deferred B credit has multiple owners"))?;
+            return sender
+                .try_send_prepaid(Ok(update), credit)
+                .map_err(|_| anyhow::anyhow!("prepaid B queue failed"));
+        }
         if gap {
             let mut pending = self
                 .pending_gap
@@ -447,7 +459,8 @@ impl OrderQueue {
 }
 
 /// No data/control channel, semaphore or lock is initialized for a v1-only client.
-struct LazyOrderQueue {
+pub(crate) struct LazyOrderQueue {
+    history: std::sync::OnceLock<Arc<crate::tracked_history::HistoryRegistry>>,
     source: SubscribeSender,
     limits: crate::plugin::filter::limits::FilterLimitsOrder,
     queue: std::sync::OnceLock<OrderQueue>,
@@ -458,12 +471,47 @@ impl LazyOrderQueue {
         limits: &crate::plugin::filter::limits::FilterLimitsOrder,
     ) -> Self {
         Self {
+            history: std::sync::OnceLock::new(),
             source: source.clone(),
             limits: limits.clone(),
             queue: std::sync::OnceLock::new(),
         }
     }
-    fn send(&self, update: FilteredUpdate) -> anyhow::Result<()> {
+    fn cancel_history_data(&self) {
+        if let Some(queue) = self.queue.get() {
+            if let Ok(data) = &queue.data {
+                data.cancel_independent();
+            }
+        }
+    }
+    fn enable_history(&self, registry: &Arc<crate::tracked_history::HistoryRegistry>) {
+        self.history.get_or_init(|| Arc::clone(registry));
+        self.source.prioritize_primary();
+    }
+    pub(crate) fn reserve_deferred(
+        &self,
+        bytes: usize,
+    ) -> anyhow::Result<Arc<crate::util::stream::DeferredCredit>> {
+        let queue = self
+            .queue
+            .get_or_init(|| OrderQueue::new(&self.source, &self.limits));
+        let sender = queue.data.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(Arc::new(
+            sender
+                .reserve_independent(bytes)
+                .map_err(|e| anyhow::anyhow!("{e}"))?,
+        ))
+    }
+    fn send(&self, mut update: FilteredUpdate) -> anyhow::Result<()> {
+        if let Some(registry) = self.history.get() {
+            if update.history_lease.is_none() {
+                let charge = prost::Message::encoded_len(&update)
+                    .checked_mul(16)
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or_else(|| anyhow::anyhow!("history output charge overflow"))?;
+                update.history_lease = Some(registry.reserve(charge)?);
+            }
+        }
         self.queue
             .get_or_init(|| OrderQueue::new(&self.source, &self.limits))
             .send(update)
@@ -484,6 +532,7 @@ type DeshredSubscribeSender = LoadAwareSender<
 #[derive(Debug, Clone)]
 pub struct SubscriberChannels {
     pub(crate) order_integrity: Arc<crate::order_integrity::OrderIntegrity>,
+    pub(crate) history: Arc<crate::tracked_history::HistoryRegistry>,
     #[cfg(test)]
     pub(crate) revision_timestamp: Option<Timestamp>,
     pub(crate) callback_watermark: Arc<AtomicU64>,
@@ -495,6 +544,7 @@ pub struct SubscriberChannels {
 impl SubscriberChannels {
     pub fn new(processed: usize, confirmed: usize, finalized: usize) -> Self {
         Self {
+            history: Arc::new(crate::tracked_history::HistoryRegistry::default()),
             order_integrity: Arc::new(crate::order_integrity::OrderIntegrity::new(
                 Default::default(),
             )),
@@ -764,6 +814,8 @@ struct ClientSession {
     endpoint: String,
     filter: Filter,
     order: crate::order_stream::OrderSession,
+    history: crate::history_session::HistorySession,
+    order_only_seen: bool,
     owner_reject: OwnerRejectSubscription,
     owner_reject_owners: Vec<Pubkey>,
     cancellation_token: CancellationToken,
@@ -790,6 +842,8 @@ impl ClientSession {
             endpoint,
             filter,
             order: crate::order_stream::OrderSession::default(),
+            history: crate::history_session::HistorySession::default(),
+            order_only_seen: false,
             owner_reject: OwnerRejectSubscription::new(Arc::new(OwnerRejectRegistry::default())),
             owner_reject_owners: Vec::new(),
             cancellation_token,
@@ -1383,6 +1437,10 @@ impl GrpcService {
         broadcast.order_integrity = Arc::new(crate::order_integrity::OrderIntegrity::new(
             config.filter_limits.order.clone(),
         ));
+        broadcast.history = Arc::new(crate::tracked_history::HistoryRegistry::new(
+            config.filter_limits.history.clone(),
+            config.filter_limits.order.max_watchers,
+        ));
         // Deshred subscribers receive their own commitment-free stream.
         let (deshred_broadcast_tx, _) = broadcast::channel(config.channel_capacity);
         let (replay_first_available_slot, replay_stored_slots_tx, replay_stored_slots_rx) =
@@ -1730,6 +1788,7 @@ impl GrpcService {
 
         let mut block_machine = BlockMachineStorage::new(replay_stored_slots as usize);
         block_machine.order_integrity = Some(Arc::clone(&broadcast.order_integrity));
+        block_machine.history = Some(Arc::clone(&broadcast.history));
         const ALL_COMMITMENT_LEVELS: [CommitmentLevel; 3] = [
             CommitmentLevel::Processed,
             CommitmentLevel::Confirmed,
@@ -1776,11 +1835,12 @@ impl GrpcService {
                             solana_commitment_config::CommitmentLevel::Confirmed => CommitmentLevel::Confirmed,
                             solana_commitment_config::CommitmentLevel::Finalized => CommitmentLevel::Finalized,
                         };
+                        if commitment_level == CommitmentLevel::Confirmed { broadcast.history.authoritative((slot_update.slot,slot_update.bank_id)); }
                         // Processed must be sent differently, since processed geyser event were individually sent,
                         // we only need to send Message::Block for block subscriber downstream.
                         // While, confirmed,finalized must be sent in the two flavors: as a stream of individual events and block.
                         if commitment_level != CommitmentLevel::Processed {
-                            let group=if commitment_level==CommitmentLevel::Confirmed && broadcast.order_integrity.has_watchers(){
+                            let group=if commitment_level==CommitmentLevel::Confirmed && (broadcast.order_integrity.has_watchers() || broadcast.history.enabled()){
                                 broadcast.order_integrity.register_bank((slot_update.slot,slot_update.bank_id));
                                 #[cfg(test)] broadcast.order_integrity.revision_bank_scans.fetch_add(1,Ordering::Relaxed);
                                 Some(crate::order_stream::GroupBoundary::Begin(crate::order_stream::BankGroup::from_frozen(&frozen_block,&broadcast.order_integrity.limits)))
@@ -1813,7 +1873,7 @@ impl GrpcService {
 
                         let slot_message_singleton_vec = Arc::new(vec![slot_message]);
                         for commitment_level in ALL_COMMITMENT_LEVELS {
-                            let group = (broadcast.order_integrity.has_watchers() && commitment_level == CommitmentLevel::Confirmed && slot_update.commitment == solana_commitment_config::CommitmentLevel::Confirmed).then_some(crate::order_stream::GroupBoundary::End { slot: slot_update.slot, bank_id: slot_update.bank_id });
+                            let group = ((broadcast.order_integrity.has_watchers() || broadcast.history.enabled()) && commitment_level == CommitmentLevel::Confirmed && slot_update.commitment == solana_commitment_config::CommitmentLevel::Confirmed).then_some(crate::order_stream::GroupBoundary::End { slot: slot_update.slot, bank_id: slot_update.bank_id });
                             broadcast.send_group(commitment_level, Arc::clone(&slot_message_singleton_vec), group);
                         }
                     }
@@ -1990,7 +2050,20 @@ impl GrpcService {
                 }
             };
         }
+        macro_rules! h_step {
+            ($step:expr) => {
+                if let Err(error) = session.order.check_watch().and_then(|()| $step) {
+                    log::warn!("tracked_account_history_v1 stopped: {error}");
+                    if let Err(gap_error) = session.history.fail_error(&error, &mut b_send) {
+                        log::warn!("tracked history gap pending: {gap_error}");
+                    }
+                }
+            };
+        }
         'outer: loop {
+            if session.history.has_failed() {
+                b_queue.cancel_history_data();
+            }
             if session.order.ever_requested() {
                 b_queue.flush();
             }
@@ -2002,14 +2075,16 @@ impl GrpcService {
 
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
-                    if session.order.ever_requested(){b_step!(session.order.fail(yellowstone_grpc_proto::prelude::OrderGapReason::Shutdown,None,"server shutdown", &mut b_send));}
+                    if session.history.ever { h_step!(session.history.fail_with(yellowstone_grpc_proto::prelude::OrderGapReason::Shutdown,"server shutdown", &mut b_send)); }
+                    else if session.order.ever_requested(){b_step!(session.order.fail(yellowstone_grpc_proto::prelude::OrderGapReason::Shutdown,None,"server shutdown", &mut b_send));}
                     info!("client #{}: cancelled", session.subscriber_id);
                     let _ = stream_tx.try_send(Err(Status::unavailable("server is shutting down try again later")));
                     session.disconnect_reason = "server_shutdown";
                     break 'outer;
                 }
                 _ = async {match b_deadline.as_mut(){Some(timer)=>{timer.tick().await;},None=>std::future::pending::<()>().await}} => {
-                    b_step!(session.order.check_deadline(&mut b_send));
+                    if session.history.ever { h_step!(session.history.tick(&mut b_send)); }
+                    else { b_step!(session.order.check_deadline(&mut b_send)); }
                 }
                 mut message = async {
                     if let Some(message) = deferred_request.take() {Some(message)} else {client_rx.recv().await}
@@ -2042,6 +2117,13 @@ impl GrpcService {
                             let order_source=filter_new.order_source.clone();
                             let pending_conflict=session.order.has_pending();
                             if let Some(raw)=order_source.as_ref() {
+                                if crate::history_protocol::has_control(raw) { b_queue.enable_history(&broadcast.history); }
+                                if raw.order_writes.is_some() && raw.tracked_account_history.is_none() { session.order_only_seen=true; }
+                                if (raw.order_close.is_some() || raw.tracked_history_close.is_some()) && (session.history.ever || crate::history_protocol::has_control(raw)) {
+                                        if let Some(error)=wire_error.as_ref() { h_step!(session.history.reject(raw,error,&mut b_send)); }
+                                        else { h_step!(session.history.close(raw,&broadcast.callback_watermark,&mut b_send)); }
+                                        continue;
+                                }
                                 if raw.order_writes.is_some() && raw.ping.is_some() {
                                     let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,"B control cannot carry ping"));
                                     if let Some(ping)=&raw.ping {let _=stream_tx.try_send(Ok(FilteredUpdate::new_empty(FilteredUpdateOneof::pong(ping.id))));}
@@ -2053,7 +2135,8 @@ impl GrpcService {
                                     }else{b_step!(session.order.close(raw, &mut b_send));}
                                     continue;
                                 }
-                                if session.order.ever_requested(){b_step!(session.order.coverage_changed(raw, &mut b_send));}
+                                if session.history.ever { h_step!(session.history.coverage_changed(raw,&mut b_send)); }
+                                else if session.order.ever_requested(){b_step!(session.order.coverage_changed(raw, &mut b_send));}
                             }
                             let watch_ready=if filter_new.has_order_control() {
                                 match session.order.register_watch(&broadcast.order_integrity) {
@@ -2090,8 +2173,14 @@ impl GrpcService {
                             if session.order.has_pending(){
                                 if let Some(owner)=owner_ack.as_ref(){b_step!(session.order.refresh_pending_owner(owner));}
                             }
-                            if let Some(raw)=order_source.as_ref().filter(|r|r.order_writes.is_some() && watch_ready) {
-                                if pending_conflict {
+                            if let Some(raw)=order_source.as_ref().filter(|r| (r.order_writes.is_some() || crate::history_protocol::has_control(r)) && watch_ready) {
+                                if session.history.ever || crate::history_protocol::has_control(raw) {
+                                    b_queue.enable_history(&broadcast.history);
+                                    if session.order_only_seen { h_step!(session.history.reject(raw,"cannot add history to an order-only coverage chain",&mut b_send)); }
+                                    else if let Some(error)=wire_error.as_ref() { h_step!(session.history.reject(raw,error,&mut b_send)); }
+                                    else if let Some(owner)=owner_ack.as_ref() { h_step!(session.history.request(raw,owner,&broadcast.history,&broadcast.callback_watermark,&broadcast.order_integrity.limits,&mut b_send)); }
+                                    else { h_step!(session.history.reject(raw,"actual owner ack missing",&mut b_send)); }
+                                } else if pending_conflict {
                                     let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::PendingExists,"another B scope was pending when this request arrived"));
                                 }else if let Some(error)=wire_error.as_ref() {
                                     let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::InvalidRequest,error));
@@ -2209,11 +2298,12 @@ impl GrpcService {
                         }
                     };
 
-                    if session.order.ever_requested(){
+                    if session.order.ever_requested() && !session.history.ever {
                         if let Some(late)=&messages.late {for bank in late.iter(){b_step!(session.order.late(*bank,&mut b_send));}}
                     }
                     if let Some(crate::order_stream::GroupBoundary::Begin(bank))=messages.group.as_ref().filter(|_|session.order.ever_requested()) {
-                        b_step!(session.order.begin(bank.clone(), &mut b_send));
+                        if session.history.ever { h_step!(session.history.begin(bank.clone(), &mut b_send)); }
+                        else { b_step!(session.order.begin(bank.clone(), &mut b_send)); }
                     }
                     for message in messages.iter() {
                         let sealed_block = if held_banks.is_empty() {
@@ -2250,7 +2340,10 @@ impl GrpcService {
                         });
                         match sent {
                             Ok(()) => {
-                                if let Some(updates)=&updates{b_step!(session.order.observe_sent(message, updates, &mut b_send));}
+                                if let Some(updates)=&updates {
+                                    if session.history.ever { h_step!(session.history.observe_sent(message,updates,&b_queue,&mut b_send)); }
+                                    else { b_step!(session.order.observe_sent(message, updates, &mut b_send)); }
+                                }
                             }
                             Err(TrySendFailure::Full) => {
                                 error!("client #{}: lagged to send an update", session.subscriber_id);
@@ -2268,7 +2361,8 @@ impl GrpcService {
                         }
                     }
                     if let Some(crate::order_stream::GroupBoundary::End {slot,bank_id})=messages.group.as_ref().filter(|_|session.order.ever_requested()) {
-                        b_step!(session.order.end(*slot,*bank_id,broadcast.callback_watermark.load(Ordering::SeqCst), &mut b_send));
+                        if session.history.ever { h_step!(session.history.end((*slot,*bank_id),&mut b_send)); }
+                        else { b_step!(session.order.end(*slot,*bank_id,broadcast.callback_watermark.load(Ordering::SeqCst), &mut b_send)); }
                     }
                 }
             }
@@ -2299,10 +2393,14 @@ impl GrpcService {
                     match maybe {
                         Some(Some((_from_slot, mut filter_new))) => {
                             let _admission=filter_new.order_admission.take();
-                            if let Some(raw)=filter_new.order_source.as_ref().filter(|r|r.order_writes.is_some() || r.order_close.is_some()) {
-                                let rejected=session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::ScopeCoverageInvalid,"B startup snapshot unsupported");
-                                if b_queue.send(rejected).is_err(){log::warn!("B startup rejection could not be queued");}
-                                if raw.order_close.is_some() || raw.ping.is_some(){continue;}
+                            if let Some(raw)=filter_new.order_source.as_ref().filter(|r|r.order_writes.is_some() || r.order_close.is_some() || crate::history_protocol::has_control(r)) {
+                                if crate::history_protocol::has_control(raw) {
+                                    if let Err(error)=session.history.reject(raw,"B startup snapshot unsupported",&mut |update|b_queue.send(update)) {log::warn!("history startup rejection could not be queued: {error}");}
+                                } else {
+                                    let rejected=session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::ScopeCoverageInvalid,"B startup snapshot unsupported");
+                                    if b_queue.send(rejected).is_err(){log::warn!("B startup rejection could not be queued");}
+                                }
+                                if raw.order_close.is_some() || raw.tracked_history_close.is_some() || raw.ping.is_some(){continue;}
                             }
                             if let Some(msg) = filter_new.get_pong_msg() {
                                 if stream_tx.send(Ok(msg)).await.is_err() {
@@ -2759,14 +2857,14 @@ impl Geyser for GrpcService {
                     message = request.get_mut().message() => match message {
                         Ok(Some(envelope)) => {
                             let request=envelope.request;
-                            let admission=if request.order_writes.is_some() || request.order_close.is_some(){
+                            let admission=if request.order_writes.is_some() || request.order_close.is_some() || crate::history_protocol::has_control(&request){
                                 match tokio::select! {
                                     _=incoming_cancellation_token.cancelled()=>break,
                                     permit=Arc::clone(order_admission.get_or_insert_with(||Arc::new(Semaphore::new(1)))).acquire_owned()=>permit,
                                 } {Ok(permit)=>Some(Arc::new(permit)),Err(_)=>break}
                             }else{None};
                             let wire_error=envelope.order_wire_error.or_else(|| (x_request_snapshot && request.order_writes.is_some()).then(||"B startup snapshot unsupported".to_owned()));
-                            if request.order_close.is_some() || (request.order_writes.is_some() && request.ping.is_some()) {
+                            if request.order_close.is_some() || request.tracked_history_close.is_some() || (request.order_writes.is_some() && request.ping.is_some()) {
                                 let mut filter=Filter::order_control(request);filter.order_wire_error=wire_error;filter.order_admission=admission;
                                 if incoming_client_tx.send(Some((None, filter))).is_err() { break; }
                                 continue;

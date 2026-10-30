@@ -193,13 +193,22 @@ impl WeightScales {
 
 pub type FilteredUpdates = SmallVec<[FilteredUpdate; 2]>;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct FilteredUpdate {
+    pub(crate) history_lease: Option<Arc<crate::tracked_history::RetentionLease>>,
+    pub(crate) deferred_credit: Option<Arc<crate::util::stream::DeferredCredit>>,
     pub filters: FilteredUpdateFilters,
     pub message: FilteredUpdateOneof,
     pub created_at: Timestamp,
 }
 
+impl PartialEq for FilteredUpdate {
+    fn eq(&self, other: &Self) -> bool {
+        self.filters == other.filters
+            && self.message == other.message
+            && self.created_at == other.created_at
+    }
+}
 impl prost::Message for FilteredUpdate {
     fn encode_raw(&self, buf: &mut impl BufMut) {
         if let FilteredUpdateOneof::Order(update) = &self.message {
@@ -249,6 +258,8 @@ impl FilteredUpdate {
             filters,
             message,
             created_at,
+            history_lease: None,
+            deferred_credit: None,
         }
     }
 
@@ -1847,6 +1858,8 @@ pub mod tests {
     #[cfg(test)]
     fn encode_decode_cmp(filters: &[&str], message: FilteredUpdateOneof) {
         let msg = FilteredUpdate {
+            history_lease: None,
+            deferred_credit: None,
             filters: create_message_filters(filters),
             message,
             created_at: Timestamp::from(SystemTime::now()),

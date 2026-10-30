@@ -247,9 +247,11 @@ impl Filter {
         }
     }
     pub(crate) fn has_order_control(&self) -> bool {
-        self.order_source
-            .as_ref()
-            .is_some_and(|r| r.order_writes.is_some() || r.order_close.is_some())
+        self.order_source.as_ref().is_some_and(|r| {
+            r.order_writes.is_some()
+                || r.order_close.is_some()
+                || crate::history_protocol::has_control(r)
+        })
     }
     pub fn new(
         config: &SubscribeRequest,
@@ -267,8 +269,10 @@ impl Filter {
         Ok(Self {
             order_admission: None,
             order_wire_error: None,
-            order_source: (config.order_writes.is_some() || config.order_close.is_some())
-                .then(|| Arc::new(config.clone())),
+            order_source: (config.order_writes.is_some()
+                || config.order_close.is_some()
+                || crate::history_protocol::has_control(config))
+            .then(|| Arc::new(config.clone())),
             accounts: FilterAccounts::new(&config.accounts, &limits.accounts, names)?,
             slots: FilterSlots::new(&config.slots, &limits.slots, names)?,
             transactions: FilterTransactions::new(
@@ -2732,6 +2736,8 @@ mod tests {
         let filter = create(SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             transactions: HashMap::from([(name(), Default::default())]),
             transactions_status: HashMap::from([(
                 name(),
@@ -2774,6 +2780,8 @@ mod tests {
         let filter = create(SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             entry: HashMap::from([(name(), Default::default())]),
             ..Default::default()
         });
@@ -2784,6 +2792,8 @@ mod tests {
         let filter = create(SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             slots: HashMap::from([(name(), Default::default())]),
             ..Default::default()
         });
@@ -2935,6 +2945,8 @@ mod tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -2972,6 +2984,8 @@ mod tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -3014,6 +3028,8 @@ mod tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3055,6 +3071,8 @@ mod tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3102,6 +3120,8 @@ mod tests {
         let mut config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3173,6 +3193,8 @@ mod tests {
         let mut config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3244,6 +3266,8 @@ mod tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3301,6 +3325,8 @@ mod tests {
         let mut config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3526,6 +3552,8 @@ mod tests {
         let request = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             entry: HashMap::from([
                 ("plain".to_owned(), SubscribeRequestFilterEntry::default()),
                 (
@@ -3916,6 +3944,8 @@ mod tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts: HashMap::new(),
             slots: HashMap::new(),
@@ -3949,6 +3979,8 @@ mod tests {
             &SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 slots,
                 ..Default::default()
             },
@@ -4005,6 +4037,8 @@ mod tests {
         let request = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             accounts: accounts.clone(),
             ..Default::default()
         };
@@ -4087,6 +4121,8 @@ mod tests {
             &SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 accounts: HashMap::from([(
                     "single".to_owned(),
                     SubscribeRequestFilterAccounts {
@@ -4343,6 +4379,8 @@ mod account_filter_regression_tests {
             &SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 accounts,
                 ..Default::default()
             },
@@ -5087,6 +5125,8 @@ mod parity_oracle {
             request: SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 accounts,
                 ..Default::default()
             },
@@ -5273,6 +5313,8 @@ mod filter_kind_coverage {
         SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             slots: HashMap::from([(
                 "s".to_owned(),
                 SubscribeRequestFilterSlots {
@@ -5340,6 +5382,8 @@ mod filter_kind_coverage {
         let filter = build(SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             entry: HashMap::from([("e".to_owned(), SubscribeRequestFilterEntry::default())]),
             ..Default::default()
         });
@@ -5357,6 +5401,8 @@ mod filter_kind_coverage {
         let filter = build(SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             blocks_meta: HashMap::from([
                 ("a".to_owned(), SubscribeRequestFilterBlocksMeta {}),
                 ("b".to_owned(), SubscribeRequestFilterBlocksMeta {}),
@@ -5380,6 +5426,8 @@ mod filter_kind_coverage {
         let filter = build(SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: HashMap::from([
                 ("a".to_owned(), SubscribeRequestFilterBlockFooter::default()),
                 ("b".to_owned(), SubscribeRequestFilterBlockFooter::default()),
@@ -5438,6 +5486,8 @@ mod filter_kind_coverage {
                 let request = SubscribeRequest {
                     order_writes: None,
                     order_close: None,
+                    tracked_account_history: None,
+                    tracked_history_close: None,
                     block_footer: settings
                         .iter()
                         .map(|(name, include_certificates)| {
@@ -5498,6 +5548,8 @@ mod filter_kind_coverage {
         let filter = build(SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             blocks_meta: HashMap::from([("a".to_owned(), SubscribeRequestFilterBlocksMeta {})]),
             ..Default::default()
         });
@@ -5520,6 +5572,8 @@ mod filter_kind_coverage {
         SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             blocks: HashMap::from([(
                 "b".to_owned(),
                 SubscribeRequestFilterBlocks {
@@ -5800,6 +5854,8 @@ mod cuckoo_tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -5864,6 +5920,8 @@ mod cuckoo_tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -5920,6 +5978,8 @@ mod cuckoo_tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -5980,6 +6040,8 @@ mod cuckoo_tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             block_footer: Default::default(),
             accounts,
             slots: HashMap::new(),
@@ -6176,6 +6238,8 @@ mod cuckoo_tests {
             let config = SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -6719,6 +6783,8 @@ mod cuckoo_tests {
             let config = SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -6768,6 +6834,8 @@ mod cuckoo_tests {
             let config = SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -6813,6 +6881,8 @@ mod cuckoo_tests {
             let config = SubscribeRequest {
                 order_writes: None,
                 order_close: None,
+                tracked_account_history: None,
+                tracked_history_close: None,
                 block_footer: Default::default(),
                 accounts: HashMap::new(),
                 slots: HashMap::new(),
@@ -7035,6 +7105,8 @@ mod owner_reject_tests {
         SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             accounts: HashMap::from([(
                 "explicit".to_owned(),
                 SubscribeRequestFilterAccounts {
@@ -7178,6 +7250,8 @@ mod owner_reject_tests {
         let config = SubscribeRequest {
             order_writes: None,
             order_close: None,
+            tracked_account_history: None,
+            tracked_history_close: None,
             blocks: HashMap::from([(
                 "block".to_owned(),
                 SubscribeRequestFilterBlocks {

@@ -430,6 +430,7 @@ impl<'storage> Iterator for ReplayIter<'storage> {
 /// are still being resolved; the moment any commitment status update names a `bank_id` as
 /// the canonical bank for its slot, every sibling buffer for that slot is discarded.
 pub struct BlockMachineStorage {
+    pub(crate) history: Option<Arc<crate::tracked_history::HistoryRegistry>>,
     pub(crate) order_integrity: Option<Arc<crate::order_integrity::OrderIntegrity>>,
     // Bank instances still accumulating content, keyed by bank_id.
     banks: FoldHashMap<BankId, BankBuffer>,
@@ -487,6 +488,7 @@ impl BlockMachineStorage {
     pub fn new(replayed_capacity: usize) -> Self {
         Self {
             order_integrity: None,
+            history: None,
             banks: FoldHashMap::with_capacity(replayed_capacity),
             slot_to_banks: FoldHashMap::with_capacity(replayed_capacity),
             discarded_bank_ids: FoldHashMap::new(),
@@ -505,6 +507,9 @@ impl BlockMachineStorage {
     }
 
     pub fn add(&mut self, message: Message) {
+        if let Some(history) = &self.history {
+            history.observe_source(&message);
+        }
         self.observe_slot(message.get_slot());
         match message {
             Message::Slot(message_slot) => {
@@ -568,6 +573,9 @@ impl BlockMachineStorage {
             .copied()
             .filter(|&slot| slot < cutoff && !self.replayed_slot.contains_key(&slot))
             .collect();
+        if let Some(history) = &self.history {
+            history.gc(cutoff);
+        }
         for slot in stale_slots {
             if let Some(bank_ids) = self.slot_to_banks.remove(&slot) {
                 for bank_id in bank_ids {
@@ -924,6 +932,9 @@ impl BlockMachineStorage {
         if bank.try_seal().is_ok() {
             let bank = self.banks.remove(&bank_id).expect("just verified present");
             let slot = bank.slot;
+            if let Some(history) = &self.history {
+                history.fence((slot, bank_id));
+            }
             let frozen = Arc::new(bank.seal());
             self.on_bank_sealed(slot, bank_id, frozen);
         }
@@ -1069,6 +1080,9 @@ impl BlockMachineStorage {
             .banks
             .entry(bank_id)
             .or_insert_with(|| BankBuffer::new(bank_id, slot));
+        if let (Some(history), Message::Account(account)) = (&self.history, &message) {
+            history.retain(account);
+        }
         bank.add_event(message);
         self.try_seal_bank(bank_id);
     }
@@ -2424,6 +2438,91 @@ mod tests {
                 .expect("sticky revocation")
                 .contains(&(10, 7)),
             "forgetting the replay bank must not forget the identity previously promised to B"
+        );
+    }
+    #[test]
+    fn tracked_account_history_v1_pre_created_versions_survive_without_changing_legacy_dedup() {
+        use crate::plugin::filter::{fixtures, limits::FilterLimits, Filter};
+        use prost::Message as _;
+        use yellowstone_grpc_proto::prelude::{
+            OrderKeyCoverage, SubscribeRequest, SubscribeRequestFilterAccounts,
+        };
+        let key = Pubkey::new_from_array([1; 32]);
+        let registry = Arc::new(crate::tracked_history::HistoryRegistry::default());
+        let (watch, plan) = registry
+            .register(
+                vec![OrderKeyCoverage {
+                    pubkey: key.to_bytes().to_vec(),
+                    active_from_slot: None,
+                    owner_exempt_active_from_slot: Some(0),
+                }],
+                99,
+            )
+            .expect("history register");
+        let mut off = BlockMachineStorage::new(10);
+        let mut on = BlockMachineStorage::new(10);
+        on.history = Some(Arc::clone(&registry));
+        let mut inputs = vec![make_account_msg(100, 100, key, 1)];
+        for pubkey in MUST_HAVE_SYSVAR_ACCOUNTS {
+            inputs.push(make_account_msg(100, 100, pubkey, 1));
+        }
+        inputs.extend([
+            make_created_bank_msg(100, Some(99), 100),
+            make_account_msg(100, 100, key, 2),
+            make_block_meta_msg(100, 99, 100),
+            make_commitment_msg(100, Some(99), SlotStatus::Processed, 100),
+        ]);
+        for input in inputs {
+            let (bank, key, data) = match &input {
+                Message::Account(a) => (a.bank_id, Some(a.account.pubkey.to_bytes()), true),
+                Message::Slot(s) => (s.bank_id, None, false),
+                Message::BlockMeta(m) => (Some(m.bank_id), None, true),
+                _ => panic!("fixture source kind"),
+            };
+            let mut ingress = registry.enter(input.get_slot(), bank, key, false, false, data);
+            if let Message::Account(account) = &input {
+                ingress.attach(account);
+            }
+            drop(ingress);
+            off.add(input.clone());
+            on.add(input);
+        }
+        let (_, a) = off.pop_ready_block().expect("legacy processed bank");
+        let (_, b) = on.pop_ready_block().expect("history processed bank");
+        assert_eq!(a.get_message_block().updated_account_count, 5);
+        assert_eq!(b.get_message_block().updated_account_count, 5);
+        let request = SubscribeRequest {
+            accounts: std::collections::HashMap::from([(
+                "a".into(),
+                SubscribeRequestFilterAccounts {
+                    account: vec![key.to_string()],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let filter = Filter::new(
+            &request,
+            &FilterLimits::default(),
+            &mut fixtures::filter_names(),
+        )
+        .expect("A filter");
+        let wire = |f: &FrozenBank| {
+            f.messages()
+                .iter()
+                .flat_map(|m| filter.get_updates(m, None))
+                .map(|u| u.encode_to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(wire(&a), wire(&b));
+        let (versions, count) = watch.versions((100, 100), &plan).expect("full history");
+        assert_eq!(count, 2);
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| v.account.account.write_version)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
         );
     }
 }

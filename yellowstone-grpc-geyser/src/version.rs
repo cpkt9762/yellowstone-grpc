@@ -9,6 +9,7 @@ pub struct Version {
     pub git_sha: &'static str,
     pub proto_schema_sha256: &'static str,
     pub capabilities: [OrderCapabilityJson; 1],
+    pub history_capabilities: [HistoryCapabilityJson; 1],
     pub git: &'static str,
     pub rustc: &'static str,
     pub buildts: &'static str,
@@ -22,6 +23,7 @@ pub const VERSION: Version = Version {
     git_sha: env!("ORDER_GIT_SHA"),
     proto_schema_sha256: env!("ORDER_PROTO_SHA256"),
     capabilities: [ORDER_CAPABILITY],
+    history_capabilities: [HISTORY_CAPABILITY],
     git: env!("GIT_VERSION"),
     rustc: env!("VERGEN_RUSTC_SEMVER"),
     buildts: env!("VERGEN_BUILD_TIMESTAMP"),
@@ -79,8 +81,43 @@ mod tracked_account_history_v1 {
     #[test]
     fn advertises_exact_history_capability() {
         let value = serde_json::to_value(&super::VERSION).expect("version JSON");
-        assert_eq!(value["history_capabilities"][0]["name"], "tracked_account_history_v1");
-        assert_eq!(value["history_capabilities"][0]["semantics"], "committed_store_all_v1");
-        assert_eq!(value["history_capabilities"][0]["legacy_projection_unchanged"], true);
+        assert_eq!(
+            value["history_capabilities"][0]["name"],
+            "tracked_account_history_v1"
+        );
+        assert_eq!(
+            value["history_capabilities"][0]["semantics"],
+            "committed_store_all_v1"
+        );
+        assert_eq!(
+            value["history_capabilities"][0]["legacy_projection_unchanged"],
+            true
+        );
     }
 }
+
+#[derive(Debug, Serialize)]
+pub struct HistoryCapabilityJson {
+    name: &'static str,
+    protocol_version: u32,
+    commitment: i32,
+    encoder_profile: &'static str,
+    bank_scoped: bool,
+    zero_write_seals: bool,
+    rollback_included: bool,
+    null_writer_preserved: bool,
+    legacy_projection_unchanged: bool,
+    semantics: &'static str,
+}
+pub const HISTORY_CAPABILITY: HistoryCapabilityJson = HistoryCapabilityJson {
+    name: "tracked_account_history_v1",
+    protocol_version: 1,
+    commitment: 1,
+    encoder_profile: "prost_tracked_history_v1",
+    bank_scoped: true,
+    zero_write_seals: true,
+    rollback_included: true,
+    null_writer_preserved: true,
+    legacy_projection_unchanged: true,
+    semantics: "committed_store_all_v1",
+};
