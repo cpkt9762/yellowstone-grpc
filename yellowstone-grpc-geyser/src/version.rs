@@ -73,3 +73,14 @@ pub const ORDER_CAPABILITY: OrderCapabilityJson = OrderCapabilityJson {
     zero_write_seals: true,
     full_target_unchanged: true,
 };
+
+#[cfg(test)]
+mod tracked_account_history_v1 {
+    #[test]
+    fn advertises_exact_history_capability() {
+        let value = serde_json::to_value(&super::VERSION).expect("version JSON");
+        assert_eq!(value["history_capabilities"][0]["name"], "tracked_account_history_v1");
+        assert_eq!(value["history_capabilities"][0]["semantics"], "committed_store_all_v1");
+        assert_eq!(value["history_capabilities"][0]["legacy_projection_unchanged"], true);
+    }
+}
