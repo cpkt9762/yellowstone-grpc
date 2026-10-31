@@ -928,6 +928,112 @@ mod tracked_account_history_v1 {
             r.retain(a);
         }
     }
+    // Two rounds stress one shared Bank and four independent Banks. Account
+    // admission is independent of slot / transaction / entry callback guards.
+    #[test]
+    fn concurrent_ingress_preserves_counts_zero_bank_a_bytes_and_real_late() {
+        use std::{sync::Barrier, thread};
+        use crate::plugin::filter::{Filter, limits::FilterLimits};
+        use prost::Message;
+        use yellowstone_grpc_proto::prelude::{SubscribeRequest, SubscribeRequestFilterAccounts};
+        let r = Arc::new(HistoryRegistry::default());
+        let keys = (1..=2).map(|key| OrderKeyCoverage {
+            pubkey: vec![key; 32], active_from_slot: None,
+            owner_exempt_active_from_slot: Some(0),
+        }).collect();
+        let (w, p) = r.register(keys, 99).expect("two-key registration");
+        let disabled = Arc::new(HistoryRegistry::default());
+        let barrier = Arc::new(Barrier::new(16));
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for worker in 0..16u64 {
+                let (r, disabled, barrier) = (Arc::clone(&r), Arc::clone(&disabled), Arc::clone(&barrier));
+                handles.push(scope.spawn(move || {
+                    let request = SubscribeRequest {
+                        accounts: std::collections::HashMap::from([(String::from("accounts"), SubscribeRequestFilterAccounts::default())]),
+                        ..Default::default()
+                    };
+                    let filter = Filter::new(&request, &FilterLimits::default(), &mut fixtures::filter_names()).expect("A filter");
+                    for round in 0..2u64 {
+                        let slot = if round == 0 { 100 } else { 101 + worker % 4 };
+                        for index in 0..32u64 {
+                            let mut a = account(worker * 64 + round * 32 + index);
+                            let raw = Arc::make_mut(&mut a);
+                            raw.slot = slot;
+                            raw.bank_id = Some(slot + 1000);
+                            raw.account.pubkey = Pubkey::new_from_array([1 + (worker % 2) as u8; 32]);
+                            barrier.wait();
+                            let mut guard = r.enter(slot, a.bank_id, Some(a.account.pubkey.to_bytes()), false, false, true);
+                            let mut control = disabled.enter(slot, a.bank_id, Some(a.account.pubkey.to_bytes()), false, false, true);
+                            guard.attach(&a);
+                            control.attach(&a);
+                            // The same callback reaches ordinary A with either registry.
+                            let message = SourceMessage::Account(Arc::clone(&a));
+                            let wire = || filter.get_updates(&message, None).iter().map(Message::encode_to_vec).collect::<Vec<_>>();
+                            let expected = wire();
+                            r.retain(&a);
+                            disabled.retain(&a);
+                            assert_eq!(wire(), expected, "history cannot change A bytes");
+                            drop((guard, control));
+                            for (data, authoritative) in [(false, false), (true, false), (true, false)] {
+                                drop(r.enter(slot, a.bank_id, None, false, authoritative, data));
+                            }
+                        }
+                    }
+                }));
+            }
+            for handle in handles { handle.join().expect("parallel callbacks"); }
+        });
+        w.check().expect("normal callback contention is not a failure");
+        let mut ordinals = BTreeSet::new();
+        for slot in 100..=104 {
+            r.fence((slot, slot + 1000));
+            let (v, count) = w.versions((slot, slot + 1000), &p).expect("all admitted versions");
+            let expected = if slot == 100 { 512 } else { 128 };
+            assert_eq!((v.len(), count), (expected, expected as u64));
+            for key in 1..=2 {
+                let expected_key = if slot == 100 { 256 } else if key == 1 + ((slot - 101) % 2) as u8 { 128 } else { 0 };
+                assert_eq!(v.iter().filter(|v| v.account.account.pubkey.to_bytes() == [key; 32]).count(), expected_key);
+            }
+            for version in v { assert!(ordinals.insert(version.ordinal), "unique callback ordinal"); }
+        }
+        drop(r.enter(105, Some(1105), None, false, false, false));
+        r.fence((105, 1105));
+        let (v, n) = w.versions((105, 1105), &p).expect("zero-write Bank seal");
+        assert!(v.is_empty()); assert_eq!(n, 0);
+        w.check().expect("all normal seals");
+        enqueue(&r, &{let mut a = account(9999); Arc::make_mut(&mut a).bank_id = Some(1100); a}, true);
+        assert!(w.check().is_err(), "a new callback after the fence revokes the run");
+    }
+    #[test]
+    fn concurrent_ingress_fence_defers_callback_tail_without_false_late() {
+        use std::{sync::Barrier, thread};
+        let (r, w, p) = setup();
+        let entered = Arc::new(Barrier::new(17));
+        let release = Arc::new(Barrier::new(17));
+        thread::scope(|scope| {
+            for worker in 0..16u64 {
+                let (r, entered, release) = (Arc::clone(&r), Arc::clone(&entered), Arc::clone(&release));
+                scope.spawn(move || {
+                    let a = account(worker);
+                    let mut guard = r.enter(100, Some(100), Some([1; 32]), false, false, true);
+                    guard.attach(&a);
+                    r.retain(&a);
+                    entered.wait(); release.wait(); drop(guard);
+                });
+            }
+            entered.wait();
+            r.fence((100, 100));
+            let checked = w.check();
+            let pending = w.versions((100, 100), &p);
+            release.wait();
+            checked.expect("an admitted callback tail is not late");
+            assert!(pending.is_err(), "no output while ingress is active");
+        });
+        let (v, n) = w.versions((100, 100), &p).expect("seal after callback tails retire");
+        assert_eq!((v.len(), n), (16, 16));
+        w.check().expect("no false late evidence");
+    }
     #[test]
     fn independent_count_detects_queue_or_decoder_drop() {
         let (r, w, p) = setup();
