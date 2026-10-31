@@ -214,11 +214,20 @@ impl Drop for DeferredCredit {
 ///
 /// It can be cloned freely, every clone shares the same capacity and weighs items with its own
 /// clone of the [`Weigher`] `W`.
+#[cfg(test)]
+#[derive(Debug)]
+struct PublicationPause {
+    after_send: bool,
+    entered: std::sync::Barrier,
+    resume: std::sync::Barrier,
+}
 pub struct LoadAwareSender<T, W> {
     shared: Arc<Shared>,
     inner: UnboundedSender<(QueueCredit, T)>,
     independent: bool,
     weigher: W,
+    #[cfg(test)]
+    publication_pause: Option<Arc<PublicationPause>>,
 }
 
 impl<T, W> fmt::Debug for LoadAwareSender<T, W> {
@@ -236,6 +245,8 @@ impl<T, W: Clone> Clone for LoadAwareSender<T, W> {
             inner: self.inner.clone(),
             independent: self.independent,
             weigher: self.weigher.clone(),
+            #[cfg(test)]
+            publication_pause: self.publication_pause.clone(),
         }
     }
 }
@@ -308,6 +319,8 @@ where
         inner: inner_sender,
         independent: false,
         weigher,
+        #[cfg(test)]
+        publication_pause: None,
     };
 
     let rx = LoadAwareReceiver {
@@ -334,6 +347,12 @@ where
         self.shared
             .prioritize_primary
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+    #[cfg(test)]
+    fn pause_publication(&self, after_send: bool) {
+        if let Some(pause) = &self.publication_pause {
+            if pause.after_send == after_send {pause.entered.wait();pause.resume.wait();}
+        }
     }
     pub fn reserve_independent(&self, weight: usize) -> Result<DeferredCredit, &'static str> {
         if !self.independent || weight > self.shared.capacity {
@@ -369,11 +388,16 @@ where
             weight: credit.weight,
             independent: credit.owner.take(),
         };
-        self.inner.send((queued, item)).map_err(|e| {
+        #[cfg(test)]
+        self.pause_publication(false);
+        let result = self.inner.send((queued, item)).map_err(|e| {
             let (credit, item) = e.0;
             credit.release(&self.shared);
             TrySendError::Closed(item)
-        })
+        });
+        #[cfg(test)]
+        self.pause_publication(true);
+        result
     }
     fn queue_credit(&self, weight: u32) -> QueueCredit {
         let independent = if self.independent {
@@ -438,11 +462,16 @@ where
         };
         let credit = self.queue_credit(weight);
         permit.forget();
-        self.inner.send((credit, item)).map_err(|err| {
+        #[cfg(test)]
+        self.pause_publication(false);
+        let result = self.inner.send((credit, item)).map_err(|err| {
             let (credit, item) = err.0;
             credit.release(&self.shared);
             SendError(item)
-        })
+        });
+        #[cfg(test)]
+        self.pause_publication(true);
+        result
     }
 
     /// Independent credit pool, sharing exactly the same ordered mpsc queue.
@@ -466,6 +495,8 @@ where
             inner: self.inner.clone(),
             independent: true,
             weigher: self.weigher.clone(),
+            #[cfg(test)]
+            publication_pause: self.publication_pause.clone(),
         })
     }
 
@@ -482,11 +513,16 @@ where
         };
         let credit = self.queue_credit(weight);
         permit.forget();
-        self.inner.send((credit, item)).map_err(|err| {
+        #[cfg(test)]
+        self.pause_publication(false);
+        let result = self.inner.send((credit, item)).map_err(|err| {
             let (credit, item) = err.0;
             credit.release(&self.shared);
             TrySendError::Closed(item)
-        })
+        });
+        #[cfg(test)]
+        self.pause_publication(true);
+        result
     }
 
     /// Strict admission for B: never clamp a message larger than its byte budget.
@@ -1028,6 +1064,47 @@ mod order_writes_v1 {
 #[cfg(test)]
 mod tracked_account_history_v1 {
     use super::*;
+    struct WakeProbe(std::sync::atomic::AtomicUsize);
+    impl futures::task::ArcWake for WakeProbe {
+        fn wake_by_ref(this: &Arc<Self>) {this.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);}
+    }
+    async fn controlled_publication(after_send: bool, method: u8) {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
+        let b = a.with_budget(2).expect("B pool");
+        a.prioritize_primary();
+        b.try_send(0).expect("old deferred B");
+        let item = tokio::task::coop::unconstrained(rx.inner.recv()).await.expect("move B to deferred without releasing credit");
+        rx.deferred.push_back(item);
+        let pause = Arc::new(PublicationPause {after_send,entered:std::sync::Barrier::new(2),resume:std::sync::Barrier::new(2)});
+        let mut sender = if after_send {b.clone()} else {a.clone()};
+        sender.publication_pause = Some(Arc::clone(&pause));
+        let probe = Arc::new(WakeProbe(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&probe));
+        let mut cx = Context::from_waker(&waker);
+        let pending = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                if method == 0 {sender.try_send(1).expect("controlled synchronous send");}
+                else if method == 1 {tokio::runtime::Builder::new_current_thread().build().expect("sender runtime").block_on(sender.send(1)).expect("controlled async send");}
+                else {let credit=sender.reserve_independent(1).expect("prepaid B credit");sender.try_send_prepaid(1,credit).expect("controlled prepaid send");}
+            });
+            pause.entered.wait();
+            let pending = matches!(rx.poll_recv(&mut cx),Poll::Pending);
+            pause.resume.wait();writer.join().expect("publisher resumed");pending
+        });
+        assert!(pending,"incomplete publication must yield, never send deferred B");
+        assert!(probe.0.load(std::sync::atomic::Ordering::SeqCst)>0,"publication exit wakes receiver");
+        if !after_send {assert_eq!(rx.recv().await,Some(1),"published A first");assert_eq!(a.current_weight(),0);}
+        assert_eq!(rx.recv().await,Some(0),"deferred B-only progress");
+        if after_send {assert_eq!(rx.recv().await,Some(1),"B publication preserves FIFO");}
+        assert_eq!(b.current_weight(),0);
+        drop((a,b,sender));assert_eq!(rx.recv().await,None,"closure after draining");
+    }
+    #[tokio::test]
+    async fn r3_registered_unpublished_a_defers_b_and_wakes() {controlled_publication(false,0).await;}
+    #[tokio::test]
+    async fn r3_published_b_tail_defers_b_and_wakes() {controlled_publication(true,1).await;}
+    #[tokio::test]
+    async fn r3_prepaid_published_tail_defers_b_and_wakes() {controlled_publication(true,2).await;}
     #[tokio::test]
     async fn r2_a_priority_crosses_coop_budget_and_releases_a_credit() {
         let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());

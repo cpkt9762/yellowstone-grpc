@@ -127,6 +127,8 @@ pub struct HistoryRegistry {
     state: Mutex<State>,
     pub limits: crate::plugin::filter::limits::FilterLimitsHistory,
     max_watchers: usize,
+    #[cfg(test)]
+    fail_cleanup_allocation: AtomicBool,
 }
 impl Default for HistoryRegistry {
     fn default() -> Self {
@@ -150,6 +152,8 @@ impl HistoryRegistry {
             state: Mutex::new(State::default()),
             limits,
             max_watchers,
+            #[cfg(test)]
+            fail_cleanup_allocation: AtomicBool::new(false),
         }
     }
     pub fn reserve(&self, bytes: usize) -> Result<Arc<RetentionLease>> {
@@ -1002,6 +1006,10 @@ impl Drop for HistoryWatch {
     fn drop(&mut self) {
         // Workspace for a bounded index snapshot is allocated outside the lock.
         let mut done = Vec::new();
+        #[cfg(test)]
+        if self.registry.fail_cleanup_allocation.swap(false,Ordering::SeqCst) {
+            self.registry.broken.store(true,Ordering::Release);return;
+        }
         if done.try_reserve_exact(16384).is_err() {
             self.registry.broken.store(true, Ordering::Release);
             return;
@@ -1347,6 +1355,17 @@ mod tracked_account_history_v1 {
     }
     fn live_bytes(r: &HistoryRegistry) -> usize {
         r.budget.used.load(Ordering::Acquire)
+    }
+    #[test]
+    fn r3_cleanup_allocation_failure_never_leaves_orphan_watch() {
+        let (r,w,_) = setup();
+        enqueue(&r,&account(1),true);
+        r.fail_cleanup_allocation.store(true,Ordering::SeqCst);
+        drop(w);
+        assert!(r.state.lock().expect("registry after disconnect").watches.is_empty(),"handle Drop must always unregister");
+        assert!(!r.enabled());assert_eq!(live_bytes(&r),0,"all owners eventually release");
+        let (next,_) = r.register(vec![OrderKeyCoverage {pubkey:vec![1;32],active_from_slot:None,owner_exempt_active_from_slot:Some(0)}],100).expect("registration recovers after cleanup failure");
+        drop(next);assert_eq!(live_bytes(&r),0);
     }
     #[test]
     fn r2_guard_retains_bank_charge_across_last_watch_and_reregistration() {
