@@ -1671,6 +1671,64 @@ mod tracked_account_history_v1 {
         }
     }
     #[tokio::test]
+    async fn concurrent_ingress_session_defers_b_seals_and_keeps_a_bytes_equal() {
+        let b = SubscriberChannels::new(64, 64, 64);
+        let a = SubscriberChannels::new(64, 64, 64);
+        b.observe_callback(99);
+        a.observe_callback(99);
+        let mut on = spawn(b.clone());
+        let mut off = spawn(a.clone());
+        ready(&mut on, &paired(request(true))).await;
+        install(&mut off, &request(false)).await;
+        let content = group_content(100, false);
+        let Message::Account(account) = &content[0] else {
+            panic!("account fixture");
+        };
+        let mut guard = b.history.enter(
+            100,
+            Some(100),
+            Some(account.account.pubkey.to_bytes()),
+            false,
+            false,
+            true,
+        );
+        guard.attach(account);
+        b.history.retain(account);
+        b.history.fence((100, 100));
+        publish(&b, 100, content.clone(), 1);
+        publish(&a, 100, content, 1);
+        let mut a_on = Vec::new();
+        // A emits account, transaction, Confirmed and BlockMeta even with B's
+        // ingress guard held. Neither order nor history may certify this Bank yet.
+        for _ in 0..4 {
+            let update = read(&mut on.1).await;
+            assert!(
+                !matches!(update.message, FilteredUpdateOneof::Order(_)),
+                "B must wait for the callback tail"
+            );
+            a_on.push(update.encode_to_vec());
+        }
+        let mut a_off = Vec::new();
+        for _ in 0..4 {
+            a_off.push(read(&mut off.1).await.encode_to_vec());
+        }
+        assert_eq!(a_on, a_off);
+        drop(guard);
+        let emitted = through_bank(&mut on).await;
+        let seals = emitted
+            .iter()
+            .filter_map(|u| match u.as_subscribe_update().update_oneof {
+                Some(UpdateOneof::TrackedAccountBankSeal(s)) => Some(s),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seals.len(), 1);
+        assert_eq!(seals[0].observed_callback_count, Some(1));
+        assert_eq!(seals[0].complete_bank, Some(true));
+        on.2.abort();
+        off.2.abort();
+    }
+    #[tokio::test]
     async fn all_versions_failed_and_null_writer_preserved_and_a_bytes_equal() {
         let b = SubscriberChannels::new(64, 64, 64);
         b.observe_callback(99);

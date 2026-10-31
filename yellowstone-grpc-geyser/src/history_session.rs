@@ -44,6 +44,7 @@ struct Group {
     meta: Option<Vec<u8>>,
     confirmed: Option<Vec<u8>>,
     bytes: usize,
+    waiting_since: Instant,
 }
 struct Ended {
     context: OrderContext,
@@ -382,6 +383,7 @@ impl HistorySession {
             meta: None,
             confirmed: None,
             bytes: 0,
+            waiting_since: Instant::now(),
         });
         Ok(())
     }
@@ -547,7 +549,7 @@ impl HistorySession {
             self.current = None;
             return self.tick(send);
         }
-        if let Some(group) = self.current.take() {
+        if let Some(mut group) = self.current.take() {
             ensure!(
                 (group.bank.slot, group.bank.bank_id) == bank,
                 "paired Bank end mismatch"
@@ -561,6 +563,7 @@ impl HistorySession {
                     self.ready.len() < self.limits.max_banks_per_stream,
                     "paired ready Bank limit"
                 );
+                group.waiting_since = Instant::now();
                 self.ready.push_back(group);
             }
         } else if self.epoch_for(bank.0).is_some() {
@@ -619,6 +622,24 @@ impl HistorySession {
             let Some(i) = position else {
                 break;
             };
+            let group = self.ready.get(i).context("ready Bank missing")?;
+            if group.waiting_since.elapsed() >= Duration::from_secs(15) {
+                return self.fail_with(
+                    OrderGapReason::IncompleteBank,
+                    "paired ingress fence deadline",
+                    send,
+                );
+            }
+            if !self
+                .watch
+                .as_ref()
+                .context("watch missing")?
+                .ready((group.bank.slot, group.bank.bank_id))?
+            {
+                // A has already been broadcast. Poll only B's bounded ready
+                // queue; never wait for callback guards on the source/A path.
+                break;
+            }
             let group = self.ready.remove(i).context("ready Bank missing")?;
             self.emit_bank(group, send)?;
         }

@@ -2441,6 +2441,151 @@ mod tests {
         );
     }
     #[test]
+    fn tracked_account_history_v1_concurrent_ingress_reconstruction_keeps_a_projection() {
+        use crate::plugin::filter::{fixtures, limits::FilterLimits, Filter};
+        use prost::Message as _;
+        use std::{
+            sync::{mpsc, Barrier},
+            thread,
+        };
+        use yellowstone_grpc_proto::prelude::{
+            OrderKeyCoverage, SubscribeRequest, SubscribeRequestFilterAccounts,
+        };
+        let registry = Arc::new(crate::tracked_history::HistoryRegistry::default());
+        let (watch, plan) = registry
+            .register(
+                (1..=2)
+                    .map(|key| OrderKeyCoverage {
+                        pubkey: vec![key; 32],
+                        active_from_slot: None,
+                        owner_exempt_active_from_slot: Some(0),
+                    })
+                    .collect(),
+                99,
+            )
+            .expect("parallel history scope");
+        let mut off = BlockMachineStorage::new(10);
+        let mut on = BlockMachineStorage::new(10);
+        on.history = Some(Arc::clone(&registry));
+        let barrier = Arc::new(Barrier::new(16));
+        let (tx, rx) = mpsc::channel();
+        thread::scope(|scope| {
+            for worker in 0..16u64 {
+                let (tx, registry, barrier) =
+                    (tx.clone(), Arc::clone(&registry), Arc::clone(&barrier));
+                scope.spawn(move || {
+                    for round in 0..2u64 {
+                        let slot = if round == 0 { 100 } else { 101 + worker % 4 };
+                        for index in 0..16u64 {
+                            let key = Pubkey::new_from_array([1 + (worker % 2) as u8; 32]);
+                            let message =
+                                make_account_msg(slot, slot, key, worker * 32 + round * 16 + index);
+                            let mut guard = registry.enter(
+                                slot,
+                                Some(slot),
+                                Some(key.to_bytes()),
+                                false,
+                                false,
+                                true,
+                            );
+                            if let Message::Account(account) = &message {
+                                guard.attach(account);
+                            }
+                            barrier.wait();
+                            tx.send(message).expect("source callback queue");
+                            drop(guard);
+                            // Real callback hooks all enter the same B ingress API.
+                            for data in [false, true, true] {
+                                drop(registry.enter(slot, Some(slot), None, false, false, data));
+                            }
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            for input in rx {
+                off.add(input.clone());
+                on.add(input);
+            }
+        });
+        let request = SubscribeRequest {
+            accounts: std::collections::HashMap::from([(
+                "all".into(),
+                SubscribeRequestFilterAccounts::default(),
+            )]),
+            ..Default::default()
+        };
+        let filter = Filter::new(
+            &request,
+            &FilterLimits::default(),
+            &mut fixtures::filter_names(),
+        )
+        .expect("ordinary account projection");
+        for slot in 100..=105 {
+            let mut inputs = vec![make_created_bank_msg(slot, Some(slot - 1), slot)];
+            for key in MUST_HAVE_SYSVAR_ACCOUNTS {
+                inputs.push(make_account_msg(slot, slot, key, 1));
+            }
+            inputs.extend([
+                make_block_meta_msg(slot, slot - 1, slot),
+                make_commitment_msg(slot, Some(slot - 1), SlotStatus::Processed, slot),
+            ]);
+            for input in inputs {
+                let key = if let Message::Account(account) = &input {
+                    Some(account.account.pubkey.to_bytes())
+                } else {
+                    None
+                };
+                let mut guard = registry.enter(
+                    slot,
+                    Some(slot),
+                    key,
+                    false,
+                    false,
+                    !matches!(input, Message::Slot(_)),
+                );
+                if let Message::Account(account) = &input {
+                    guard.attach(account);
+                }
+                off.add(input.clone());
+                on.add(input);
+                drop(guard);
+            }
+            let (_, a) = off.pop_ready_block().expect("ordinary sealed Bank");
+            let (_, b) = on.pop_ready_block().expect("history sealed Bank");
+            assert_eq!(
+                a.get_message_block().updated_account_count,
+                b.get_message_block().updated_account_count
+            );
+            let wire = |bank: &FrozenBank| {
+                bank.messages()
+                    .iter()
+                    .flat_map(|m| filter.get_updates(m, None))
+                    .map(|u| u.encode_to_vec())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                wire(&a),
+                wire(&b),
+                "parallel admission preserves A dedup bytes"
+            );
+            let (versions, count) = watch
+                .versions((slot, slot), &plan)
+                .expect("complete parallel Bank or zero-write seal");
+            let expected = if slot == 100 {
+                256
+            } else if slot == 105 {
+                0
+            } else {
+                64
+            };
+            assert_eq!((versions.len(), count), (expected, expected as u64));
+        }
+        watch
+            .check()
+            .expect("no synthetic contention or callback-tail failure");
+    }
+    #[test]
     fn tracked_account_history_v1_pre_created_versions_survive_without_changing_legacy_dedup() {
         use crate::plugin::filter::{fixtures, limits::FilterLimits, Filter};
         use prost::Message as _;

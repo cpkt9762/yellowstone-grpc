@@ -1,13 +1,15 @@
-//! B-only ingress ledger. Callback hooks never wait for a registry lock.
+//! B-only ingress ledger. Locks cover only bounded in-memory bookkeeping.
+//! Bank payloads never share a registry lock with registration or other Banks.
 use {
     crate::plugin::message::{Message as SourceMessage, MessageAccount, SlotStatus},
     anyhow::{ensure, Context, Result},
     std::{
         collections::{BTreeMap, BTreeSet},
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex,
         },
+        time::{Duration, Instant},
     },
 };
 pub type Bank = (u64, u64);
@@ -32,7 +34,7 @@ pub struct Plan {
 }
 #[derive(Debug)]
 struct Watch {
-    plans: Vec<Plan>,
+    plans: BTreeMap<u64, Arc<Plan>>,
     end: Option<u64>,
     completed: BTreeSet<Bank>,
     failed: bool,
@@ -43,7 +45,11 @@ impl Watch {
         if self.end.is_some_and(|e| slot >= e) {
             return None;
         }
-        self.plans.iter().rev().find(|p| p.switch <= slot)
+        self.plans
+            .values()
+            .rev()
+            .find(|p| p.switch <= slot)
+            .map(AsRef::as_ref)
     }
 }
 #[derive(Debug, Clone)]
@@ -51,26 +57,58 @@ pub struct Version {
     pub ordinal: u64,
     pub account: Arc<MessageAccount>,
 }
+// The high bit closes admission, the remaining bits count admitted callback
+// guards. One CAS linearizes admission against the fence, without lock races.
+const CLOSED: usize = 1usize << (usize::BITS - 1);
+#[derive(Debug, Default)]
+struct BankIngress {
+    gate: AtomicUsize,
+    count: AtomicU64,
+    late: AtomicBool,
+    retired: AtomicBool,
+    state: Mutex<BankState>,
+}
 #[derive(Debug, Default)]
 struct BankState {
-    inflight: usize,
-    count: BTreeMap<[u8; 32], u64>,
-    versions: Vec<Version>,
+    count: BTreeMap<[u8; 32], AtomicU64>,
+    // Small tree nodes avoid growing a large contiguous allocation under a lock.
+    versions: BTreeMap<u64, Version>,
+    identities: BTreeMap<([u8; 32], u64), Arc<MessageAccount>>,
     awaiting: BTreeMap<usize, (u64, [u8; 32])>,
-    sealed: bool,
-    late: bool,
+    fenced_at: Option<Instant>,
     bytes: usize,
+}
+impl BankIngress {
+    fn ready(&self) -> Result<bool> {
+        let b = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
+        let gate = self.gate.load(Ordering::Acquire);
+        if gate == CLOSED && b.awaiting.is_empty() {
+            ensure!(
+                self.count.load(Ordering::Acquire) == b.versions.len() as u64,
+                "independent callback count mismatch"
+            );
+            return Ok(true);
+        }
+        ensure!(
+            !b.fenced_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(15)),
+            "history ingress fence deadline"
+        );
+        Ok(false)
+    }
 }
 #[derive(Debug, Default)]
 struct State {
     next: u64,
-    ordinal: u64,
     generation: u64,
     high: u64,
     bytes: usize,
     external_bytes: usize,
     watches: BTreeMap<u64, Watch>,
-    banks: BTreeMap<Bank, BankState>,
+    banks: BTreeMap<Bank, Arc<BankIngress>>,
     authoritative: BTreeMap<u64, u64>,
     floor: u64,
 }
@@ -78,6 +116,7 @@ struct State {
 pub struct HistoryRegistry {
     enabled: AtomicUsize,
     broken: AtomicBool,
+    ordinal: AtomicU64,
     state: Mutex<State>,
     pub limits: crate::plugin::filter::limits::FilterLimitsHistory,
     max_watchers: usize,
@@ -95,6 +134,7 @@ impl HistoryRegistry {
         Self {
             enabled: AtomicUsize::new(0),
             broken: AtomicBool::new(false),
+            ordinal: AtomicU64::new(0),
             state: Mutex::new(State::default()),
             limits,
             max_watchers,
@@ -198,18 +238,18 @@ impl HistoryRegistry {
             .filter_map(|k| k.active_from_slot)
             .max()
             .context("empty history scope")?;
-        let plan = Plan {
+        let plan = Arc::new(Plan {
             generation: s.generation,
             switch,
             keys,
-        };
+        });
         let id = s.next;
         s.next = s.next.checked_add(1).context("history watcher exhausted")?;
         s.bytes += WATCH_BYTES;
         s.watches.insert(
             id,
             Watch {
-                plans: vec![plan.clone()],
+                plans: BTreeMap::from([(plan.generation, Arc::clone(&plan))]),
                 end: None,
                 completed: BTreeSet::new(),
                 failed: false,
@@ -217,16 +257,17 @@ impl HistoryRegistry {
             },
         );
         self.enabled.store(s.watches.len(), Ordering::Release);
+        drop(s);
         Ok((
             HistoryWatch {
                 registry: Arc::clone(self),
                 id,
             },
-            plan,
+            plan.as_ref().clone(),
         ))
     }
-    // A callback can race with registration. Both update high under this lock; a
-    // contended hook invalidates B instead of waiting or changing the A result.
+    // Registry metadata linearizes high-watermark / coverage with registration.
+    // Payload retention, attachment and retirement use only the selected Bank.
     pub fn enter(
         self: &Arc<Self>,
         slot: u64,
@@ -239,159 +280,189 @@ impl HistoryRegistry {
         if !self.enabled() {
             return Ingress::default();
         }
-        let mut s = match self.state.try_lock() {
-            Ok(s) => s,
-            Err(_) => {
-                self.broken.store(true, Ordering::Release);
-                return Ingress::default();
-            }
-        };
-        s.high = s.high.max(slot);
-        let ordinal = s.ordinal;
-        let Some(next) = ordinal.checked_add(1) else {
-            self.broken.store(true, Ordering::Release);
-            return Ingress::default();
-        };
-        s.ordinal = next;
-        if dead {
-            for (b, v) in &mut s.banks {
-                if b.0 == slot {
-                    v.late = true;
-                }
-            }
-        }
-        let Some(id) = bank_id else {
-            return Ingress::default();
-        };
-        let bank = (slot, id);
-        if authoritative {
-            if s.authoritative.get(&slot).is_some_and(|old| *old != id) {
-                for (b, v) in &mut s.banks {
-                    if b.0 == slot {
-                        v.late = true;
+        let result = (|| -> Result<Ingress> {
+            let mut s = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+            s.high = s.high.max(slot);
+            let ordinal = self
+                .ordinal
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+                .map_err(|_| anyhow::anyhow!("history ordinal exhausted"))?;
+            if dead {
+                for (bank, b) in &s.banks {
+                    if bank.0 == slot {
+                        b.late.store(true, Ordering::Release);
                     }
                 }
             }
-            if !s.authoritative.contains_key(&slot) {
-                if s.bytes + NODE_BYTES > self.limits.retained_bytes {
-                    self.broken.store(true, Ordering::Release);
-                } else {
-                    s.authoritative.insert(slot, id);
-                    s.bytes += NODE_BYTES;
+            let Some(id) = bank_id else {
+                return Ok(Ingress::default());
+            };
+            let bank = (slot, id);
+            if authoritative {
+                self.record_authoritative(&mut s, bank)?;
+            }
+            if data {
+                if let Some(b) = s.banks.get(&bank) {
+                    if b.gate.load(Ordering::Acquire) & CLOSED != 0 {
+                        b.late.store(true, Ordering::Release);
+                    }
                 }
             }
-        }
-        if data {
-            if let Some(b) = s.banks.get_mut(&bank) {
-                if b.sealed {
-                    b.late = true;
-                }
-            }
-        }
-        let covered = s
-            .watches
-            .values()
-            .any(|w| !w.failed && w.plan(slot).is_some());
-        if !covered {
-            return Ingress::default();
-        }
-        if slot < s.floor {
-            self.broken.store(true, Ordering::Release);
-            return Ingress::default();
-        }
-        let after_epoch_seal = (data || !s.banks.contains_key(&bank))
-            && s.watches
+            let covered = s
+                .watches
                 .values()
-                .any(|w| w.plan(slot).is_some() && slot < w.sealed_through);
-        if !s.banks.contains_key(&bank) {
-            if s.banks.len() >= 16384 || s.bytes + NODE_BYTES > self.limits.retained_bytes {
-                self.broken.store(true, Ordering::Release);
-                return Ingress::default();
+                .any(|w| !w.failed && w.plan(slot).is_some());
+            if !covered {
+                return Ok(Ingress::default());
             }
-            s.banks.insert(bank, BankState::default());
-            s.bytes += NODE_BYTES;
-        }
-        let tracked = key.filter(|k| {
-            s.watches.values().any(|w| {
-                !w.failed
-                    && w.plan(slot).is_some_and(|p| {
-                        p.keys.iter().any(|c| {
-                            c.pubkey.as_slice() == k
-                                && c.active_from_slot.is_some_and(|a| a <= slot)
+            ensure!(slot >= s.floor, "history callback below GC floor");
+            let after_epoch_seal = (data || !s.banks.contains_key(&bank))
+                && s.watches
+                    .values()
+                    .any(|w| w.plan(slot).is_some() && slot < w.sealed_through);
+            if !s.banks.contains_key(&bank) {
+                ensure!(s.banks.len() < 16384, "history Bank index limit");
+                self.charge(&mut s, NODE_BYTES)?;
+                s.banks.insert(bank, Arc::new(BankIngress::default()));
+            }
+            let tracked = key.filter(|k| {
+                s.watches.values().any(|w| {
+                    !w.failed
+                        && w.plan(slot).is_some_and(|p| {
+                            p.keys.iter().any(|c| {
+                                c.pubkey.as_slice() == k
+                                    && c.active_from_slot.is_some_and(|a| a <= slot)
+                            })
                         })
-                    })
-            })
-        });
-        // Reserve bookkeeping before allocation. Each node is conservatively charged.
-        if tracked.is_some() && s.bytes + 2 * NODE_BYTES > self.limits.retained_bytes {
-            self.broken.store(true, Ordering::Release);
-            return Ingress::default();
-        }
-        if tracked.is_some() {
-            s.bytes += 2 * NODE_BYTES;
-        }
-        let Some(b) = s.banks.get_mut(&bank) else {
-            self.broken.store(true, Ordering::Release);
-            return Ingress::default();
-        };
-        if after_epoch_seal {
-            b.late = true;
-        }
-        if !data {
-            return Ingress::default();
-        }
-        if b.sealed {
-            b.late = true;
-        }
-        b.inflight += 1;
-        if let Some(key) = tracked {
-            let count = b.count.entry(key).or_default();
-            if let Some(next) = count.checked_add(1) {
-                *count = next;
-            } else {
-                self.broken.store(true, Ordering::Release);
+                })
+            });
+            if tracked.is_some() {
+                self.charge(&mut s, 2 * NODE_BYTES)?;
             }
-            b.bytes += 2 * NODE_BYTES;
-            if b.count.values().copied().sum::<u64>() > self.limits.bank_versions as u64
-                || b.bytes > self.limits.bank_bytes
+            let b = Arc::clone(s.banks.get(&bank).context("history Bank missing")?);
+            if after_epoch_seal {
+                b.late.store(true, Ordering::Release);
+            }
+            if !data && b.gate.load(Ordering::Acquire) & CLOSED != 0 {
+                // Known post-seal Processed/Confirmed/Rooted statuses are legal;
+                // data callbacks still revoke the old Bank below.
+                return Ok(Ingress::default());
+            }
+            // Admission and closure have a single atomic order. A closed gate
+            // never admits a fresh callback, but already admitted guards retire.
+            if b.gate
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |gate| {
+                    (gate < CLOSED - 1).then(|| gate + 1)
+                })
+                .is_err()
             {
+                if data {
+                    b.late.store(true, Ordering::Release);
+                }
+                return Ok(Ingress::default());
+            }
+            drop(s);
+            let guard = Ingress {
+                registry: Some(Arc::clone(self)),
+                ingress: Some(Arc::clone(&b)),
+                ordinal,
+                key: tracked,
+                attached: false,
+            };
+            if let Some(key) = tracked {
+                let mut payload = b
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
+                ensure!(
+                    !b.retired.load(Ordering::Acquire),
+                    "history stopped during callback admission"
+                );
+                b.count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+                    .map_err(|_| anyhow::anyhow!("history callback count exhausted"))?;
+                payload
+                    .count
+                    .entry(key)
+                    .or_default()
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+                    .map_err(|_| anyhow::anyhow!("history key count exhausted"))?;
+                payload.bytes += 2 * NODE_BYTES;
+                ensure!(
+                    b.count.load(Ordering::Acquire) <= self.limits.bank_versions as u64
+                        && payload.bytes <= self.limits.bank_bytes,
+                    "history Bank callback/byte limit"
+                );
+            }
+            Ok(guard)
+        })();
+        match result {
+            Ok(guard) => guard,
+            Err(error) => {
                 self.broken.store(true, Ordering::Release);
+                log::warn!("tracked history ingress failed: {error}");
+                Ingress::default()
             }
         }
-        Ingress {
-            registry: Some(Arc::clone(self)),
-            bank,
-            ordinal,
-            key: tracked,
-            attached: false,
+    }
+    fn charge(&self, s: &mut State, bytes: usize) -> Result<()> {
+        ensure!(
+            s.bytes
+                .checked_add(bytes)
+                .is_some_and(|n| n <= self.limits.retained_bytes),
+            "global history retained limit"
+        );
+        s.bytes += bytes;
+        Ok(())
+    }
+    fn bank(&self, bank: Bank) -> Result<Option<Arc<BankIngress>>> {
+        let s = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+        Ok(s.banks.get(&bank).cloned())
+    }
+    fn record_authoritative(&self, s: &mut State, bank: Bank) -> Result<()> {
+        if s.authoritative.get(&bank.0).is_some_and(|id| *id != bank.1) {
+            for (key, b) in &s.banks {
+                if key.0 == bank.0 {
+                    b.late.store(true, Ordering::Release);
+                }
+            }
+        } else if !s.authoritative.contains_key(&bank.0) {
+            self.charge(s, NODE_BYTES)?;
+            s.authoritative.insert(bank.0, bank.1);
         }
+        Ok(())
     }
     pub fn retain(&self, account: &Arc<MessageAccount>) {
         if !self.enabled() {
             return;
         }
         let result = (|| -> Result<()> {
-            let mut s = self
-                .state
-                .try_lock()
-                .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
             let bank = (
                 account.slot,
                 account.bank_id.context("history account Bank missing")?,
             );
-            let ptr = Arc::as_ptr(account) as usize;
-            let Some(b) = s.banks.get(&bank) else {
+            let Some(ingress) = self.bank(bank)? else {
                 return Ok(());
             };
-            if b.sealed {
-                if let Some(b) = s.banks.get_mut(&bank) {
-                    b.late = true;
-                }
+            if ingress.retired.load(Ordering::Acquire) {
                 return Ok(());
             }
-            let Some((ordinal, _)) = b.awaiting.get(&ptr).copied() else {
-                return Ok(());
-            };
+            let ptr = Arc::as_ptr(account) as usize;
+            {
+                let b = ingress
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
+                if !b.awaiting.contains_key(&ptr) {
+                    return Ok(());
+                }
+            }
             let charge = account
                 .account
                 .data
@@ -399,30 +470,43 @@ impl HistoryRegistry {
                 .checked_mul(2)
                 .and_then(|n| n.checked_add(2048))
                 .context("history charge overflow")?;
-            ensure!(
-                s.bytes
-                    .checked_add(charge)
-                    .is_some_and(|n| n <= self.limits.retained_bytes),
-                "global history retained limit"
-            );
+            {
+                let mut s = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+                self.charge(&mut s, charge)?;
+            }
+            let mut b = ingress
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
+            if ingress.retired.load(Ordering::Acquire) {
+                drop(b);
+                let mut s = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+                s.bytes = s.bytes.saturating_sub(charge);
+                return Ok(());
+            }
             ensure!(
                 b.bytes
                     .checked_add(charge)
                     .is_some_and(|n| n <= self.limits.bank_bytes),
                 "history Bank byte limit"
             );
-            // Pre-encoded ordinary account storage can be populated after this point;
-            // the data*2 allowance includes that possible B-prolonged allocation.
-            s.bytes += charge;
-            let b = s.banks.get_mut(&bank).context("history Bank missing")?;
+            let (ordinal, _) = b
+                .awaiting
+                .remove(&ptr)
+                .context("history repeated retention")?;
             b.bytes += charge;
-            b.awaiting.remove(&ptr);
-            b.versions.try_reserve_exact(1)?;
-            if let Some(old) = b.versions.iter().find(|v| {
-                v.account.account.pubkey == account.account.pubkey
-                    && v.account.account.write_version == account.account.write_version
-            }) {
-                let a = &old.account.account;
+            let identity = (
+                account.account.pubkey.to_bytes(),
+                account.account.write_version,
+            );
+            if let Some(old) = b.identities.get(&identity) {
+                let a = &old.account;
                 let b = &account.account;
                 ensure!(
                     a.pubkey == b.pubkey
@@ -436,127 +520,170 @@ impl HistoryRegistry {
                     "history source conflict: duplicate version differs"
                 );
             }
-            b.versions.push(Version {
+            b.identities
+                .entry(identity)
+                .or_insert_with(|| Arc::clone(account));
+            b.versions.insert(
                 ordinal,
-                account: Arc::clone(account),
-            });
+                Version {
+                    ordinal,
+                    account: Arc::clone(account),
+                },
+            );
             Ok(())
         })();
         if let Err(error) = result {
-            log::warn!("tracked history retention failed: {error}");
             self.broken.store(true, Ordering::Release);
+            log::warn!("tracked history retention failed: {error}");
         }
     }
     pub fn fence(&self, bank: Bank) {
         if !self.enabled() {
             return;
         }
-        match self.state.try_lock() {
-            Ok(mut s) => {
-                if let Some(b) = s.banks.get_mut(&bank) {
-                    if b.inflight != 0
-                        || !b.awaiting.is_empty()
-                        || b.count.values().sum::<u64>() != b.versions.len() as u64
-                    {
-                        b.late = true;
-                    }
-                    b.sealed = true;
+        let result = (|| -> Result<()> {
+            if let Some(ingress) = self.bank(bank)? {
+                let mut b = ingress
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
+                let prior = ingress.gate.fetch_or(CLOSED, Ordering::AcqRel);
+                b.fenced_at.get_or_insert_with(Instant::now);
+                // Missing retained callbacks with no active sender are actual
+                // source loss. An active callback tail is polled by B instead.
+                if prior == 0
+                    && (!b.awaiting.is_empty()
+                        || ingress.count.load(Ordering::Acquire) != b.versions.len() as u64)
+                {
+                    ingress.late.store(true, Ordering::Release);
                 }
             }
-            Err(_) => self.broken.store(true, Ordering::Release),
+            Ok(())
+        })();
+        if result.is_err() {
+            self.broken.store(true, Ordering::Release);
         }
     }
     pub fn authoritative(&self, bank: Bank) {
         if !self.enabled() {
             return;
         }
-        match self.state.try_lock() {
-            Ok(mut s) => {
-                if s.authoritative.get(&bank.0).is_some_and(|id| *id != bank.1) {
-                    for (b, v) in &mut s.banks {
-                        if b.0 == bank.0 {
-                            v.late = true;
-                        }
-                    }
-                } else if !s.authoritative.contains_key(&bank.0) {
-                    if s.bytes + NODE_BYTES > self.limits.retained_bytes {
-                        self.broken.store(true, Ordering::Release);
-                    } else {
-                        s.bytes += NODE_BYTES;
-                        s.authoritative.insert(bank.0, bank.1);
-                    }
-                }
-            }
-            Err(_) => self.broken.store(true, Ordering::Release),
+        let result = (|| -> Result<()> {
+            let mut s = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+            self.record_authoritative(&mut s, bank)
+        })();
+        if result.is_err() {
+            self.broken.store(true, Ordering::Release);
         }
     }
     pub fn observe_source(&self, message: &SourceMessage) {
         if !self.enabled() {
             return;
         }
-        if let SourceMessage::EntryUpdateParent(update) = message {
-            match self.state.try_lock() {
-                Ok(mut s) => {
-                    if let Some(b) = s.banks.get_mut(&(
+        let result = (|| -> Result<()> {
+            let s = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+            match message {
+                SourceMessage::EntryUpdateParent(update) => {
+                    if let Some(b) = s.banks.get(&(
                         update.update_parent.slot,
                         update.update_parent.cleared_bank_id,
                     )) {
-                        b.late = true;
+                        b.late.store(true, Ordering::Release);
                     }
                 }
-                Err(_) => self.broken.store(true, Ordering::Release),
-            }
-        }
-        if let SourceMessage::Slot(slot) = message {
-            if slot.status == SlotStatus::Dead {
-                match self.state.try_lock() {
-                    Ok(mut s) => {
-                        for (bank, b) in &mut s.banks {
-                            if bank.0 == slot.slot {
-                                b.late = true;
-                            }
+                SourceMessage::Slot(slot) if slot.status == SlotStatus::Dead => {
+                    for (bank, b) in &s.banks {
+                        if bank.0 == slot.slot {
+                            b.late.store(true, Ordering::Release);
                         }
                     }
-                    Err(_) => self.broken.store(true, Ordering::Release),
                 }
+                _ => (),
             }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.broken.store(true, Ordering::Release);
         }
+    }
+    fn release_bank(&self, ingress: &BankIngress) -> Result<()> {
+        let owners = {
+            let mut b = ingress
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
+            ingress.retired.store(true, Ordering::Release);
+            ingress.gate.fetch_or(CLOSED, Ordering::AcqRel);
+            std::mem::take(&mut *b)
+        };
+        let released = owners.bytes;
+        drop(owners);
+        let mut s = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+        s.bytes = s.bytes.saturating_sub(released);
+        Ok(())
     }
     pub fn gc(&self, floor: u64) {
         if !self.enabled() {
             return;
         }
-        match self.state.try_lock() {
-            Ok(mut s) => {
+        let result = (|| -> Result<()> {
+            // Preallocate the bounded index snapshot outside the registry lock.
+            let mut banks = Vec::new();
+            banks.try_reserve_exact(16384)?;
+            {
+                let mut s = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
                 s.floor = s.floor.max(floor);
-                if s.banks.iter().any(|(bank, b)| bank.0 < floor && !b.sealed) {
-                    self.broken.store(true, Ordering::Release);
-                }
+                banks.extend(
+                    s.banks
+                        .iter()
+                        .filter(|(bank, _)| bank.0 < floor)
+                        .map(|(_, b)| Arc::clone(b)),
+                );
             }
-            Err(_) => self.broken.store(true, Ordering::Release),
+            for bank in banks {
+                ensure!(
+                    bank.retired.load(Ordering::Acquire) || bank.ready()?,
+                    "history GC of incomplete Bank"
+                );
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.broken.store(true, Ordering::Release);
         }
     }
 }
 #[derive(Debug, Default)]
 pub struct Ingress {
     registry: Option<Arc<HistoryRegistry>>,
-    bank: Bank,
+    ingress: Option<Arc<BankIngress>>,
     ordinal: u64,
     key: Option<[u8; 32]>,
     attached: bool,
 }
 impl Ingress {
     pub fn attach(&mut self, account: &Arc<MessageAccount>) {
-        let (Some(registry), Some(key)) = (&self.registry, self.key) else {
+        let (Some(registry), Some(ingress), Some(key)) = (&self.registry, &self.ingress, self.key)
+        else {
             return;
         };
-        match registry.state.try_lock() {
-            Ok(mut s) => {
-                if let Some(b) = s.banks.get_mut(&self.bank) {
-                    b.awaiting
-                        .insert(Arc::as_ptr(account) as usize, (self.ordinal, key));
-                    self.attached = true;
-                }
+        match ingress.state.lock() {
+            Ok(mut b) => {
+                b.awaiting
+                    .insert(Arc::as_ptr(account) as usize, (self.ordinal, key));
+                self.attached = true;
             }
             Err(_) => registry.broken.store(true, Ordering::Release),
         }
@@ -564,19 +691,19 @@ impl Ingress {
 }
 impl Drop for Ingress {
     fn drop(&mut self) {
-        let Some(r) = &self.registry else {
+        let (Some(r), Some(b)) = (&self.registry, &self.ingress) else {
             return;
         };
-        match r.state.try_lock() {
-            Ok(mut s) => {
-                if let Some(b) = s.banks.get_mut(&self.bank) {
-                    b.inflight = b.inflight.saturating_sub(1);
-                    if self.key.is_some() && !self.attached {
-                        b.late = true;
-                    }
-                }
-            }
-            Err(_) => r.broken.store(true, Ordering::Release),
+        if self.key.is_some() && !self.attached {
+            b.late.store(true, Ordering::Release);
+        }
+        if b.gate
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |gate| {
+                (gate & !CLOSED != 0).then(|| gate - 1)
+            })
+            .is_err()
+        {
+            r.broken.store(true, Ordering::Release);
         }
     }
 }
@@ -604,7 +731,7 @@ impl HistoryWatch {
         if let Some((bank, _)) = s
             .banks
             .iter()
-            .find(|(bank, b)| b.late && w.plan(bank.0).is_some())
+            .find(|(bank, b)| b.late.load(Ordering::Acquire) && w.plan(bank.0).is_some())
         {
             return Err(HistoryFault {
                 reason: yellowstone_grpc_proto::prelude::OrderGapReason::SourceAfterSeal,
@@ -649,7 +776,7 @@ impl HistoryWatch {
         let old = s
             .watches
             .get(&self.id)
-            .and_then(|w| w.plans.last())
+            .and_then(|w| w.plans.values().next_back())
             .context("history scope missing")?;
         for key in &mut keys {
             key.active_from_slot = Some(
@@ -669,11 +796,11 @@ impl HistoryWatch {
             .generation
             .checked_add(1)
             .context("generation exhausted")?;
-        let p = Plan {
+        let p = Arc::new(Plan {
             generation: s.generation,
             switch,
             keys,
-        };
+        });
         ensure!(
             s.bytes + keys_charge(&p) <= self.registry.limits.retained_bytes,
             "history plan resource limit"
@@ -683,8 +810,9 @@ impl HistoryWatch {
             .get_mut(&self.id)
             .context("watcher missing")?
             .plans
-            .push(p.clone());
-        Ok(p)
+            .insert(p.generation, Arc::clone(&p));
+        drop(s);
+        Ok(p.as_ref().clone())
     }
     pub fn close(&self, watermark: u64) -> Result<u64> {
         self.close_with(|| watermark)
@@ -713,21 +841,36 @@ impl HistoryWatch {
             .keys()
             .any(|bank| bank.0 < before && w.plan(bank.0).is_some() && !w.completed.contains(bank)))
     }
+    pub fn ready(&self, bank: Bank) -> Result<bool> {
+        self.check()?;
+        self.registry
+            .bank(bank)?
+            .context("Bank absent from callback ingress (partial Bank)")?
+            .ready()
+            .map_err(|error| {
+                anyhow::Error::new(HistoryFault {
+                    reason: yellowstone_grpc_proto::prelude::OrderGapReason::IncompleteBank,
+                    bank: Some(bank),
+                    detail: "history ingress fence/count incomplete",
+                })
+                .context(error.to_string())
+            })
+    }
     pub fn versions(&self, bank: Bank, plan: &Plan) -> Result<(Vec<Version>, u64)> {
         self.check()?;
-        let s = self
+        let ingress = self
             .registry
+            .bank(bank)?
+            .context("Bank absent from callback ingress (partial Bank)")?;
+        ensure!(ingress.ready()?, "Bank missing ingress fence");
+        let capacity = usize::try_from(ingress.count.load(Ordering::Acquire))?;
+        // The caller has reserved encoding workspace. Allocate outside all locks.
+        let mut versions = Vec::new();
+        versions.try_reserve_exact(capacity)?;
+        let b = ingress
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-        let b = s
-            .banks
-            .get(&bank)
-            .context("Bank absent from callback ingress (partial Bank)")?;
-        ensure!(
-            b.sealed && b.inflight == 0 && b.awaiting.is_empty(),
-            "Bank missing ingress fence"
-        );
+            .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
         let matches = |key: &[u8]| {
             plan.keys
                 .iter()
@@ -737,19 +880,18 @@ impl HistoryWatch {
             .count
             .iter()
             .filter(|(key, _)| matches(key.as_slice()))
-            .map(|(_, n)| *n)
+            .map(|(_, n)| n.load(Ordering::Acquire))
             .sum::<u64>();
-        let mut versions = b
-            .versions
-            .iter()
-            .filter(|v| matches(v.account.account.pubkey.as_ref()))
-            .cloned()
-            .collect::<Vec<_>>();
+        versions.extend(
+            b.versions
+                .values()
+                .filter(|v| matches(v.account.account.pubkey.as_ref()))
+                .cloned(),
+        );
         ensure!(
             count == versions.len() as u64,
             "independent callback count mismatch"
         );
-        versions.sort_by_key(|v| v.ordinal);
         Ok((versions, count))
     }
     pub fn seal_through(&self, cutoff: u64) -> Result<()> {
@@ -773,68 +915,60 @@ impl HistoryWatch {
         Ok(())
     }
     pub fn stop(&self) -> Result<()> {
-        let mut s = self
-            .registry
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-        // This is failure cleanup, never a successful coverage cutoff.
-        let end = s.high.saturating_add(1);
-        let w = s.watches.get_mut(&self.id).context("watcher missing")?;
-        w.failed = true;
-        w.end.get_or_insert(end);
-        let done = s
-            .banks
-            .keys()
-            .copied()
-            .filter(|bank| {
-                s.watches
-                    .values()
-                    .all(|w| w.failed || w.plan(bank.0).is_none() || w.completed.contains(bank))
-            })
-            .collect::<Vec<_>>();
+        let mut done = Vec::new();
+        done.try_reserve_exact(16384)?;
+        {
+            let mut s = self
+                .registry
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+            // Failure cleanup never establishes a successful coverage cutoff.
+            let end = s.high.saturating_add(1);
+            let w = s.watches.get_mut(&self.id).context("watcher missing")?;
+            w.failed = true;
+            w.end.get_or_insert(end);
+            done.extend(
+                s.banks
+                    .iter()
+                    .filter(|(bank, _)| {
+                        s.watches.values().all(|w| {
+                            w.failed || w.plan(bank.0).is_none() || w.completed.contains(bank)
+                        })
+                    })
+                    .map(|(_, b)| Arc::clone(b)),
+            );
+        }
         for bank in done {
-            if let Some(b) = s.banks.get_mut(&bank) {
-                let released = b.bytes;
-                b.versions = Vec::new();
-                b.count.clear();
-                b.awaiting.clear();
-                b.bytes = 0;
-                b.sealed = true;
-                s.bytes = s.bytes.saturating_sub(released);
-            }
+            self.registry.release_bank(&bank)?;
         }
         Ok(())
     }
     pub fn complete(&self, bank: Bank) -> Result<()> {
-        let mut s = self
-            .registry
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-        ensure!(
-            s.bytes + NODE_BYTES <= self.registry.limits.retained_bytes,
-            "history completed index limit"
-        );
-        s.bytes += NODE_BYTES;
-        s.watches
-            .get_mut(&self.id)
-            .context("watcher missing")?
-            .completed
-            .insert(bank);
-        // Drop B's raw ownership once every interested physical stream consumed it.
-        let done = s
-            .watches
-            .values()
-            .all(|w| w.failed || w.plan(bank.0).is_none() || w.completed.contains(&bank));
-        if done {
-            if let Some(b) = s.banks.get_mut(&bank) {
-                let released = b.bytes;
-                b.versions = Vec::new();
-                b.count.clear();
-                b.bytes = 0;
-                s.bytes = s.bytes.saturating_sub(released);
+        let release = {
+            let mut s = self
+                .registry
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+            self.registry.charge(&mut s, NODE_BYTES)?;
+            s.watches
+                .get_mut(&self.id)
+                .context("watcher missing")?
+                .completed
+                .insert(bank);
+            let done = s
+                .watches
+                .values()
+                .all(|w| w.failed || w.plan(bank.0).is_none() || w.completed.contains(&bank));
+            if done {
+                s.banks.get(&bank).cloned()
+            } else {
+                None
             }
+        };
+        if let Some(bank) = release {
+            self.registry.release_bank(&bank)?;
         }
         Ok(())
     }
@@ -846,24 +980,38 @@ impl Drop for HistoryWatch {
     fn drop(&mut self) {
         match self.registry.state.lock() {
             Ok(mut s) => {
-                if let Some(w) = s.watches.remove(&self.id) {
+                let removed = s.watches.remove(&self.id);
+                if let Some(w) = &removed {
                     let charge = WATCH_BYTES
-                        + w.plans.iter().skip(1).map(keys_charge).sum::<usize>()
+                        + w.plans
+                            .values()
+                            .skip(1)
+                            .map(|p| keys_charge(p))
+                            .sum::<usize>()
                         + w.completed.len() * NODE_BYTES;
                     s.bytes = s.bytes.saturating_sub(charge);
                 }
                 self.registry
                     .enabled
                     .store(s.watches.len(), Ordering::Release);
-                if s.watches.is_empty() {
+                let retired = if s.watches.is_empty() {
                     let external_bytes = s.external_bytes;
-                    *s = State {
-                        bytes: external_bytes,
-                        external_bytes,
-                        ..Default::default()
-                    };
+                    let old = std::mem::replace(
+                        &mut *s,
+                        State {
+                            bytes: external_bytes,
+                            external_bytes,
+                            ..Default::default()
+                        },
+                    );
                     self.registry.broken.store(false, Ordering::Release);
-                }
+                    Some(old)
+                } else {
+                    None
+                };
+                drop(s);
+                // Raw ownership / large scopes are destroyed outside the registry.
+                drop((removed, retired));
             }
             Err(_) => self.registry.broken.store(true, Ordering::Release),
         }
@@ -932,28 +1080,40 @@ mod tracked_account_history_v1 {
     // admission is independent of slot / transaction / entry callback guards.
     #[test]
     fn concurrent_ingress_preserves_counts_zero_bank_a_bytes_and_real_late() {
-        use std::{sync::Barrier, thread};
-        use crate::plugin::filter::{Filter, limits::FilterLimits};
+        use crate::plugin::filter::{limits::FilterLimits, Filter};
         use prost::Message;
+        use std::{sync::Barrier, thread};
         use yellowstone_grpc_proto::prelude::{SubscribeRequest, SubscribeRequestFilterAccounts};
         let r = Arc::new(HistoryRegistry::default());
-        let keys = (1..=2).map(|key| OrderKeyCoverage {
-            pubkey: vec![key; 32], active_from_slot: None,
-            owner_exempt_active_from_slot: Some(0),
-        }).collect();
+        let keys = (1..=2)
+            .map(|key| OrderKeyCoverage {
+                pubkey: vec![key; 32],
+                active_from_slot: None,
+                owner_exempt_active_from_slot: Some(0),
+            })
+            .collect();
         let (w, p) = r.register(keys, 99).expect("two-key registration");
         let disabled = Arc::new(HistoryRegistry::default());
         let barrier = Arc::new(Barrier::new(16));
         thread::scope(|scope| {
             let mut handles = Vec::new();
             for worker in 0..16u64 {
-                let (r, disabled, barrier) = (Arc::clone(&r), Arc::clone(&disabled), Arc::clone(&barrier));
+                let (r, disabled, barrier) =
+                    (Arc::clone(&r), Arc::clone(&disabled), Arc::clone(&barrier));
                 handles.push(scope.spawn(move || {
                     let request = SubscribeRequest {
-                        accounts: std::collections::HashMap::from([(String::from("accounts"), SubscribeRequestFilterAccounts::default())]),
+                        accounts: std::collections::HashMap::from([(
+                            String::from("accounts"),
+                            SubscribeRequestFilterAccounts::default(),
+                        )]),
                         ..Default::default()
                     };
-                    let filter = Filter::new(&request, &FilterLimits::default(), &mut fixtures::filter_names()).expect("A filter");
+                    let filter = Filter::new(
+                        &request,
+                        &FilterLimits::default(),
+                        &mut fixtures::filter_names(),
+                    )
+                    .expect("A filter");
                     for round in 0..2u64 {
                         let slot = if round == 0 { 100 } else { 101 + worker % 4 };
                         for index in 0..32u64 {
@@ -961,49 +1121,102 @@ mod tracked_account_history_v1 {
                             let raw = Arc::make_mut(&mut a);
                             raw.slot = slot;
                             raw.bank_id = Some(slot + 1000);
-                            raw.account.pubkey = Pubkey::new_from_array([1 + (worker % 2) as u8; 32]);
+                            raw.account.pubkey =
+                                Pubkey::new_from_array([1 + (worker % 2) as u8; 32]);
                             barrier.wait();
-                            let mut guard = r.enter(slot, a.bank_id, Some(a.account.pubkey.to_bytes()), false, false, true);
-                            let mut control = disabled.enter(slot, a.bank_id, Some(a.account.pubkey.to_bytes()), false, false, true);
+                            let mut guard = r.enter(
+                                slot,
+                                a.bank_id,
+                                Some(a.account.pubkey.to_bytes()),
+                                false,
+                                false,
+                                true,
+                            );
+                            let mut control = disabled.enter(
+                                slot,
+                                a.bank_id,
+                                Some(a.account.pubkey.to_bytes()),
+                                false,
+                                false,
+                                true,
+                            );
                             guard.attach(&a);
                             control.attach(&a);
                             // The same callback reaches ordinary A with either registry.
                             let message = SourceMessage::Account(Arc::clone(&a));
-                            let wire = || filter.get_updates(&message, None).iter().map(Message::encode_to_vec).collect::<Vec<_>>();
+                            let wire = || {
+                                filter
+                                    .get_updates(&message, None)
+                                    .iter()
+                                    .map(Message::encode_to_vec)
+                                    .collect::<Vec<_>>()
+                            };
                             let expected = wire();
                             r.retain(&a);
                             disabled.retain(&a);
                             assert_eq!(wire(), expected, "history cannot change A bytes");
                             drop((guard, control));
-                            for (data, authoritative) in [(false, false), (true, false), (true, false)] {
+                            for (data, authoritative) in
+                                [(false, false), (true, false), (true, false)]
+                            {
                                 drop(r.enter(slot, a.bank_id, None, false, authoritative, data));
                             }
                         }
                     }
                 }));
             }
-            for handle in handles { handle.join().expect("parallel callbacks"); }
+            for handle in handles {
+                handle.join().expect("parallel callbacks");
+            }
         });
-        w.check().expect("normal callback contention is not a failure");
+        w.check()
+            .expect("normal callback contention is not a failure");
         let mut ordinals = BTreeSet::new();
         for slot in 100..=104 {
             r.fence((slot, slot + 1000));
-            let (v, count) = w.versions((slot, slot + 1000), &p).expect("all admitted versions");
+            let (v, count) = w
+                .versions((slot, slot + 1000), &p)
+                .expect("all admitted versions");
             let expected = if slot == 100 { 512 } else { 128 };
             assert_eq!((v.len(), count), (expected, expected as u64));
             for key in 1..=2 {
-                let expected_key = if slot == 100 { 256 } else if key == 1 + ((slot - 101) % 2) as u8 { 128 } else { 0 };
-                assert_eq!(v.iter().filter(|v| v.account.account.pubkey.to_bytes() == [key; 32]).count(), expected_key);
+                let expected_key = if slot == 100 {
+                    256
+                } else if key == 1 + ((slot - 101) % 2) as u8 {
+                    128
+                } else {
+                    0
+                };
+                assert_eq!(
+                    v.iter()
+                        .filter(|v| v.account.account.pubkey.to_bytes() == [key; 32])
+                        .count(),
+                    expected_key
+                );
             }
-            for version in v { assert!(ordinals.insert(version.ordinal), "unique callback ordinal"); }
+            for version in v {
+                assert!(ordinals.insert(version.ordinal), "unique callback ordinal");
+            }
         }
         drop(r.enter(105, Some(1105), None, false, false, false));
         r.fence((105, 1105));
         let (v, n) = w.versions((105, 1105), &p).expect("zero-write Bank seal");
-        assert!(v.is_empty()); assert_eq!(n, 0);
+        assert!(v.is_empty());
+        assert_eq!(n, 0);
         w.check().expect("all normal seals");
-        enqueue(&r, &{let mut a = account(9999); Arc::make_mut(&mut a).bank_id = Some(1100); a}, true);
-        assert!(w.check().is_err(), "a new callback after the fence revokes the run");
+        enqueue(
+            &r,
+            &{
+                let mut a = account(9999);
+                Arc::make_mut(&mut a).bank_id = Some(1100);
+                a
+            },
+            true,
+        );
+        assert!(
+            w.check().is_err(),
+            "a new callback after the fence revokes the run"
+        );
     }
     #[test]
     fn concurrent_ingress_fence_defers_callback_tail_without_false_late() {
@@ -1013,13 +1226,16 @@ mod tracked_account_history_v1 {
         let release = Arc::new(Barrier::new(17));
         thread::scope(|scope| {
             for worker in 0..16u64 {
-                let (r, entered, release) = (Arc::clone(&r), Arc::clone(&entered), Arc::clone(&release));
+                let (r, entered, release) =
+                    (Arc::clone(&r), Arc::clone(&entered), Arc::clone(&release));
                 scope.spawn(move || {
                     let a = account(worker);
                     let mut guard = r.enter(100, Some(100), Some([1; 32]), false, false, true);
                     guard.attach(&a);
                     r.retain(&a);
-                    entered.wait(); release.wait(); drop(guard);
+                    entered.wait();
+                    release.wait();
+                    drop(guard);
                 });
             }
             entered.wait();
@@ -1030,9 +1246,31 @@ mod tracked_account_history_v1 {
             checked.expect("an admitted callback tail is not late");
             assert!(pending.is_err(), "no output while ingress is active");
         });
-        let (v, n) = w.versions((100, 100), &p).expect("seal after callback tails retire");
+        let (v, n) = w
+            .versions((100, 100), &p)
+            .expect("seal after callback tails retire");
         assert_eq!((v.len(), n), (16, 16));
         w.check().expect("no false late evidence");
+    }
+    #[test]
+    fn concurrent_ingress_deadline_and_gc_reject_unretired_admission() {
+        let (r, w, _) = setup();
+        let a = account(1);
+        let mut guard = r.enter(100, Some(100), Some([1; 32]), false, false, true);
+        guard.attach(&a);
+        r.retain(&a);
+        r.fence((100, 100));
+        assert!(!w.ready((100, 100)).expect("pending ingress"));
+        let bank = r.bank((100, 100)).expect("registry").expect("Bank");
+        bank.state.lock().expect("Bank fence clock").fenced_at =
+            Some(Instant::now() - Duration::from_secs(16));
+        assert!(w.ready((100, 100)).is_err(), "bounded fence deadline");
+        r.gc(101);
+        assert!(
+            w.check().is_err(),
+            "GC cannot discard an active fenced Bank"
+        );
+        drop(guard);
     }
     #[test]
     fn independent_count_detects_queue_or_decoder_drop() {
@@ -1051,17 +1289,25 @@ mod tracked_account_history_v1 {
         guard.attach(&a);
         r.fence((100, 100));
         assert!(w.versions((100, 100), &p).is_err());
-        drop(guard);
+        w.check().expect("fence defers active ingress");
         r.retain(&a);
-        assert!(w.check().is_err());
+        drop(guard);
+        assert_eq!(w.versions((100, 100), &p).expect("retired ingress").1, 1);
     }
     #[test]
-    fn registration_contention_is_sticky_and_does_not_wait() {
-        let (r, w, _) = setup();
-        let locked = r.state.lock().expect("hold registration lock");
-        drop(r.enter(100, Some(100), Some([1; 32]), false, false, true));
-        drop(locked);
-        assert!(w.check().is_err());
+    fn registration_contention_waits_and_preserves_coverage() {
+        let (r, w, p) = setup();
+        std::thread::scope(|scope| {
+            let locked = r.state.lock().expect("hold registration lock");
+            let callback = scope.spawn(|| enqueue(&r, &account(1), true));
+            drop(locked);
+            callback
+                .join()
+                .expect("callback waits for registry metadata");
+        });
+        r.fence((100, 100));
+        assert_eq!(w.versions((100, 100), &p).expect("complete Bank").1, 1);
+        w.check().expect("ordinary contention is not a gap");
     }
     #[test]
     fn repeated_identical_version_is_counted_and_conflicting_value_rejected() {
