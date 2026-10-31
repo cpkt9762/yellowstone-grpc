@@ -25,7 +25,9 @@ pub const RETAINED_BYTES: usize = 64 * 1024 * 1024;
 pub const BANK_BYTES: usize = 16 * 1024 * 1024;
 pub const BANK_VERSIONS: usize = 65536;
 const NODE_BYTES: usize = 512;
-const WATCH_BYTES: usize = 4 * 1024 * 1024 + 16 * 1024 + 64 * 1024;
+const BANK_INDEX_LIMIT: usize = 16384;
+const CLEANUP_SCRATCH_BYTES: usize = BANK_INDEX_LIMIT * std::mem::size_of::<Arc<BankIngress>>();
+const WATCH_BYTES: usize = 4 * 1024 * 1024 + 16 * 1024 + 64 * 1024 + CLEANUP_SCRATCH_BYTES;
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub generation: u64,
@@ -40,6 +42,7 @@ struct Watch {
     completed: BTreeSet<Bank>,
     failed: bool,
     sealed_through: u64,
+    scratch: Vec<Arc<BankIngress>>,
     lease: Arc<RetentionLease>,
 }
 impl Watch {
@@ -124,6 +127,7 @@ pub struct HistoryRegistry {
     ordinal: AtomicU64,
     pub watermark: AtomicU64,
     budget: Arc<LiveBudget>,
+    cleanup_pending: AtomicBool,
     state: Mutex<State>,
     pub limits: crate::plugin::filter::limits::FilterLimitsHistory,
     max_watchers: usize,
@@ -149,6 +153,7 @@ impl HistoryRegistry {
                 used: AtomicUsize::new(0),
                 limit: limits.retained_bytes.min(RETAINED_BYTES),
             }),
+            cleanup_pending: AtomicBool::new(false),
             state: Mutex::new(State::default()),
             limits,
             max_watchers,
@@ -204,21 +209,25 @@ impl HistoryRegistry {
                 && self.limits.bank_versions <= BANK_VERSIONS,
             "history configured limits exceed hard limits"
         );
+        let lease = self.reserve(WATCH_BYTES)?;
+        let mut scratch = Vec::new();
+        scratch.try_reserve_exact(BANK_INDEX_LIMIT)?;
+        let actual_scratch = scratch
+            .capacity()
+            .checked_mul(std::mem::size_of::<Arc<BankIngress>>())
+            .context("history scratch size overflow")?;
+        if actual_scratch > CLEANUP_SCRATCH_BYTES {
+            lease.add(actual_scratch - CLEANUP_SCRATCH_BYTES)?;
+        }
         let mut s = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
         ensure!(
             s.watches.len() < self.max_watchers
-                && self
-                    .budget
-                    .used
-                    .load(Ordering::Acquire)
-                    .checked_add(WATCH_BYTES)
-                    .is_some_and(|b| b <= self.limits.retained_bytes),
+                && self.budget.used.load(Ordering::Acquire) <= self.limits.retained_bytes,
             "history watcher resource limit"
         );
-        let lease = self.reserve(WATCH_BYTES)?;
         let previous_watchers = s.watches.len();
         self.enabled.store(previous_watchers + 1, Ordering::Release);
         s.high = s
@@ -270,6 +279,7 @@ impl HistoryRegistry {
                 completed: BTreeSet::new(),
                 failed: false,
                 sealed_through: 0,
+                scratch,
                 lease,
             },
         );
@@ -648,11 +658,48 @@ impl HistoryRegistry {
         drop(owners);
         Ok(())
     }
+    fn retry_cleanup(&self) -> Result<()> {
+        if !self.cleanup_pending.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let result = (|| -> Result<()> {
+            let mut done = Vec::new();
+            done.try_reserve_exact(BANK_INDEX_LIMIT)?;
+            {
+                let s = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
+                done.extend(
+                    s.banks
+                        .iter()
+                        .filter(|(bank, b)| {
+                            !b.retired.load(Ordering::Acquire)
+                                && s.watches.values().all(|w| {
+                                    w.failed
+                                        || w.plan(bank.0).is_none()
+                                        || w.completed.contains(bank)
+                                })
+                        })
+                        .map(|(_, b)| Arc::clone(b)),
+                );
+            }
+            for bank in done {
+                self.release_bank(&bank)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.cleanup_pending.store(true, Ordering::Release);
+        }
+        result
+    }
     pub fn gc(&self, floor: u64) {
         if !self.enabled() {
             return;
         }
         let result = (|| -> Result<()> {
+            self.retry_cleanup()?;
             // Preallocate the bounded index snapshot outside the registry lock.
             let mut banks = Vec::new();
             banks.try_reserve_exact(16384)?;
@@ -996,6 +1043,7 @@ impl HistoryWatch {
         if let Some(bank) = release {
             self.registry.release_bank(&bank)?;
         }
+        self.registry.retry_cleanup()?;
         Ok(())
     }
 }
@@ -1004,56 +1052,56 @@ const fn keys_charge(plan: &Plan) -> usize {
 }
 impl Drop for HistoryWatch {
     fn drop(&mut self) {
-        // Workspace for a bounded index snapshot is allocated outside the lock.
-        let mut done = Vec::new();
-        #[cfg(test)]
-        if self.registry.fail_cleanup_allocation.swap(false,Ordering::SeqCst) {
-            self.registry.broken.store(true,Ordering::Release);return;
-        }
-        if done.try_reserve_exact(16384).is_err() {
-            self.registry.broken.store(true, Ordering::Release);
-            return;
-        }
-        let removed;
+        let mut removed;
         let detached;
-        match self.registry.state.lock() {
-            Ok(mut s) => {
-                removed = s.watches.remove(&self.id);
-                self.registry
-                    .enabled
-                    .store(s.watches.len(), Ordering::Release);
-                if s.watches.is_empty() {
-                    // Detach the registry owners. Guards may still own an entire
-                    // Bank; its leases remain charged until those Arcs retire.
-                    detached = Some((
-                        std::mem::take(&mut s.banks),
-                        std::mem::take(&mut s.authoritative),
-                    ));
-                    self.registry.broken.store(false, Ordering::Release);
-                } else {
-                    done.extend(
-                        s.banks
-                            .iter()
-                            .filter(|(bank, _)| {
-                                s.watches.values().all(|w| {
-                                    w.failed
-                                        || w.plan(bank.0).is_none()
-                                        || w.completed.contains(bank)
-                                })
-                            })
-                            .map(|(_, b)| Arc::clone(b)),
-                    );
-                    detached = None;
+        {
+            let mut s = match self.registry.state.lock() {
+                Ok(s) => s,
+                Err(poison) => {
+                    self.registry.broken.store(true, Ordering::Release);
+                    poison.into_inner()
                 }
-            }
-            Err(_) => {
-                self.registry.broken.store(true, Ordering::Release);
-                return;
+            };
+            // Unregister first, without allocating, including poisoned cleanup.
+            removed = s.watches.remove(&self.id);
+            self.registry
+                .enabled
+                .store(s.watches.len(), Ordering::Release);
+            if s.watches.is_empty() {
+                detached = Some((
+                    std::mem::take(&mut s.banks),
+                    std::mem::take(&mut s.authoritative),
+                ));
+                self.registry
+                    .cleanup_pending
+                    .store(false, Ordering::Release);
+                self.registry.broken.store(false, Ordering::Release);
+            } else {
+                if let Some(watch) = &mut removed {
+                    for (bank, b) in &s.banks {
+                        if b.retired.load(Ordering::Acquire)
+                            || !s.watches.values().all(|w| {
+                                w.failed || w.plan(bank.0).is_none() || w.completed.contains(bank)
+                            })
+                        {
+                            continue;
+                        }
+                        if watch.scratch.len() < watch.scratch.capacity() {
+                            watch.scratch.push(Arc::clone(b));
+                        } else {
+                            self.registry.cleanup_pending.store(true, Ordering::Release);
+                        }
+                    }
+                }
+                detached = None;
             }
         }
-        for bank in done {
-            if self.registry.release_bank(&bank).is_err() {
-                self.registry.broken.store(true, Ordering::Release);
+        if let Some(watch) = &mut removed {
+            for bank in watch.scratch.drain(..) {
+                if self.registry.release_bank(&bank).is_err() {
+                    self.registry.cleanup_pending.store(true, Ordering::Release);
+                    self.registry.broken.store(true, Ordering::Release);
+                }
             }
         }
         drop((removed, detached));
@@ -1358,14 +1406,80 @@ mod tracked_account_history_v1 {
     }
     #[test]
     fn r3_cleanup_allocation_failure_never_leaves_orphan_watch() {
-        let (r,w,_) = setup();
-        enqueue(&r,&account(1),true);
-        r.fail_cleanup_allocation.store(true,Ordering::SeqCst);
+        let (r, w, _) = setup();
+        enqueue(&r, &account(1), true);
+        r.fail_cleanup_allocation.store(true, Ordering::SeqCst);
         drop(w);
-        assert!(r.state.lock().expect("registry after disconnect").watches.is_empty(),"handle Drop must always unregister");
-        assert!(!r.enabled());assert_eq!(live_bytes(&r),0,"all owners eventually release");
-        let (next,_) = r.register(vec![OrderKeyCoverage {pubkey:vec![1;32],active_from_slot:None,owner_exempt_active_from_slot:Some(0)}],100).expect("registration recovers after cleanup failure");
-        drop(next);assert_eq!(live_bytes(&r),0);
+        assert!(
+            r.state
+                .lock()
+                .expect("registry after disconnect")
+                .watches
+                .is_empty(),
+            "handle Drop must always unregister"
+        );
+        assert!(
+            r.fail_cleanup_allocation.load(Ordering::SeqCst),
+            "Drop never consults the deleted allocation point"
+        );
+        assert!(!r.enabled());
+        assert_eq!(live_bytes(&r), 0, "all owners eventually release");
+        let (next, _) = r
+            .register(
+                vec![OrderKeyCoverage {
+                    pubkey: vec![1; 32],
+                    active_from_slot: None,
+                    owner_exempt_active_from_slot: Some(0),
+                }],
+                100,
+            )
+            .expect("registration recovers after cleanup failure");
+        drop(next);
+        assert_eq!(live_bytes(&r), 0);
+    }
+    #[test]
+    fn r3_scratch_shortfall_retries_on_gc_and_complete_without_orphan() {
+        for use_gc in [true, false] {
+            let (r, w1, p) = setup();
+            let (w2, _) = r.register(p.keys.clone(), 99).expect("second watch");
+            let a = account(1);
+            let weak = Arc::downgrade(&a);
+            enqueue(&r, &a, true);
+            drop(a);
+            r.fence((100, 100));
+            w1.complete((100, 100)).expect("W1 complete");
+            r.state
+                .lock()
+                .expect("test scratch shortfall")
+                .watches
+                .get_mut(&w2.id)
+                .expect("W2")
+                .scratch = Vec::new();
+            drop(w2);
+            assert_eq!(
+                r.state.lock().expect("registry").watches.len(),
+                1,
+                "W2 always removed"
+            );
+            assert!(r.cleanup_pending.load(Ordering::Acquire));
+            assert!(weak.upgrade().is_some(), "payload awaits retry");
+            if use_gc {
+                r.gc(100);
+            } else {
+                drop(r.enter(101, Some(101), None, false, false, false));
+                r.fence((101, 101));
+                w1.complete((101, 101))
+                    .expect("completion retries other cleanup");
+            }
+            assert!(
+                weak.upgrade().is_none(),
+                "fallback releases unneeded raw payload"
+            );
+            assert!(!r.cleanup_pending.load(Ordering::Acquire));
+            w1.check().expect("remaining watch healthy");
+            drop((w1, p));
+            assert_eq!(live_bytes(&r), 0);
+        }
     }
     #[test]
     fn r2_guard_retains_bank_charge_across_last_watch_and_reregistration() {

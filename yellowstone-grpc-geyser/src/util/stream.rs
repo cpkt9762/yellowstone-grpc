@@ -1,9 +1,12 @@
 use {
-    futures::Stream,
+    futures::{task::AtomicWaker, Stream},
     std::{
         fmt,
         marker::PhantomData,
-        sync::Arc,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
         task::{Context, Poll},
     },
     thiserror::Error,
@@ -144,7 +147,6 @@ impl<T> Weigher for UnitWeigher<T> {
 /// State shared between every [`LoadAwareSender`] and the [`LoadAwareReceiver`].
 #[derive(Debug)]
 struct Shared {
-    prioritize_primary: std::sync::atomic::AtomicBool,
     cancelled: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     revision_credit_owners: std::sync::atomic::AtomicUsize,
@@ -175,6 +177,32 @@ impl Shared {
     }
 }
 
+// Shared by all lanes and clones of this physical queue, unlike lane credits.
+#[derive(Default)]
+struct PublicationState {
+    priority: AtomicBool,
+    publishing: AtomicUsize,
+    waker: AtomicWaker,
+}
+struct Publication<'a>(Option<&'a PublicationState>);
+impl PublicationState {
+    fn enter(&self) -> Publication<'_> {
+        if self.priority.load(Ordering::SeqCst) {
+            self.publishing.fetch_add(1, Ordering::SeqCst);
+            Publication(Some(self))
+        } else {
+            Publication(None)
+        }
+    }
+}
+impl Drop for Publication<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self.0 {
+            state.publishing.fetch_sub(1, Ordering::SeqCst);
+            state.waker.wake();
+        }
+    }
+}
 // Primary credit uses only its weight, as in the original A queue. Only an
 // independent B lane carries ownership so its pool survives sender teardown.
 struct QueueCredit {
@@ -222,6 +250,7 @@ struct PublicationPause {
     resume: std::sync::Barrier,
 }
 pub struct LoadAwareSender<T, W> {
+    publication: Arc<PublicationState>,
     shared: Arc<Shared>,
     inner: UnboundedSender<(QueueCredit, T)>,
     independent: bool,
@@ -241,6 +270,7 @@ impl<T, W> fmt::Debug for LoadAwareSender<T, W> {
 impl<T, W: Clone> Clone for LoadAwareSender<T, W> {
     fn clone(&self) -> Self {
         Self {
+            publication: Arc::clone(&self.publication),
             shared: Arc::clone(&self.shared),
             inner: self.inner.clone(),
             independent: self.independent,
@@ -255,9 +285,12 @@ impl<T, W: Clone> Clone for LoadAwareSender<T, W> {
 ///
 /// Dropping it closes the channel and wakes every sender waiting for capacity.
 pub struct LoadAwareReceiver<T> {
+    publication: Arc<PublicationState>,
     shared: Arc<Shared>,
     inner: UnboundedReceiver<(QueueCredit, T)>,
     deferred: std::collections::VecDeque<(QueueCredit, T)>,
+    #[cfg(test)]
+    pending_injection: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 // No field is structurally pinned; moving queued values is the receiver API.
@@ -307,14 +340,15 @@ where
     );
     let (inner_sender, inner_receiver) = tokio::sync::mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
-        prioritize_primary: Default::default(),
         cancelled: Default::default(),
         #[cfg(test)]
         revision_credit_owners: Default::default(),
         semaphore: Semaphore::new(weighted_capacity),
         capacity: weighted_capacity,
     });
+    let publication = Arc::new(PublicationState::default());
     let sender = LoadAwareSender {
+        publication: Arc::clone(&publication),
         shared: Arc::clone(&shared),
         inner: inner_sender,
         independent: false,
@@ -324,9 +358,12 @@ where
     };
 
     let rx = LoadAwareReceiver {
+        publication,
         shared,
         inner: inner_receiver,
         deferred: std::collections::VecDeque::new(),
+        #[cfg(test)]
+        pending_injection: None,
     };
 
     (sender, rx)
@@ -344,14 +381,15 @@ where
         }
     }
     pub fn prioritize_primary(&self) {
-        self.shared
-            .prioritize_primary
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.publication.priority.store(true, Ordering::SeqCst);
     }
     #[cfg(test)]
     fn pause_publication(&self, after_send: bool) {
         if let Some(pause) = &self.publication_pause {
-            if pause.after_send == after_send {pause.entered.wait();pause.resume.wait();}
+            if pause.after_send == after_send {
+                pause.entered.wait();
+                pause.resume.wait();
+            }
         }
     }
     pub fn reserve_independent(&self, weight: usize) -> Result<DeferredCredit, &'static str> {
@@ -388,6 +426,7 @@ where
             weight: credit.weight,
             independent: credit.owner.take(),
         };
+        let _publication = self.publication.enter();
         #[cfg(test)]
         self.pause_publication(false);
         let result = self.inner.send((queued, item)).map_err(|e| {
@@ -462,6 +501,7 @@ where
         };
         let credit = self.queue_credit(weight);
         permit.forget();
+        let _publication = self.publication.enter();
         #[cfg(test)]
         self.pause_publication(false);
         let result = self.inner.send((credit, item)).map_err(|err| {
@@ -484,8 +524,8 @@ where
             return Err("invalid queue credit capacity");
         }
         Ok(Self {
+            publication: Arc::clone(&self.publication),
             shared: Arc::new(Shared {
-                prioritize_primary: Default::default(),
                 cancelled: Default::default(),
                 #[cfg(test)]
                 revision_credit_owners: Default::default(),
@@ -513,6 +553,7 @@ where
         };
         let credit = self.queue_credit(weight);
         permit.forget();
+        let _publication = self.publication.enter();
         #[cfg(test)]
         self.pause_publication(false);
         let result = self.inner.send((credit, item)).map_err(|err| {
@@ -564,6 +605,13 @@ impl<T> LoadAwareReceiver<T> {
         poll_fn(|cx| self.poll_recv(cx)).await
     }
 
+    fn poll_unconstrained(&mut self, cx: &mut Context<'_>) -> Poll<Option<(QueueCredit, T)>> {
+        use std::future::{poll_fn, Future};
+        std::pin::pin!(tokio::task::coop::unconstrained(poll_fn(|cx| self
+            .inner
+            .poll_recv(cx))))
+        .poll(cx)
+    }
     /// Polls for the next item, releasing its weight back to the channel.
     ///
     /// # Arguments
@@ -575,43 +623,56 @@ impl<T> LoadAwareReceiver<T> {
     /// [`Poll::Ready`] with the next item, or with [`None`] once the channel is empty and every
     /// [`LoadAwareSender`] is dropped. [`Poll::Pending`] otherwise.
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if self
-            .shared
-            .prioritize_primary
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            let mut empty = false;
-            // Queued length is bounded by the lanes' existing credit capacities.
-            // One extra try observes Empty; concurrent refills instead cause a
-            // yield and another scan, never permission to send B ahead of A.
-            for _ in 0..=self.inner.len() {
-                match self.inner.try_recv() {
-                    Ok((credit, item)) if credit.independent.is_none() => {
-                        credit.release(&self.shared);
-                        return Poll::Ready(Some(item));
-                    }
-                    Ok((credit, item)) => {
-                        if credit
-                            .independent
-                            .as_ref()
-                            .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire))
-                        {
-                            credit.release(&self.shared);
-                            drop(item);
-                        } else {
-                            self.deferred.push_back((credit, item));
+        if self.publication.priority.load(Ordering::SeqCst) {
+            let mut confirmed_empty = false;
+            let mut closed = false;
+            // len may exclude a reserved unpublished tail. It is used only as
+            // a finite work bound; one unit always permits the recheck protocol.
+            let limit = self.inner.len().saturating_add(1);
+            for _ in 0..limit {
+                let item = match self.poll_unconstrained(cx) {
+                    Poll::Ready(item) => item,
+                    Poll::Pending => {
+                        #[cfg(test)]
+                        if let Some(inject) = self.pending_injection.take() {
+                            inject();
+                        }
+                        self.publication.waker.register(cx.waker());
+                        if self.publication.publishing.load(Ordering::SeqCst) != 0 {
+                            return Poll::Pending;
+                        }
+                        // A publisher may have completed between the first poll
+                        // and this zero observation. Re-poll before sending B.
+                        match self.poll_unconstrained(cx) {
+                            Poll::Ready(item) => item,
+                            Poll::Pending => {
+                                confirmed_empty = true;
+                                break;
+                            }
                         }
                     }
-                    Err(
-                        tokio::sync::mpsc::error::TryRecvError::Empty
-                        | tokio::sync::mpsc::error::TryRecvError::Disconnected,
-                    ) => {
-                        empty = true;
-                        break;
-                    }
+                };
+                let Some((credit, item)) = item else {
+                    confirmed_empty = true;
+                    closed = true;
+                    break;
+                };
+                if credit.independent.is_none() {
+                    credit.release(&self.shared);
+                    return Poll::Ready(Some(item));
+                }
+                if credit
+                    .independent
+                    .as_ref()
+                    .is_some_and(|s| s.cancelled.load(Ordering::Acquire))
+                {
+                    credit.release(&self.shared);
+                    drop(item);
+                } else {
+                    self.deferred.push_back((credit, item));
                 }
             }
-            if !empty {
+            if !confirmed_empty {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -619,23 +680,16 @@ impl<T> LoadAwareReceiver<T> {
                 let cancelled = credit
                     .independent
                     .as_ref()
-                    .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::Acquire));
+                    .is_some_and(|s| s.cancelled.load(Ordering::Acquire));
                 credit.release(&self.shared);
                 if !cancelled {
                     return Poll::Ready(Some(item));
                 }
             }
-            return match self.inner.poll_recv(cx) {
-                Poll::Ready(Some((credit, item))) if credit.independent.is_none() => {
-                    credit.release(&self.shared);
-                    Poll::Ready(Some(item))
-                }
-                Poll::Ready(Some(item)) => {
-                    self.deferred.push_back(item);
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                }
-                other => other.map(|item| item.map(|(_, item)| item)),
+            return if closed {
+                Poll::Ready(None)
+            } else {
+                Poll::Pending
             };
         }
         self.inner.poll_recv(cx).map(|maybe| {
@@ -1066,45 +1120,156 @@ mod tracked_account_history_v1 {
     use super::*;
     struct WakeProbe(std::sync::atomic::AtomicUsize);
     impl futures::task::ArcWake for WakeProbe {
-        fn wake_by_ref(this: &Arc<Self>) {this.0.fetch_add(1,std::sync::atomic::Ordering::SeqCst);}
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     async fn controlled_publication(after_send: bool, method: u8) {
         let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
         let b = a.with_budget(2).expect("B pool");
         a.prioritize_primary();
         b.try_send(0).expect("old deferred B");
-        let item = tokio::task::coop::unconstrained(rx.inner.recv()).await.expect("move B to deferred without releasing credit");
+        let item = tokio::task::coop::unconstrained(rx.inner.recv())
+            .await
+            .expect("move B to deferred without releasing credit");
         rx.deferred.push_back(item);
-        let pause = Arc::new(PublicationPause {after_send,entered:std::sync::Barrier::new(2),resume:std::sync::Barrier::new(2)});
-        let mut sender = if after_send {b.clone()} else {a.clone()};
+        let pause = Arc::new(PublicationPause {
+            after_send,
+            entered: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        });
+        let is_a = !after_send && method != 2;
+        let mut sender = if is_a { a.clone() } else { b.clone() };
         sender.publication_pause = Some(Arc::clone(&pause));
         let probe = Arc::new(WakeProbe(std::sync::atomic::AtomicUsize::new(0)));
         let waker = futures::task::waker(Arc::clone(&probe));
         let mut cx = Context::from_waker(&waker);
         let pending = std::thread::scope(|scope| {
             let writer = scope.spawn(|| {
-                if method == 0 {sender.try_send(1).expect("controlled synchronous send");}
-                else if method == 1 {tokio::runtime::Builder::new_current_thread().build().expect("sender runtime").block_on(sender.send(1)).expect("controlled async send");}
-                else {let credit=sender.reserve_independent(1).expect("prepaid B credit");sender.try_send_prepaid(1,credit).expect("controlled prepaid send");}
+                if method == 0 {
+                    sender.try_send(1).expect("controlled synchronous send");
+                } else if method == 1 {
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("sender runtime")
+                        .block_on(sender.send(1))
+                        .expect("controlled async send");
+                } else {
+                    let credit = sender.reserve_independent(1).expect("prepaid B credit");
+                    sender
+                        .try_send_prepaid(1, credit)
+                        .expect("controlled prepaid send");
+                }
             });
             pause.entered.wait();
-            let pending = matches!(rx.poll_recv(&mut cx),Poll::Pending);
-            pause.resume.wait();writer.join().expect("publisher resumed");pending
+            let pending = matches!(rx.poll_recv(&mut cx), Poll::Pending);
+            pause.resume.wait();
+            writer.join().expect("publisher resumed");
+            pending
         });
-        assert!(pending,"incomplete publication must yield, never send deferred B");
-        assert!(probe.0.load(std::sync::atomic::Ordering::SeqCst)>0,"publication exit wakes receiver");
-        if !after_send {assert_eq!(rx.recv().await,Some(1),"published A first");assert_eq!(a.current_weight(),0);}
-        assert_eq!(rx.recv().await,Some(0),"deferred B-only progress");
-        if after_send {assert_eq!(rx.recv().await,Some(1),"B publication preserves FIFO");}
-        assert_eq!(b.current_weight(),0);
-        drop((a,b,sender));assert_eq!(rx.recv().await,None,"closure after draining");
+        assert!(
+            pending,
+            "incomplete publication must yield, never send deferred B"
+        );
+        assert!(
+            probe.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "publication exit wakes receiver"
+        );
+        if is_a {
+            assert_eq!(rx.recv().await, Some(1), "published A first");
+            assert_eq!(a.current_weight(), 0);
+        }
+        assert_eq!(rx.recv().await, Some(0), "deferred B-only progress");
+        if !is_a {
+            assert_eq!(rx.recv().await, Some(1), "B publication preserves FIFO");
+        }
+        assert_eq!(b.current_weight(), 0);
+        drop((a, b, sender));
+        assert_eq!(rx.recv().await, None, "closure after draining");
     }
     #[tokio::test]
-    async fn r3_registered_unpublished_a_defers_b_and_wakes() {controlled_publication(false,0).await;}
+    async fn r3_registered_unpublished_a_defers_b_and_wakes() {
+        controlled_publication(false, 0).await;
+    }
     #[tokio::test]
-    async fn r3_published_b_tail_defers_b_and_wakes() {controlled_publication(true,1).await;}
+    async fn r3_published_b_tail_defers_b_and_wakes() {
+        controlled_publication(true, 1).await;
+    }
     #[tokio::test]
-    async fn r3_prepaid_published_tail_defers_b_and_wakes() {controlled_publication(true,2).await;}
+    async fn r3_prepaid_published_tail_defers_b_and_wakes() {
+        controlled_publication(true, 2).await;
+    }
+    #[tokio::test]
+    async fn r3_unpublished_prepaid_b_defers_b_and_wakes() {
+        controlled_publication(false, 2).await;
+    }
+    #[tokio::test]
+    async fn r3_available_a_precedes_b_during_other_lane_publication() {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
+        let b = a.with_budget(2).expect("B pool");
+        a.prioritize_primary();
+        b.try_send(0).expect("old B");
+        let item = tokio::task::coop::unconstrained(rx.inner.recv())
+            .await
+            .expect("deferred B");
+        rx.deferred.push_back(item);
+        let pause = Arc::new(PublicationPause {
+            after_send: true,
+            entered: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        });
+        let mut sender = b.clone();
+        sender.publication_pause = Some(Arc::clone(&pause));
+        let probe = Arc::new(WakeProbe(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&probe));
+        let mut cx = Context::from_waker(&waker);
+        let observed = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| sender.try_send(1).expect("publishing B"));
+            pause.entered.wait();
+            a.try_send(99).expect("A behind just-published B");
+            let first = rx.poll_recv(&mut cx);
+            let tail = rx.poll_recv(&mut cx);
+            pause.resume.wait();
+            writer.join().expect("writer");
+            (first, tail)
+        });
+        assert!(
+            matches!(observed.0, Poll::Ready(Some(99))),
+            "available A must not wait for the B publisher's tail"
+        );
+        assert!(
+            observed.1.is_pending(),
+            "deferred B waits for the publisher exit"
+        );
+        assert!(probe.0.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert_eq!(rx.recv().await, Some(0));
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!((a.current_weight(), b.current_weight()), (0, 0));
+    }
+    #[tokio::test]
+    async fn r3_zero_publishing_requires_second_poll_before_deferred_b() {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
+        let b = a.with_budget(1).expect("B pool");
+        a.prioritize_primary();
+        b.try_send(0).expect("B");
+        let item = tokio::task::coop::unconstrained(rx.inner.recv())
+            .await
+            .expect("deferred B");
+        rx.deferred.push_back(item);
+        let publisher = a.clone();
+        rx.pending_injection = Some(Box::new(move || {
+            publisher
+                .try_send(99)
+                .expect("A completes between first Pending and counter load")
+        }));
+        assert_eq!(
+            rx.recv().await,
+            Some(99),
+            "second poll must see the completed publisher"
+        );
+        assert_eq!(rx.recv().await, Some(0));
+        assert_eq!((a.current_weight(), b.current_weight()), (0, 0));
+    }
     #[tokio::test]
     async fn r2_a_priority_crosses_coop_budget_and_releases_a_credit() {
         let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
