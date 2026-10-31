@@ -1193,6 +1193,17 @@ mod tracked_account_history_v1 {
                         .count(),
                     expected_key
                 );
+                let mut key_plan = p.clone();
+                key_plan
+                    .keys
+                    .retain(|coverage| coverage.pubkey == [key; 32]);
+                let (key_versions, independent_count) = w
+                    .versions((slot, slot + 1000), &key_plan)
+                    .expect("per-key independent callback count");
+                assert_eq!(
+                    (key_versions.len(), independent_count),
+                    (expected_key, expected_key as u64)
+                );
             }
             for version in v {
                 assert!(ordinals.insert(version.ordinal), "unique callback ordinal");
@@ -1251,6 +1262,18 @@ mod tracked_account_history_v1 {
             .expect("seal after callback tails retire");
         assert_eq!((v.len(), n), (16, 16));
         w.check().expect("no false late evidence");
+        let slot_guard = r.enter(106, Some(106), None, false, false, false);
+        r.fence((106, 106));
+        assert!(!w
+            .ready((106, 106))
+            .expect("slot callback tail also defers seal"));
+        drop(slot_guard);
+        assert_eq!(
+            w.versions((106, 106), &p)
+                .expect("zero-write slot tail retired")
+                .1,
+            0
+        );
     }
     #[test]
     fn concurrent_ingress_deadline_and_gc_reject_unretired_admission() {
