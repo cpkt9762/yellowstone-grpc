@@ -1003,6 +1003,25 @@ mod order_writes_v1 {
 mod tracked_account_history_v1 {
     use super::*;
     #[tokio::test]
+    async fn r2_a_priority_crosses_coop_budget_and_releases_a_credit() {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
+        let b = a.with_budget(129).expect("bounded B backlog");
+        a.prioritize_primary();
+        for value in 0..129 { b.try_send(value).expect("B backlog"); }
+        a.try_send(999).expect("single original A permit");
+        let first = tokio::spawn(async move {
+            let first = rx.recv().await;
+            (first, rx)
+        }).await.expect("fresh Tokio coop budget");
+        let (first, mut rx) = first;
+        assert_eq!(first, Some(999), "already queued A precedes all 129 B messages");
+        assert_eq!(a.current_weight(), 0, "returning A releases its original permit");
+        a.try_send(1000).expect("same A capacity reusable");
+        assert_eq!(rx.recv().await, Some(1000));
+        for value in 0..129 { assert_eq!(rx.recv().await, Some(value), "B-only progress and FIFO"); }
+        assert_eq!(b.current_weight(), 0);
+    }
+    #[tokio::test]
     async fn a_priority_and_deferred_shared_credit_preserve_b_fifo() {
         let (a, mut rx) = load_aware_channel(2, UnitWeigher::<u32>::new());
         let b = a.with_budget(2).expect("B pool");

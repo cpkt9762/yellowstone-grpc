@@ -49,6 +49,8 @@ use {
 
 #[derive(Debug)]
 pub struct PluginInner {
+    #[cfg(test)]
+    entry_test_pause: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     runtime: Runtime,
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
@@ -259,6 +261,8 @@ impl GeyserPlugin for Plugin {
         };
 
         self.inner = Some(PluginInner {
+            #[cfg(test)]
+            entry_test_pause: None,
             runtime,
             snapshot_channel: Mutex::new(grpc_service_result.snapshot_tx),
             snapshot_channel_closed: AtomicBool::new(false),
@@ -568,6 +572,8 @@ impl GeyserPlugin for Plugin {
                 false,
                 false,
             );
+            #[cfg(test)]
+            if let Some((entered, resume)) = &inner.entry_test_pause { entered.wait(); resume.wait(); }
             let message = Message::Slot(Arc::new(MessageSlot::from_geyser(
                 slot, parent, status, None,
             )));
@@ -869,4 +875,52 @@ pub unsafe extern "C" fn _create_plugin() -> *mut dyn GeyserPlugin {
     let plugin = Plugin::default();
     let plugin: Box<dyn GeyserPlugin> = Box::new(plugin);
     Box::into_raw(plugin)
+}
+
+#[cfg(test)]
+mod tracked_account_history_v1 {
+    use super::*;
+    use std::{collections::HashMap, sync::Barrier};
+    use yellowstone_grpc_proto::prelude::*;
+    fn order_ack_observation(watermark: u64) -> (Option<u64>, Option<u64>) {
+        let key = Pubkey::new_from_array([1; 32]);
+        let mut order = SubscribeRequestOrderWrites { protocol_version:Some(1), request_version:Some(1), tracked_keys:vec![key.to_bytes().to_vec()], ..Default::default() };
+        order.request_sha256 = crate::order_protocol::request_digest(&order);
+        let request = SubscribeRequest {
+            commitment:Some(1), order_writes:Some(order),
+            accounts:HashMap::from([("a".into(),SubscribeRequestFilterAccounts {account:vec![key.to_string()],include_owner_rejected:Some(true),..Default::default()})]),
+            slots:HashMap::from([("s".into(),SubscribeRequestFilterSlots {interslot_updates:Some(true),..Default::default()})]),
+            blocks_meta:HashMap::from([("m".into(),SubscribeRequestFilterBlocksMeta {})]), ..Default::default()
+        };
+        let owner = crate::order_protocol::control(subscribe_update::UpdateOneof::OwnerRejectExemption(SubscribeUpdateOwnerRejectExemption {accounts:vec![OwnerRejectExemptAccount {pubkey:key.to_string(),active_from_slot:99}],owner_reject:vec![]}));
+        let mut updates=Vec::new();
+        crate::order_stream::OrderSession::default().request(&request,&owner,watermark,&mut |u| {updates.push(u);Ok(())}).expect("legacy order registration");
+        let Some(subscribe_update::UpdateOneof::OrderCoverageAck(ack))=updates.pop().expect("legacy ack").as_subscribe_update().update_oneof else {panic!("expected order ack")};
+        (ack.observed_callback_slot_high_watermark,ack.active_from_slot)
+    }
+    #[test]
+    fn r2_entry_legacy_ack_observation_matches_baseline_before_message_publish() {
+        let channels=SubscriberChannels::new(4,4,4); channels.observe_callback(99);
+        let (grpc_tx,mut grpc_rx)=mpsc::unbounded_channel();
+        let (contact_tx,_contact_rx)=mpsc::unbounded_channel();
+        let entered=Arc::new(Barrier::new(2)); let resume=Arc::new(Barrier::new(2));
+        let plugin=Plugin {inner:Some(PluginInner {
+            entry_test_pause:Some((Arc::clone(&entered),Arc::clone(&resume))),
+            runtime:Builder::new_current_thread().build().expect("local test runtime"),
+            snapshot_channel:Mutex::new(None), snapshot_channel_closed:AtomicBool::new(false),filter_limits:FilterLimits::default(),
+            grpc_channel:grpc_tx,deshred_channel:broadcast::channel(4).0,contact_info_channel:contact_tx,broadcast_channel:channels.clone(),blocks_meta_tx:None,
+            dynamic_pre_accounts_program_ids:Arc::new(ArcSwap::from_pointee(HashSet::new())),shm_state:Arc::new(ArcSwap::from_pointee(ShmSubscriptionState::empty())),shm_path:None,
+            owner_reject_registry:Arc::new(OwnerRejectRegistry::default()),plugin_cancellation_token:CancellationToken::new(),plugin_task_tracker:TaskTracker::new(),file_watcher:Arc::new(FileWatcher::new().expect("local watcher without file registrations")),
+        })};
+        let observed=std::thread::scope(|scope| {
+            let callback=scope.spawn(||plugin.update_slot_status(100,Some(99),&super::SlotStatus::FirstShredReceived));
+            entered.wait();
+            assert!(!channels.history.enabled());
+            let observed=order_ack_observation(channels.callback_watermark.load(Ordering::SeqCst));
+            resume.wait();callback.join().expect("entry callback").expect("slot callback success"); observed
+        });
+        assert_eq!(observed,order_ack_observation(99),"baseline only observes slot100 inside send_message");
+        assert_eq!(channels.callback_watermark.load(Ordering::SeqCst),100);
+        assert!(grpc_rx.try_recv().is_ok());
+    }
 }

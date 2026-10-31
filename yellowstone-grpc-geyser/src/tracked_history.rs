@@ -1295,6 +1295,52 @@ mod tracked_account_history_v1 {
         );
         drop(guard);
     }
+    fn live_bytes(r: &HistoryRegistry) -> usize { r.state.lock().expect("live ledger").bytes }
+    #[test]
+    fn r2_guard_retains_bank_charge_across_last_watch_and_reregistration() {
+        let (r, w, _) = setup();
+        let a = account(1); let weak = Arc::downgrade(&a);
+        enqueue(&r, &a, true); drop(a);
+        let guard = r.enter(100, Some(100), None, false, false, true);
+        drop(w);
+        assert!(weak.upgrade().is_some(), "guard still owns raw Bank versions");
+        let required = NODE_BYTES + 2 * NODE_BYTES + 2048;
+        assert!(live_bytes(&r) >= required, "live guard Bank cannot be uncharged");
+        let (next, _) = r.register(vec![OrderKeyCoverage {pubkey:vec![1;32], active_from_slot:None, owner_exempt_active_from_slot:Some(0)}], 100).expect("new generation");
+        assert!(r.reserve(RETAINED_BYTES - WATCH_BYTES - required + 1).is_err(), "old guard bytes cannot be reused");
+        drop(next); drop(guard);
+        assert!(weak.upgrade().is_none()); assert_eq!(live_bytes(&r), 0);
+    }
+    #[test]
+    fn r2_snapshot_retains_raw_charge_after_complete_and_last_watch() {
+        let (r, w, p) = setup();
+        let a = account(1); let weak = Arc::downgrade(&a);
+        enqueue(&r, &a, true); drop(a); r.fence((100,100));
+        let (snapshot, n) = w.versions((100,100), &p).expect("emit Bank snapshot"); assert_eq!(n, 1);
+        let before = live_bytes(&r);
+        w.complete((100,100)).expect("complete while snapshot lives");
+        assert!(weak.upgrade().is_some());
+        let raw_charge = 2 * NODE_BYTES + 2048;
+        assert!(live_bytes(&r) + raw_charge >= before, "complete must retain snapshot raw charge");
+        drop(w); drop(p);
+        assert!(live_bytes(&r) >= raw_charge, "last watcher cannot refund a live snapshot");
+        assert!(r.reserve(RETAINED_BYTES - raw_charge + 1).is_err());
+        drop(snapshot); assert!(weak.upgrade().is_none()); assert_eq!(live_bytes(&r), 0);
+    }
+    #[test]
+    fn r2_disconnected_watcher_retires_payload_for_remaining_completed_watch() {
+        let (r, w1, p) = setup();
+        let (w2, _) = r.register(p.keys.clone(), 99).expect("second observer");
+        let a = account(1); let weak = Arc::downgrade(&a);
+        enqueue(&r, &a, true); drop(a); r.fence((100,100));
+        w1.complete((100,100)).expect("W1 consumed");
+        assert!(weak.upgrade().is_some(), "W2 still needs payload");
+        let before = live_bytes(&r); drop(w2);
+        assert!(weak.upgrade().is_none(), "remaining W1 completed: disconnect releases raw owners");
+        assert!(live_bytes(&r) + WATCH_BYTES + 2048 <= before, "payload and disconnected watcher both refunded");
+        w1.check().expect("tombstone survives"); drop(w1); drop(p);
+        assert_eq!(live_bytes(&r), 0);
+    }
     #[test]
     fn independent_count_detects_queue_or_decoder_drop() {
         let (r, w, p) = setup();
