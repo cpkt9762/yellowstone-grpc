@@ -1282,6 +1282,20 @@ mod tracked_account_history_v1 {
         .encode_to_vec();
         transition_sender_clone(raw, false).await;
     }
+    #[tokio::test]
+    async fn r4_activation_counts_async_incoming_pong_clone() {
+        use prost::Message;
+        use yellowstone_grpc_proto::prelude::*;
+        let raw = SubscribeUpdate {
+            update_oneof: Some(subscribe_update::UpdateOneof::Pong(SubscribeUpdatePong {
+                id: 777,
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        // grpc incoming task, like the ping task, uses send().await on its clone.
+        transition_sender_clone(raw, true).await;
+    }
     #[test]
     fn r4_unpaired_publication_counts_without_accessing_waker() {
         let state = PublicationState::default();
