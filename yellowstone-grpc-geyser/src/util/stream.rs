@@ -184,22 +184,20 @@ struct PublicationState {
     publishing: AtomicUsize,
     waker: AtomicWaker,
 }
-struct Publication<'a>(Option<&'a PublicationState>);
+struct Publication<'a>(&'a PublicationState);
 impl PublicationState {
     fn enter(&self) -> Publication<'_> {
-        if self.priority.load(Ordering::SeqCst) {
-            self.publishing.fetch_add(1, Ordering::SeqCst);
-            Publication(Some(self))
-        } else {
-            Publication(None)
-        }
+        // Count even before priority is enabled: an old in-flight sender must
+        // remain visible across the receiver's false-to-true transition.
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        Publication(self)
     }
 }
 impl Drop for Publication<'_> {
     fn drop(&mut self) {
-        if let Some(state) = self.0 {
-            state.publishing.fetch_sub(1, Ordering::SeqCst);
-            state.waker.wake();
+        self.0.publishing.fetch_sub(1, Ordering::SeqCst);
+        if self.0.priority.load(Ordering::SeqCst) {
+            self.0.waker.wake();
         }
     }
 }
@@ -304,8 +302,9 @@ impl<T> Drop for LoadAwareReceiver<T> {
 /// Creates an mpsc channel whose capacity is a total weight instead of an item count.
 ///
 /// Each item is accounted for by the [`Weigher::weight`] of `weigher` from the moment a sender admits it
-/// until the receiver dequeues it. The uncontended path is a single atomic operation plus a
-/// lock-free enqueue, and a lock is only taken when a sender actually has to wait.
+/// until the receiver dequeues it. Publication tracking adds two atomic RMWs and one priority
+/// flag read to each admitted enqueue. Tracking itself does not lock or allocate; waiting for
+/// weight credit still happens before publication registration.
 ///
 /// Semantics:
 ///
@@ -1187,59 +1186,186 @@ mod tracked_account_history_v1 {
         drop((a, b, sender));
         assert_eq!(rx.recv().await, None, "closure after draining");
     }
-    async fn transition_sender_clone(payload:Vec<u8>, asynchronous:bool) {
-        let (a,mut rx)=load_aware_channel(1,UnitWeigher::<Vec<u8>>::new());
-        let b=a.with_budget(1).expect("B lane shares publication state before enable");
-        let pause=Arc::new(PublicationPause {after_send:false,entered:std::sync::Barrier::new(2),resume:std::sync::Barrier::new(2)});
-        let mut independent_task_sender=a.clone();independent_task_sender.publication_pause=Some(Arc::clone(&pause));
-        let probe=Arc::new(WakeProbe(AtomicUsize::new(0)));let waker=futures::task::waker(Arc::clone(&probe));let mut cx=Context::from_waker(&waker);
-        let pending=std::thread::scope(|scope| {
-            let writer=scope.spawn(|| {
+    async fn transition_sender_clone(payload: Vec<u8>, asynchronous: bool) {
+        let (a, mut rx) = load_aware_channel(1, UnitWeigher::<Vec<u8>>::new());
+        let b = a
+            .with_budget(1)
+            .expect("B lane shares publication state before enable");
+        let pause = Arc::new(PublicationPause {
+            after_send: false,
+            entered: std::sync::Barrier::new(2),
+            resume: std::sync::Barrier::new(2),
+        });
+        let mut independent_task_sender = a.clone();
+        independent_task_sender.publication_pause = Some(Arc::clone(&pause));
+        let probe = Arc::new(WakeProbe(AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&probe));
+        let mut cx = Context::from_waker(&waker);
+        let pending = std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
                 if asynchronous {
-                    tokio::runtime::Builder::new_current_thread().build().expect("ping task runtime").block_on(independent_task_sender.send(payload.clone())).expect("ping sender clone");
-                } else {independent_task_sender.try_send(payload.clone()).expect("incoming pong sender clone");}
+                    tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .expect("ping task runtime")
+                        .block_on(independent_task_sender.send(payload.clone()))
+                        .expect("ping sender clone");
+                } else {
+                    independent_task_sender
+                        .try_send(payload.clone())
+                        .expect("incoming pong sender clone");
+                }
             });
             pause.entered.wait();
-            let was_disabled=!a.publication.priority.load(Ordering::SeqCst);
+            let was_disabled = !a.publication.priority.load(Ordering::SeqCst);
             a.prioritize_primary();
-            b.try_send(vec![0x7f]).expect("B produced after enabling priority");
-            let queued=rx.poll_unconstrained(&mut cx);
-            let deferred=if let Poll::Ready(Some(item))=queued {rx.deferred.push_back(item);true}else{false};
-            let pending=if deferred {rx.poll_recv(&mut cx).is_pending()}else{false};
-            pause.resume.wait();writer.join().expect("old sender exits");
-            (was_disabled,deferred,pending)
+            b.try_send(vec![0x7f])
+                .expect("B produced after enabling priority");
+            let queued = rx.poll_unconstrained(&mut cx);
+            let deferred = if let Poll::Ready(Some(item)) = queued {
+                rx.deferred.push_back(item);
+                true
+            } else {
+                false
+            };
+            let pending = if deferred {
+                rx.poll_recv(&mut cx).is_pending()
+            } else {
+                false
+            };
+            pause.resume.wait();
+            writer.join().expect("old sender exits");
+            (was_disabled, deferred, pending)
         });
-        assert!(pending.0,"sender entered while priority was false");assert!(pending.1,"B already deferred");
-        assert!(pending.2,"old in-flight sender must prevent B passing the activation boundary");
-        assert!(probe.0.load(Ordering::SeqCst)>0,"old sender exit wakes priority receiver");
-        assert_eq!(rx.recv().await,Some(payload),"ping/pong bytes precede deferred B unchanged");
-        assert_eq!(a.current_weight(),0,"original A permit released");
-        assert_eq!(rx.recv().await,Some(vec![0x7f]));assert_eq!(b.current_weight(),0);
-        assert_eq!(a.publication.publishing.load(Ordering::SeqCst),0);
-        drop((a,b,independent_task_sender));assert_eq!(rx.recv().await,None);
+        assert!(pending.0, "sender entered while priority was false");
+        assert!(pending.1, "B already deferred");
+        assert!(
+            pending.2,
+            "old in-flight sender must prevent B passing the activation boundary"
+        );
+        assert!(
+            probe.0.load(Ordering::SeqCst) > 0,
+            "old sender exit wakes priority receiver"
+        );
+        assert_eq!(
+            rx.recv().await,
+            Some(payload),
+            "ping/pong bytes precede deferred B unchanged"
+        );
+        assert_eq!(a.current_weight(), 0, "original A permit released");
+        assert_eq!(rx.recv().await, Some(vec![0x7f]));
+        assert_eq!(b.current_weight(), 0);
+        assert_eq!(a.publication.publishing.load(Ordering::SeqCst), 0);
+        drop((a, b, independent_task_sender));
+        assert_eq!(rx.recv().await, None);
     }
     #[tokio::test]
     async fn r4_activation_counts_old_ping_task_sender_clone() {
         use prost::Message;
         use yellowstone_grpc_proto::prelude::*;
-        let raw=SubscribeUpdate {update_oneof:Some(subscribe_update::UpdateOneof::Ping(SubscribeUpdatePing {})),..Default::default()}.encode_to_vec();
-        transition_sender_clone(raw,true).await;
+        let raw = SubscribeUpdate {
+            update_oneof: Some(subscribe_update::UpdateOneof::Ping(SubscribeUpdatePing {})),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        transition_sender_clone(raw, true).await;
     }
     #[tokio::test]
     async fn r4_activation_counts_old_incoming_pong_sender_clone() {
         use prost::Message;
         use yellowstone_grpc_proto::prelude::*;
-        let raw=SubscribeUpdate {update_oneof:Some(subscribe_update::UpdateOneof::Pong(SubscribeUpdatePong {id:777})),..Default::default()}.encode_to_vec();
-        transition_sender_clone(raw,false).await;
+        let raw = SubscribeUpdate {
+            update_oneof: Some(subscribe_update::UpdateOneof::Pong(SubscribeUpdatePong {
+                id: 777,
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        transition_sender_clone(raw, false).await;
     }
     #[test]
     fn r4_unpaired_publication_counts_without_accessing_waker() {
-        let state=PublicationState::default();
-        let probe=Arc::new(WakeProbe(AtomicUsize::new(0)));let waker=futures::task::waker(Arc::clone(&probe));state.waker.register(&waker);
-        let guard=state.enter();assert_eq!(state.publishing.load(Ordering::SeqCst),1,"unpaired sends are counted before inner.send too");
-        drop(guard);assert_eq!(state.publishing.load(Ordering::SeqCst),0);
-        assert_eq!(probe.0.load(Ordering::SeqCst),0,"disabled exit never wakes or consumes stored waker");
-        state.waker.wake();assert_eq!(probe.0.load(Ordering::SeqCst),1,"waker remains registered after disabled exit");
+        let state = PublicationState::default();
+        let probe = Arc::new(WakeProbe(AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&probe));
+        state.waker.register(&waker);
+        let guard = state.enter();
+        assert_eq!(
+            state.publishing.load(Ordering::SeqCst),
+            1,
+            "unpaired sends are counted before inner.send too"
+        );
+        drop(guard);
+        assert_eq!(state.publishing.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            probe.0.load(Ordering::SeqCst),
+            0,
+            "disabled exit never wakes or consumes stored waker"
+        );
+        state.waker.wake();
+        assert_eq!(
+            probe.0.load(Ordering::SeqCst),
+            1,
+            "waker remains registered after disabled exit"
+        );
+    }
+    #[tokio::test]
+    async fn r4_unpaired_ping_pong_and_prepaid_keep_fifo_bytes_and_waker() {
+        use prost::Message;
+        use yellowstone_grpc_proto::prelude::*;
+        let ping = SubscribeUpdate {
+            update_oneof: Some(subscribe_update::UpdateOneof::Ping(SubscribeUpdatePing {})),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let pong = SubscribeUpdate {
+            update_oneof: Some(subscribe_update::UpdateOneof::Pong(SubscribeUpdatePong {
+                id: 777,
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let (a, mut rx) = load_aware_channel(2, UnitWeigher::<Vec<u8>>::new());
+        let b = a.with_budget(1).expect("B credit");
+        let probe = Arc::new(WakeProbe(AtomicUsize::new(0)));
+        let waker = futures::task::waker(Arc::clone(&probe));
+        a.publication.waker.register(&waker);
+        a.clone()
+            .send(ping.clone())
+            .await
+            .expect("legacy ping clone");
+        let credit = b.reserve_independent(1).expect("prepaid credit");
+        b.try_send_prepaid(vec![0x7f], credit)
+            .expect("legacy prepaid send");
+        a.clone().try_send(pong.clone()).expect("legacy pong clone");
+        let mut bytes = Vec::new();
+        for _ in 0..3 {
+            bytes.push(rx.recv().await.expect("unpaired FIFO frame"));
+        }
+        assert_eq!(
+            bytes,
+            vec![ping, vec![0x7f], pong],
+            "without priority the original A/B FIFO and complete bytes remain unchanged"
+        );
+        assert_eq!(
+            (
+                a.current_weight(),
+                b.current_weight(),
+                a.publication.publishing.load(Ordering::SeqCst)
+            ),
+            (0, 0, 0)
+        );
+        assert!(!a.publication.priority.load(Ordering::SeqCst));
+        assert_eq!(
+            probe.0.load(Ordering::SeqCst),
+            0,
+            "no publication waker access while disabled"
+        );
+        a.publication.waker.wake();
+        assert_eq!(
+            probe.0.load(Ordering::SeqCst),
+            1,
+            "test sentinel was never consumed"
+        );
     }
     #[tokio::test]
     async fn r3_registered_unpublished_a_defers_b_and_wakes() {
