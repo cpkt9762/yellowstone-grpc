@@ -31,6 +31,7 @@ pub struct Plan {
     pub generation: u64,
     pub switch: u64,
     pub keys: Vec<yellowstone_grpc_proto::prelude::OrderKeyCoverage>,
+    _lease: Arc<RetentionLease>,
 }
 #[derive(Debug)]
 struct Watch {
@@ -39,6 +40,7 @@ struct Watch {
     completed: BTreeSet<Bank>,
     failed: bool,
     sealed_through: u64,
+    lease: Arc<RetentionLease>,
 }
 impl Watch {
     fn plan(&self, slot: u64) -> Option<&Plan> {
@@ -52,29 +54,34 @@ impl Watch {
             .map(AsRef::as_ref)
     }
 }
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Version {
     pub ordinal: u64,
     pub account: Arc<MessageAccount>,
+    // Last field: release the raw owner before its charge. Registry indexes,
+    // snapshots and canonical identities all share this same Arc<Version>.
+    _lease: Arc<RetentionLease>,
 }
 // The high bit closes admission, the remaining bits count admitted callback
 // guards. One CAS linearizes admission against the fence, without lock races.
 const CLOSED: usize = 1usize << (usize::BITS - 1);
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BankIngress {
     gate: AtomicUsize,
     count: AtomicU64,
     late: AtomicBool,
     retired: AtomicBool,
     state: Mutex<BankState>,
+    _lease: Arc<RetentionLease>,
 }
 #[derive(Debug, Default)]
 struct BankState {
     count: BTreeMap<[u8; 32], AtomicU64>,
     // Small tree nodes avoid growing a large contiguous allocation under a lock.
-    versions: BTreeMap<u64, Version>,
-    identities: BTreeMap<([u8; 32], u64), Arc<MessageAccount>>,
+    versions: BTreeMap<u64, Arc<Version>>,
+    identities: BTreeMap<([u8; 32], u64), Arc<Version>>,
     awaiting: BTreeMap<usize, (u64, [u8; 32])>,
+    obligations: BTreeMap<u64, Arc<RetentionLease>>,
     fenced_at: Option<Instant>,
     bytes: usize,
 }
@@ -105,11 +112,9 @@ struct State {
     next: u64,
     generation: u64,
     high: u64,
-    bytes: usize,
-    external_bytes: usize,
     watches: BTreeMap<u64, Watch>,
     banks: BTreeMap<Bank, Arc<BankIngress>>,
-    authoritative: BTreeMap<u64, u64>,
+    authoritative: BTreeMap<u64, (u64, Arc<RetentionLease>)>,
     floor: u64,
 }
 #[derive(Debug)]
@@ -117,6 +122,8 @@ pub struct HistoryRegistry {
     enabled: AtomicUsize,
     broken: AtomicBool,
     ordinal: AtomicU64,
+    pub watermark: AtomicU64,
+    budget: Arc<LiveBudget>,
     state: Mutex<State>,
     pub limits: crate::plugin::filter::limits::FilterLimitsHistory,
     max_watchers: usize,
@@ -135,28 +142,26 @@ impl HistoryRegistry {
             enabled: AtomicUsize::new(0),
             broken: AtomicBool::new(false),
             ordinal: AtomicU64::new(0),
+            watermark: AtomicU64::new(0),
+            budget: Arc::new(LiveBudget {
+                used: AtomicUsize::new(0),
+                limit: limits.retained_bytes.min(RETAINED_BYTES),
+            }),
             state: Mutex::new(State::default()),
             limits,
             max_watchers,
         }
     }
-    pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<RetentionLease>> {
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-        ensure!(
-            s.bytes
-                .checked_add(bytes)
-                .is_some_and(|n| n <= self.limits.retained_bytes),
-            "history live allocation resource limit"
-        );
-        s.bytes += bytes;
-        s.external_bytes += bytes;
-        Ok(Arc::new(RetentionLease {
-            registry: Arc::clone(self),
-            bytes,
-        }))
+    pub fn reserve(&self, bytes: usize) -> Result<Arc<RetentionLease>> {
+        let lease = Arc::new(RetentionLease {
+            budget: Arc::clone(&self.budget),
+            bytes: AtomicUsize::new(0),
+        });
+        lease.add(bytes)?;
+        Ok(lease)
+    }
+    pub fn observe_callback(&self, slot: u64) {
+        self.watermark.fetch_max(slot, Ordering::SeqCst);
     }
     pub fn enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire) != 0
@@ -201,14 +206,21 @@ impl HistoryRegistry {
             .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
         ensure!(
             s.watches.len() < self.max_watchers
-                && s.bytes
+                && self
+                    .budget
+                    .used
+                    .load(Ordering::Acquire)
                     .checked_add(WATCH_BYTES)
                     .is_some_and(|b| b <= self.limits.retained_bytes),
             "history watcher resource limit"
         );
+        let lease = self.reserve(WATCH_BYTES)?;
         let previous_watchers = s.watches.len();
         self.enabled.store(previous_watchers + 1, Ordering::Release);
-        s.high = s.high.max(sample());
+        s.high = s
+            .high
+            .max(sample())
+            .max(self.watermark.load(Ordering::SeqCst));
         let Some(switch) = s.high.checked_add(1) else {
             self.enabled.store(previous_watchers, Ordering::Release);
             anyhow::bail!("history watermark exhausted");
@@ -242,10 +254,10 @@ impl HistoryRegistry {
             generation: s.generation,
             switch,
             keys,
+            _lease: Arc::clone(&lease),
         });
         let id = s.next;
         s.next = s.next.checked_add(1).context("history watcher exhausted")?;
-        s.bytes += WATCH_BYTES;
         s.watches.insert(
             id,
             Watch {
@@ -254,6 +266,7 @@ impl HistoryRegistry {
                 completed: BTreeSet::new(),
                 failed: false,
                 sealed_through: 0,
+                lease,
             },
         );
         self.enabled.store(s.watches.len(), Ordering::Release);
@@ -325,8 +338,18 @@ impl HistoryRegistry {
                     .any(|w| w.plan(slot).is_some() && slot < w.sealed_through);
             if !s.banks.contains_key(&bank) {
                 ensure!(s.banks.len() < 16384, "history Bank index limit");
-                self.charge(&mut s, NODE_BYTES)?;
-                s.banks.insert(bank, Arc::new(BankIngress::default()));
+                let lease = self.reserve(NODE_BYTES)?;
+                s.banks.insert(
+                    bank,
+                    Arc::new(BankIngress {
+                        gate: AtomicUsize::new(0),
+                        count: AtomicU64::new(0),
+                        late: AtomicBool::new(false),
+                        retired: AtomicBool::new(false),
+                        state: Mutex::new(BankState::default()),
+                        _lease: lease,
+                    }),
+                );
             }
             let tracked = key.filter(|k| {
                 s.watches.values().any(|w| {
@@ -339,9 +362,11 @@ impl HistoryRegistry {
                         })
                 })
             });
-            if tracked.is_some() {
-                self.charge(&mut s, 2 * NODE_BYTES)?;
-            }
+            let callback_lease = if tracked.is_some() {
+                Some(self.reserve(2 * NODE_BYTES)?)
+            } else {
+                None
+            };
             let b = Arc::clone(s.banks.get(&bank).context("history Bank missing")?);
             if after_epoch_seal {
                 b.late.store(true, Ordering::Release);
@@ -371,6 +396,7 @@ impl HistoryRegistry {
                 ordinal,
                 key: tracked,
                 attached: false,
+                lease: callback_lease,
             };
             if let Some(key) = tracked {
                 let mut payload = b
@@ -390,6 +416,11 @@ impl HistoryRegistry {
                     .or_default()
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
                     .map_err(|_| anyhow::anyhow!("history key count exhausted"))?;
+                let lease = guard
+                    .lease
+                    .as_ref()
+                    .context("history callback lease missing")?;
+                payload.obligations.insert(ordinal, Arc::clone(lease));
                 payload.bytes += 2 * NODE_BYTES;
                 ensure!(
                     b.count.load(Ordering::Acquire) <= self.limits.bank_versions as u64
@@ -408,16 +439,6 @@ impl HistoryRegistry {
             }
         }
     }
-    fn charge(&self, s: &mut State, bytes: usize) -> Result<()> {
-        ensure!(
-            s.bytes
-                .checked_add(bytes)
-                .is_some_and(|n| n <= self.limits.retained_bytes),
-            "global history retained limit"
-        );
-        s.bytes += bytes;
-        Ok(())
-    }
     fn bank(&self, bank: Bank) -> Result<Option<Arc<BankIngress>>> {
         let s = self
             .state
@@ -426,15 +447,20 @@ impl HistoryRegistry {
         Ok(s.banks.get(&bank).cloned())
     }
     fn record_authoritative(&self, s: &mut State, bank: Bank) -> Result<()> {
-        if s.authoritative.get(&bank.0).is_some_and(|id| *id != bank.1) {
+        if s.authoritative
+            .get(&bank.0)
+            .is_some_and(|(id, _)| *id != bank.1)
+        {
             for (key, b) in &s.banks {
                 if key.0 == bank.0 {
                     b.late.store(true, Ordering::Release);
                 }
             }
-        } else if !s.authoritative.contains_key(&bank.0) {
-            self.charge(s, NODE_BYTES)?;
-            s.authoritative.insert(bank.0, bank.1);
+        } else if let std::collections::btree_map::Entry::Vacant(entry) =
+            s.authoritative.entry(bank.0)
+        {
+            let lease = self.reserve(NODE_BYTES)?;
+            entry.insert((bank.1, lease));
         }
         Ok(())
     }
@@ -470,26 +496,20 @@ impl HistoryRegistry {
                 .checked_mul(2)
                 .and_then(|n| n.checked_add(2048))
                 .context("history charge overflow")?;
-            {
-                let mut s = self
-                    .state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-                self.charge(&mut s, charge)?;
-            }
             let mut b = ingress
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("history Bank mutex poisoned"))?;
             if ingress.retired.load(Ordering::Acquire) {
-                drop(b);
-                let mut s = self
-                    .state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-                s.bytes = s.bytes.saturating_sub(charge);
                 return Ok(());
             }
+            let (ordinal, _) = *b.awaiting.get(&ptr).context("history repeated retention")?;
+            let lease = Arc::clone(
+                b.obligations
+                    .get(&ordinal)
+                    .context("history callback lease missing")?,
+            );
+            lease.add(charge)?;
             ensure!(
                 b.bytes
                     .checked_add(charge)
@@ -506,7 +526,7 @@ impl HistoryRegistry {
                 account.account.write_version,
             );
             if let Some(old) = b.identities.get(&identity) {
-                let a = &old.account;
+                let a = &old.account.account;
                 let b = &account.account;
                 ensure!(
                     a.pubkey == b.pubkey
@@ -520,16 +540,15 @@ impl HistoryRegistry {
                     "history source conflict: duplicate version differs"
                 );
             }
+            let version = Arc::new(Version {
+                ordinal,
+                account: Arc::clone(account),
+                _lease: lease,
+            });
             b.identities
                 .entry(identity)
-                .or_insert_with(|| Arc::clone(account));
-            b.versions.insert(
-                ordinal,
-                Version {
-                    ordinal,
-                    account: Arc::clone(account),
-                },
-            );
+                .or_insert_with(|| Arc::clone(&version));
+            b.versions.insert(ordinal, version);
             Ok(())
         })();
         if let Err(error) = result {
@@ -622,13 +641,7 @@ impl HistoryRegistry {
             ingress.gate.fetch_or(CLOSED, Ordering::AcqRel);
             std::mem::take(&mut *b)
         };
-        let released = owners.bytes;
         drop(owners);
-        let mut s = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-        s.bytes = s.bytes.saturating_sub(released);
         Ok(())
     }
     pub fn gc(&self, floor: u64) {
@@ -672,6 +685,7 @@ pub struct Ingress {
     ordinal: u64,
     key: Option<[u8; 32]>,
     attached: bool,
+    lease: Option<Arc<RetentionLease>>,
 }
 impl Ingress {
     pub fn attach(&mut self, account: &Arc<MessageAccount>) {
@@ -771,7 +785,10 @@ impl HistoryWatch {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-        s.high = s.high.max(sample());
+        s.high = s
+            .high
+            .max(sample())
+            .max(self.registry.watermark.load(Ordering::SeqCst));
         let switch = s.high.checked_add(1).context("cutover exhausted")?;
         let old = s
             .watches
@@ -796,16 +813,14 @@ impl HistoryWatch {
             .generation
             .checked_add(1)
             .context("generation exhausted")?;
+        let lease = Arc::clone(&s.watches.get(&self.id).context("watcher missing")?.lease);
         let p = Arc::new(Plan {
             generation: s.generation,
             switch,
             keys,
+            _lease: lease,
         });
-        ensure!(
-            s.bytes + keys_charge(&p) <= self.registry.limits.retained_bytes,
-            "history plan resource limit"
-        );
-        s.bytes += keys_charge(&p);
+        p._lease.add(keys_charge(&p))?;
         s.watches
             .get_mut(&self.id)
             .context("watcher missing")?
@@ -824,7 +839,10 @@ impl HistoryWatch {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-        s.high = s.high.max(sample());
+        s.high = s
+            .high
+            .max(sample())
+            .max(self.registry.watermark.load(Ordering::SeqCst));
         let end = s.high.checked_add(1).context("close cutoff exhausted")?;
         s.watches.get_mut(&self.id).context("watcher missing")?.end = Some(end);
         Ok(end)
@@ -856,7 +874,7 @@ impl HistoryWatch {
                 .context(error.to_string())
             })
     }
-    pub fn versions(&self, bank: Bank, plan: &Plan) -> Result<(Vec<Version>, u64)> {
+    pub fn versions(&self, bank: Bank, plan: &Plan) -> Result<(Vec<Arc<Version>>, u64)> {
         self.check()?;
         let ingress = self
             .registry
@@ -951,7 +969,11 @@ impl HistoryWatch {
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("history mutex poisoned"))?;
-            self.registry.charge(&mut s, NODE_BYTES)?;
+            s.watches
+                .get(&self.id)
+                .context("watcher missing")?
+                .lease
+                .add(NODE_BYTES)?;
             s.watches
                 .get_mut(&self.id)
                 .context("watcher missing")?
@@ -978,60 +1000,88 @@ const fn keys_charge(plan: &Plan) -> usize {
 }
 impl Drop for HistoryWatch {
     fn drop(&mut self) {
+        // Workspace for a bounded index snapshot is allocated outside the lock.
+        let mut done = Vec::new();
+        if done.try_reserve_exact(16384).is_err() {
+            self.registry.broken.store(true, Ordering::Release);
+            return;
+        }
+        let removed;
+        let detached;
         match self.registry.state.lock() {
             Ok(mut s) => {
-                let removed = s.watches.remove(&self.id);
-                if let Some(w) = &removed {
-                    let charge = WATCH_BYTES
-                        + w.plans
-                            .values()
-                            .skip(1)
-                            .map(|p| keys_charge(p))
-                            .sum::<usize>()
-                        + w.completed.len() * NODE_BYTES;
-                    s.bytes = s.bytes.saturating_sub(charge);
-                }
+                removed = s.watches.remove(&self.id);
                 self.registry
                     .enabled
                     .store(s.watches.len(), Ordering::Release);
-                let retired = if s.watches.is_empty() {
-                    let external_bytes = s.external_bytes;
-                    let old = std::mem::replace(
-                        &mut *s,
-                        State {
-                            bytes: external_bytes,
-                            external_bytes,
-                            ..Default::default()
-                        },
-                    );
+                if s.watches.is_empty() {
+                    // Detach the registry owners. Guards may still own an entire
+                    // Bank; its leases remain charged until those Arcs retire.
+                    detached = Some((
+                        std::mem::take(&mut s.banks),
+                        std::mem::take(&mut s.authoritative),
+                    ));
                     self.registry.broken.store(false, Ordering::Release);
-                    Some(old)
                 } else {
-                    None
-                };
-                drop(s);
-                // Raw ownership / large scopes are destroyed outside the registry.
-                drop((removed, retired));
+                    done.extend(
+                        s.banks
+                            .iter()
+                            .filter(|(bank, _)| {
+                                s.watches.values().all(|w| {
+                                    w.failed
+                                        || w.plan(bank.0).is_none()
+                                        || w.completed.contains(bank)
+                                })
+                            })
+                            .map(|(_, b)| Arc::clone(b)),
+                    );
+                    detached = None;
+                }
             }
-            Err(_) => self.registry.broken.store(true, Ordering::Release),
+            Err(_) => {
+                self.registry.broken.store(true, Ordering::Release);
+                return;
+            }
         }
+        for bank in done {
+            if self.registry.release_bank(&bank).is_err() {
+                self.registry.broken.store(true, Ordering::Release);
+            }
+        }
+        drop((removed, detached));
     }
 }
-
+#[derive(Debug)]
+// This ledger outlives registry generations. Only actual owner lease Drop
+// decrements it; clearing metadata or completing a Bank never changes used.
+struct LiveBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
 #[derive(Debug)]
 pub struct RetentionLease {
-    registry: Arc<HistoryRegistry>,
-    bytes: usize,
+    budget: Arc<LiveBudget>,
+    bytes: AtomicUsize,
+}
+impl RetentionLease {
+    fn add(&self, bytes: usize) -> Result<()> {
+        self.budget
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.budget.limit)
+            })
+            .map_err(|_| anyhow::anyhow!("history live allocation resource limit"))?;
+        // The shared budget bound also bounds the sum stored in any one lease.
+        self.bytes.fetch_add(bytes, Ordering::AcqRel);
+        Ok(())
+    }
 }
 impl Drop for RetentionLease {
     fn drop(&mut self) {
-        match self.registry.state.lock() {
-            Ok(mut s) => {
-                s.bytes = s.bytes.saturating_sub(self.bytes);
-                s.external_bytes = s.external_bytes.saturating_sub(self.bytes);
-            }
-            Err(_) => self.registry.broken.store(true, Ordering::Release),
-        }
+        self.budget
+            .used
+            .fetch_sub(self.bytes.load(Ordering::Acquire), Ordering::AcqRel);
     }
 }
 
@@ -1295,51 +1345,149 @@ mod tracked_account_history_v1 {
         );
         drop(guard);
     }
-    fn live_bytes(r: &HistoryRegistry) -> usize { r.state.lock().expect("live ledger").bytes }
+    fn live_bytes(r: &HistoryRegistry) -> usize {
+        r.budget.used.load(Ordering::Acquire)
+    }
     #[test]
     fn r2_guard_retains_bank_charge_across_last_watch_and_reregistration() {
         let (r, w, _) = setup();
-        let a = account(1); let weak = Arc::downgrade(&a);
-        enqueue(&r, &a, true); drop(a);
+        let mut a = account(1);
+        Arc::make_mut(&mut a).account.data = bytes::Bytes::from(vec![7; 512 * 1024]);
+        let raw_charge = 2 * NODE_BYTES + 2 * a.account.data.len() + 2048;
+        let weak = Arc::downgrade(&a);
+        enqueue(&r, &a, true);
+        drop(a);
         let guard = r.enter(100, Some(100), None, false, false, true);
         drop(w);
-        assert!(weak.upgrade().is_some(), "guard still owns raw Bank versions");
-        let required = NODE_BYTES + 2 * NODE_BYTES + 2048;
-        assert!(live_bytes(&r) >= required, "live guard Bank cannot be uncharged");
-        let (next, _) = r.register(vec![OrderKeyCoverage {pubkey:vec![1;32], active_from_slot:None, owner_exempt_active_from_slot:Some(0)}], 100).expect("new generation");
-        assert!(r.reserve(RETAINED_BYTES - WATCH_BYTES - required + 1).is_err(), "old guard bytes cannot be reused");
-        drop(next); drop(guard);
-        assert!(weak.upgrade().is_none()); assert_eq!(live_bytes(&r), 0);
+        assert!(
+            weak.upgrade().is_some(),
+            "guard still owns raw Bank versions"
+        );
+        let required = NODE_BYTES + raw_charge;
+        assert!(
+            live_bytes(&r) == required,
+            "live guard Bank cannot be uncharged"
+        );
+        let (next, _) = r
+            .register(
+                vec![OrderKeyCoverage {
+                    pubkey: vec![1; 32],
+                    active_from_slot: None,
+                    owner_exempt_active_from_slot: Some(0),
+                }],
+                100,
+            )
+            .expect("new generation");
+        assert!(
+            r.reserve(RETAINED_BYTES - WATCH_BYTES - required + 1)
+                .is_err(),
+            "old guard bytes cannot be reused"
+        );
+        drop(next);
+        drop(guard);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(live_bytes(&r), 0);
     }
     #[test]
     fn r2_snapshot_retains_raw_charge_after_complete_and_last_watch() {
         let (r, w, p) = setup();
-        let a = account(1); let weak = Arc::downgrade(&a);
-        enqueue(&r, &a, true); drop(a); r.fence((100,100));
-        let (snapshot, n) = w.versions((100,100), &p).expect("emit Bank snapshot"); assert_eq!(n, 1);
+        let mut a = account(1);
+        Arc::make_mut(&mut a).account.data = bytes::Bytes::from(vec![7; 512 * 1024]);
+        let raw_charge = 2 * NODE_BYTES + 2 * a.account.data.len() + 2048;
+        let weak = Arc::downgrade(&a);
+        enqueue(&r, &a, true);
+        drop(a);
+        r.fence((100, 100));
+        let (snapshot, n) = w.versions((100, 100), &p).expect("emit Bank snapshot");
+        assert_eq!(n, 1);
         let before = live_bytes(&r);
-        w.complete((100,100)).expect("complete while snapshot lives");
+        w.complete((100, 100))
+            .expect("complete while snapshot lives");
         assert!(weak.upgrade().is_some());
-        let raw_charge = 2 * NODE_BYTES + 2048;
-        assert!(live_bytes(&r) + raw_charge >= before, "complete must retain snapshot raw charge");
-        drop(w); drop(p);
-        assert!(live_bytes(&r) >= raw_charge, "last watcher cannot refund a live snapshot");
+        assert_eq!(
+            live_bytes(&r),
+            before + NODE_BYTES,
+            "complete releases no live snapshot charge"
+        );
+        drop(w);
+        drop(p);
+        assert!(
+            live_bytes(&r) == raw_charge,
+            "last watcher cannot refund a live snapshot"
+        );
         assert!(r.reserve(RETAINED_BYTES - raw_charge + 1).is_err());
-        drop(snapshot); assert!(weak.upgrade().is_none()); assert_eq!(live_bytes(&r), 0);
+        drop(snapshot);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(live_bytes(&r), 0);
     }
     #[test]
     fn r2_disconnected_watcher_retires_payload_for_remaining_completed_watch() {
         let (r, w1, p) = setup();
         let (w2, _) = r.register(p.keys.clone(), 99).expect("second observer");
-        let a = account(1); let weak = Arc::downgrade(&a);
-        enqueue(&r, &a, true); drop(a); r.fence((100,100));
-        w1.complete((100,100)).expect("W1 consumed");
+        let mut a = account(1);
+        Arc::make_mut(&mut a).account.data = bytes::Bytes::from(vec![7; 512 * 1024]);
+        let raw_charge = 2 * NODE_BYTES + 2 * a.account.data.len() + 2048;
+        let weak = Arc::downgrade(&a);
+        enqueue(&r, &a, true);
+        drop(a);
+        r.fence((100, 100));
+        w1.complete((100, 100)).expect("W1 consumed");
         assert!(weak.upgrade().is_some(), "W2 still needs payload");
-        let before = live_bytes(&r); drop(w2);
-        assert!(weak.upgrade().is_none(), "remaining W1 completed: disconnect releases raw owners");
-        assert!(live_bytes(&r) + WATCH_BYTES + 2048 <= before, "payload and disconnected watcher both refunded");
-        w1.check().expect("tombstone survives"); drop(w1); drop(p);
+        let before = live_bytes(&r);
+        drop(w2);
+        assert!(
+            weak.upgrade().is_none(),
+            "remaining W1 completed: disconnect releases raw owners"
+        );
+        assert!(
+            live_bytes(&r) + WATCH_BYTES + raw_charge == before,
+            "payload and disconnected watcher both refunded"
+        );
+        w1.check().expect("tombstone survives");
+        drop(w1);
+        drop(p);
         assert_eq!(live_bytes(&r), 0);
+    }
+    #[test]
+    fn r2_unwind_retires_guard_and_exposes_unattached_callback() {
+        for attached in [true, false] {
+            let (r, w, p) = setup();
+            let a = account(1);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut guard = r.enter(100, Some(100), Some([1; 32]), false, false, true);
+                if attached {
+                    guard.attach(&a);
+                    r.retain(&a);
+                }
+                panic!("injected callback unwind outside ledger locks");
+            }));
+            assert!(panic.is_err(), "fault injection must unwind");
+            assert_eq!(
+                r.bank((100, 100))
+                    .expect("registry")
+                    .expect("Bank")
+                    .gate
+                    .load(Ordering::Acquire),
+                0,
+                "RAII fence retired even on unwind"
+            );
+            r.fence((100, 100));
+            if attached {
+                assert_eq!(
+                    w.versions((100, 100), &p)
+                        .expect("retained callback survived unwind")
+                        .1,
+                    1
+                );
+            } else {
+                assert!(
+                    w.check().is_err(),
+                    "unattached callback cannot certify a Bank"
+                );
+            }
+            drop((w, p));
+            assert_eq!(live_bytes(&r), 0, "all B owners released after unwind");
+        }
     }
     #[test]
     fn independent_count_detects_queue_or_decoder_drop() {
@@ -1455,14 +1603,14 @@ mod tracked_account_history_v1 {
     #[test]
     fn all_watchers_share_live_budget_and_queued_ownership_outlives_watch() {
         let (r, w, _) = setup();
-        let remaining = RETAINED_BYTES - r.state.lock().expect("ledger").bytes;
+        let remaining = RETAINED_BYTES - r.budget.used.load(Ordering::Acquire);
         let lease = r.reserve(remaining).expect("fill global limit");
         assert!(r.reserve(1).is_err());
         drop(w);
-        assert_eq!(r.state.lock().expect("ledger").external_bytes, remaining);
+        assert_eq!(r.budget.used.load(Ordering::Acquire), remaining);
         assert!(r.reserve(RETAINED_BYTES - remaining + 1).is_err());
         drop(lease);
-        assert_eq!(r.state.lock().expect("ledger").bytes, 0);
+        assert_eq!(r.budget.used.load(Ordering::Acquire), 0);
     }
     #[test]
     fn fresh_watermark_is_sampled_after_ingress_gate_and_sealed_range_rejects_unseen_bank() {
@@ -1500,9 +1648,9 @@ mod tracked_account_history_v1 {
         let (r, w, _) = setup();
         enqueue(&r, &account(1), true);
         r.fence((100, 100));
-        let before = r.state.lock().expect("ledger").bytes;
+        let before = r.budget.used.load(Ordering::Acquire);
         w.stop().expect("stop B");
-        assert!(r.state.lock().expect("ledger").bytes < before);
+        assert!(r.budget.used.load(Ordering::Acquire) < before);
         drop(r.enter(101, Some(101), None, false, false, false));
         assert!(!r
             .state

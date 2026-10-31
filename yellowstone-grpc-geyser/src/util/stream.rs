@@ -544,13 +544,17 @@ impl<T> LoadAwareReceiver<T> {
             .prioritize_primary
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            loop {
-                match self.inner.poll_recv(cx) {
-                    Poll::Ready(Some((credit, item))) if credit.independent.is_none() => {
+            let mut empty = false;
+            // Queued length is bounded by the lanes' existing credit capacities.
+            // One extra try observes Empty; concurrent refills instead cause a
+            // yield and another scan, never permission to send B ahead of A.
+            for _ in 0..=self.inner.len() {
+                match self.inner.try_recv() {
+                    Ok((credit, item)) if credit.independent.is_none() => {
                         credit.release(&self.shared);
                         return Poll::Ready(Some(item));
                     }
-                    Poll::Ready(Some((credit, item))) => {
+                    Ok((credit, item)) => {
                         if credit
                             .independent
                             .as_ref()
@@ -562,8 +566,18 @@ impl<T> LoadAwareReceiver<T> {
                             self.deferred.push_back((credit, item));
                         }
                     }
-                    Poll::Ready(None) | Poll::Pending => break,
+                    Err(
+                        tokio::sync::mpsc::error::TryRecvError::Empty
+                        | tokio::sync::mpsc::error::TryRecvError::Disconnected,
+                    ) => {
+                        empty = true;
+                        break;
+                    }
                 }
+            }
+            if !empty {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
             while let Some((credit, item)) = self.deferred.pop_front() {
                 let cancelled = credit
@@ -575,6 +589,18 @@ impl<T> LoadAwareReceiver<T> {
                     return Poll::Ready(Some(item));
                 }
             }
+            return match self.inner.poll_recv(cx) {
+                Poll::Ready(Some((credit, item))) if credit.independent.is_none() => {
+                    credit.release(&self.shared);
+                    Poll::Ready(Some(item))
+                }
+                Poll::Ready(Some(item)) => {
+                    self.deferred.push_back(item);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                other => other.map(|item| item.map(|(_, item)| item)),
+            };
         }
         self.inner.poll_recv(cx).map(|maybe| {
             maybe.map(|(credit, item)| {
@@ -1007,18 +1033,32 @@ mod tracked_account_history_v1 {
         let (a, mut rx) = load_aware_channel(1, UnitWeigher::<u32>::new());
         let b = a.with_budget(129).expect("bounded B backlog");
         a.prioritize_primary();
-        for value in 0..129 { b.try_send(value).expect("B backlog"); }
+        for value in 0..129 {
+            b.try_send(value).expect("B backlog");
+        }
         a.try_send(999).expect("single original A permit");
         let first = tokio::spawn(async move {
             let first = rx.recv().await;
             (first, rx)
-        }).await.expect("fresh Tokio coop budget");
+        })
+        .await
+        .expect("fresh Tokio coop budget");
         let (first, mut rx) = first;
-        assert_eq!(first, Some(999), "already queued A precedes all 129 B messages");
-        assert_eq!(a.current_weight(), 0, "returning A releases its original permit");
+        assert_eq!(
+            first,
+            Some(999),
+            "already queued A precedes all 129 B messages"
+        );
+        assert_eq!(
+            a.current_weight(),
+            0,
+            "returning A releases its original permit"
+        );
         a.try_send(1000).expect("same A capacity reusable");
         assert_eq!(rx.recv().await, Some(1000));
-        for value in 0..129 { assert_eq!(rx.recv().await, Some(value), "B-only progress and FIFO"); }
+        for value in 0..129 {
+            assert_eq!(rx.recv().await, Some(value), "B-only progress and FIFO");
+        }
         assert_eq!(b.current_weight(), 0);
     }
     #[tokio::test]

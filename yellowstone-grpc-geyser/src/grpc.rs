@@ -576,6 +576,7 @@ impl SubscriberChannels {
 
     pub fn observe_callback(&self, slot: u64) {
         self.callback_watermark.fetch_max(slot, Ordering::SeqCst);
+        self.history.observe_callback(slot);
     }
     pub(crate) fn send_group(
         &self,
@@ -2121,7 +2122,7 @@ impl GrpcService {
                                 if raw.order_writes.is_some() && raw.tracked_account_history.is_none() { session.order_only_seen=true; }
                                 if (raw.order_close.is_some() || raw.tracked_history_close.is_some()) && (session.history.ever || crate::history_protocol::has_control(raw)) {
                                         if let Some(error)=wire_error.as_ref() { h_step!(session.history.reject(raw,error,&mut b_send)); }
-                                        else { h_step!(session.history.close(raw,&broadcast.callback_watermark,&mut b_send)); }
+                                        else { h_step!(session.history.close(raw,&broadcast.history.watermark,&mut b_send)); }
                                         continue;
                                 }
                                 if raw.order_writes.is_some() && raw.ping.is_some() {
@@ -2178,7 +2179,7 @@ impl GrpcService {
                                     b_queue.enable_history(&broadcast.history);
                                     if session.order_only_seen { h_step!(session.history.reject(raw,"cannot add history to an order-only coverage chain",&mut b_send)); }
                                     else if let Some(error)=wire_error.as_ref() { h_step!(session.history.reject(raw,error,&mut b_send)); }
-                                    else if let Some(owner)=owner_ack.as_ref() { h_step!(session.history.request(raw,owner,&broadcast.history,&broadcast.callback_watermark,&broadcast.order_integrity.limits,&mut b_send)); }
+                                    else if let Some(owner)=owner_ack.as_ref() { h_step!(session.history.request(raw,owner,&broadcast.history,&broadcast.history.watermark,&broadcast.order_integrity.limits,&mut b_send)); }
                                     else { h_step!(session.history.reject(raw,"actual owner ack missing",&mut b_send)); }
                                 } else if pending_conflict {
                                     let _=b_send(session.order.reject(raw.order_writes.as_ref(),yellowstone_grpc_proto::prelude::OrderRejectReason::PendingExists,"another B scope was pending when this request arrived"));

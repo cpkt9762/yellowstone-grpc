@@ -435,7 +435,7 @@ impl GeyserPlugin for Plugin {
         bank_id: BankId,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
-            inner.broadcast_channel.observe_callback(slot);
+            inner.broadcast_channel.history.observe_callback(slot);
             let _history_ingress = inner.broadcast_channel.history.enter(
                 slot,
                 Some(bank_id),
@@ -563,7 +563,7 @@ impl GeyserPlugin for Plugin {
         status: &SlotStatus,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
-            inner.broadcast_channel.observe_callback(slot);
+            inner.broadcast_channel.history.observe_callback(slot);
             let _history_ingress = inner.broadcast_channel.history.enter(
                 slot,
                 None,
@@ -573,7 +573,10 @@ impl GeyserPlugin for Plugin {
                 false,
             );
             #[cfg(test)]
-            if let Some((entered, resume)) = &inner.entry_test_pause { entered.wait(); resume.wait(); }
+            if let Some((entered, resume)) = &inner.entry_test_pause {
+                entered.wait();
+                resume.wait();
+            }
             let message = Message::Slot(Arc::new(MessageSlot::from_geyser(
                 slot, parent, status, None,
             )));
@@ -616,7 +619,7 @@ impl GeyserPlugin for Plugin {
         bank_id: BankId,
     ) -> PluginResult<()> {
         self.with_inner(|inner| {
-            inner.broadcast_channel.observe_callback(slot);
+            inner.broadcast_channel.history.observe_callback(slot);
             let _history_ingress = inner.broadcast_channel.history.enter(
                 slot,
                 Some(bank_id),
@@ -709,7 +712,7 @@ impl GeyserPlugin for Plugin {
                 ReplicaEntryInfoVersions::V0_0_2(entry) => entry,
             };
 
-            inner.broadcast_channel.observe_callback(entry.slot);
+            inner.broadcast_channel.history.observe_callback(entry.slot);
             let _history_ingress = inner.broadcast_channel.history.enter(
                 entry.slot,
                 Some(bank_id),
@@ -737,7 +740,10 @@ impl GeyserPlugin for Plugin {
                 ReplicaBlockInfoVersions::V0_0_5(info) => info,
             };
 
-            inner.broadcast_channel.observe_callback(blockinfo.slot);
+            inner
+                .broadcast_channel
+                .history
+                .observe_callback(blockinfo.slot);
             let _history_ingress = inner.broadcast_channel.history.enter(
                 blockinfo.slot,
                 Some(bank_id),
@@ -788,7 +794,7 @@ impl GeyserPlugin for Plugin {
                 ReplicaBlockFooterInfoVersions::V0_0_2(info) => info,
             };
 
-            inner.broadcast_channel.observe_callback(info.slot);
+            inner.broadcast_channel.history.observe_callback(info.slot);
             let _history_ingress = inner.broadcast_channel.history.enter(
                 info.slot,
                 Some(bank_id),
@@ -884,43 +890,135 @@ mod tracked_account_history_v1 {
     use yellowstone_grpc_proto::prelude::*;
     fn order_ack_observation(watermark: u64) -> (Option<u64>, Option<u64>) {
         let key = Pubkey::new_from_array([1; 32]);
-        let mut order = SubscribeRequestOrderWrites { protocol_version:Some(1), request_version:Some(1), tracked_keys:vec![key.to_bytes().to_vec()], ..Default::default() };
+        let mut order = SubscribeRequestOrderWrites {
+            protocol_version: Some(1),
+            request_version: Some(1),
+            tracked_keys: vec![key.to_bytes().to_vec()],
+            ..Default::default()
+        };
         order.request_sha256 = crate::order_protocol::request_digest(&order);
         let request = SubscribeRequest {
-            commitment:Some(1), order_writes:Some(order),
-            accounts:HashMap::from([("a".into(),SubscribeRequestFilterAccounts {account:vec![key.to_string()],include_owner_rejected:Some(true),..Default::default()})]),
-            slots:HashMap::from([("s".into(),SubscribeRequestFilterSlots {interslot_updates:Some(true),..Default::default()})]),
-            blocks_meta:HashMap::from([("m".into(),SubscribeRequestFilterBlocksMeta {})]), ..Default::default()
+            commitment: Some(1),
+            order_writes: Some(order),
+            accounts: HashMap::from([(
+                "a".into(),
+                SubscribeRequestFilterAccounts {
+                    account: vec![key.to_string()],
+                    include_owner_rejected: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            slots: HashMap::from([(
+                "s".into(),
+                SubscribeRequestFilterSlots {
+                    interslot_updates: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            blocks_meta: HashMap::from([("m".into(), SubscribeRequestFilterBlocksMeta {})]),
+            ..Default::default()
         };
-        let owner = crate::order_protocol::control(subscribe_update::UpdateOneof::OwnerRejectExemption(SubscribeUpdateOwnerRejectExemption {accounts:vec![OwnerRejectExemptAccount {pubkey:key.to_string(),active_from_slot:99}],owner_reject:vec![]}));
-        let mut updates=Vec::new();
-        crate::order_stream::OrderSession::default().request(&request,&owner,watermark,&mut |u| {updates.push(u);Ok(())}).expect("legacy order registration");
-        let Some(subscribe_update::UpdateOneof::OrderCoverageAck(ack))=updates.pop().expect("legacy ack").as_subscribe_update().update_oneof else {panic!("expected order ack")};
-        (ack.observed_callback_slot_high_watermark,ack.active_from_slot)
+        let owner =
+            crate::order_protocol::control(subscribe_update::UpdateOneof::OwnerRejectExemption(
+                SubscribeUpdateOwnerRejectExemption {
+                    accounts: vec![OwnerRejectExemptAccount {
+                        pubkey: key.to_string(),
+                        active_from_slot: 99,
+                    }],
+                    owner_reject: vec![],
+                },
+            ));
+        let mut updates = Vec::new();
+        crate::order_stream::OrderSession::default()
+            .request(&request, &owner, watermark, &mut |u| {
+                updates.push(u);
+                Ok(())
+            })
+            .expect("legacy order registration");
+        let Some(subscribe_update::UpdateOneof::OrderCoverageAck(ack)) = updates
+            .pop()
+            .expect("legacy ack")
+            .as_subscribe_update()
+            .update_oneof
+        else {
+            panic!("expected order ack")
+        };
+        (
+            ack.observed_callback_slot_high_watermark,
+            ack.active_from_slot,
+        )
     }
     #[test]
     fn r2_entry_legacy_ack_observation_matches_baseline_before_message_publish() {
-        let channels=SubscriberChannels::new(4,4,4); channels.observe_callback(99);
-        let (grpc_tx,mut grpc_rx)=mpsc::unbounded_channel();
-        let (contact_tx,_contact_rx)=mpsc::unbounded_channel();
-        let entered=Arc::new(Barrier::new(2)); let resume=Arc::new(Barrier::new(2));
-        let plugin=Plugin {inner:Some(PluginInner {
-            entry_test_pause:Some((Arc::clone(&entered),Arc::clone(&resume))),
-            runtime:Builder::new_current_thread().build().expect("local test runtime"),
-            snapshot_channel:Mutex::new(None), snapshot_channel_closed:AtomicBool::new(false),filter_limits:FilterLimits::default(),
-            grpc_channel:grpc_tx,deshred_channel:broadcast::channel(4).0,contact_info_channel:contact_tx,broadcast_channel:channels.clone(),blocks_meta_tx:None,
-            dynamic_pre_accounts_program_ids:Arc::new(ArcSwap::from_pointee(HashSet::new())),shm_state:Arc::new(ArcSwap::from_pointee(ShmSubscriptionState::empty())),shm_path:None,
-            owner_reject_registry:Arc::new(OwnerRejectRegistry::default()),plugin_cancellation_token:CancellationToken::new(),plugin_task_tracker:TaskTracker::new(),file_watcher:Arc::new(FileWatcher::new().expect("local watcher without file registrations")),
-        })};
-        let observed=std::thread::scope(|scope| {
-            let callback=scope.spawn(||plugin.update_slot_status(100,Some(99),&super::SlotStatus::FirstShredReceived));
+        let channels = SubscriberChannels::new(4, 4, 4);
+        channels.observe_callback(99);
+        let (grpc_tx, mut grpc_rx) = mpsc::unbounded_channel();
+        let (contact_tx, _contact_rx) = mpsc::unbounded_channel();
+        let entered = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let plugin = Plugin {
+            inner: Some(PluginInner {
+                entry_test_pause: Some((Arc::clone(&entered), Arc::clone(&resume))),
+                runtime: Builder::new_current_thread()
+                    .build()
+                    .expect("local test runtime"),
+                snapshot_channel: Mutex::new(None),
+                snapshot_channel_closed: AtomicBool::new(false),
+                filter_limits: FilterLimits::default(),
+                grpc_channel: grpc_tx,
+                deshred_channel: broadcast::channel(4).0,
+                contact_info_channel: contact_tx,
+                broadcast_channel: channels.clone(),
+                blocks_meta_tx: None,
+                dynamic_pre_accounts_program_ids: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+                shm_state: Arc::new(ArcSwap::from_pointee(ShmSubscriptionState::empty())),
+                shm_path: None,
+                owner_reject_registry: Arc::new(OwnerRejectRegistry::default()),
+                plugin_cancellation_token: CancellationToken::new(),
+                plugin_task_tracker: TaskTracker::new(),
+                file_watcher: Arc::new(
+                    FileWatcher::new().expect("local watcher without file registrations"),
+                ),
+            }),
+        };
+        let observed = std::thread::scope(|scope| {
+            let callback = scope.spawn(|| {
+                plugin.update_slot_status(100, Some(99), &super::SlotStatus::FirstShredReceived)
+            });
             entered.wait();
             assert!(!channels.history.enabled());
-            let observed=order_ack_observation(channels.callback_watermark.load(Ordering::SeqCst));
-            resume.wait();callback.join().expect("entry callback").expect("slot callback success"); observed
+            let observed =
+                order_ack_observation(channels.callback_watermark.load(Ordering::SeqCst));
+            let (watch, plan) = channels
+                .history
+                .register(
+                    vec![OrderKeyCoverage {
+                        pubkey: vec![1; 32],
+                        active_from_slot: None,
+                        owner_exempt_active_from_slot: Some(0),
+                    }],
+                    0,
+                )
+                .expect("history barrier uses independent entry watermark");
+            let switch = plan.switch;
+            drop((watch, plan));
+            resume.wait();
+            assert_eq!(
+                switch, 101,
+                "already entered slot100 cannot become a promised half Bank"
+            );
+            callback
+                .join()
+                .expect("entry callback")
+                .expect("slot callback success");
+            observed
         });
-        assert_eq!(observed,order_ack_observation(99),"baseline only observes slot100 inside send_message");
-        assert_eq!(channels.callback_watermark.load(Ordering::SeqCst),100);
+        assert_eq!(
+            observed,
+            order_ack_observation(99),
+            "baseline only observes slot100 inside send_message"
+        );
+        assert_eq!(channels.callback_watermark.load(Ordering::SeqCst), 100);
         assert!(grpc_rx.try_recv().is_ok());
     }
 }
