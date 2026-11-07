@@ -737,7 +737,16 @@ pub(crate) fn extract_slot(msg: &SubscribeUpdate) -> Option<u64> {
             | UpdateOneof::OrderSlotSeal(_)
             | UpdateOneof::OrderEpochSeal(_)
             | UpdateOneof::OrderGap(_)
-            | UpdateOneof::OrderRejected(_) => None,
+            | UpdateOneof::OrderRejected(_)
+            // Tracked account history is a separate paired stream with its own watermarks.
+            // It must not enter legacy dedup, replay cursors or reconstructed bank data.
+            | UpdateOneof::TrackedHistoryAck(_)
+            | UpdateOneof::TrackedAccountVersion(_)
+            | UpdateOneof::TrackedAccountBankSeal(_)
+            | UpdateOneof::TrackedHistoryEpochSeal(_)
+            | UpdateOneof::TrackedHistoryGap(_)
+            | UpdateOneof::TrackedHistoryRejected(_)
+            => None,
     }
 }
 

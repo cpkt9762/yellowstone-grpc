@@ -126,8 +126,8 @@ vergen = { workspace = true, features = ["build", "rustc"] }
 
 [dev-dependencies]
 agave-votor-messages = { workspace = true, features = ["agave-unstable-api"] }
-agave-transaction-view = "=6.1.0"
-solana-svm-transaction = "=5.0.0"
+agave-transaction-view = "=7.0.0"
+solana-svm-transaction = "=6.0.0"
 bytes = { workspace = true }
 criterion = { workspace = true }
 fastrand = { workspace = true }

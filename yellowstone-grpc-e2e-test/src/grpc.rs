@@ -279,7 +279,14 @@ impl GeyserEventAdapter for E2EGeyserEventAdapter {
             | UpdateOneof::OrderSlotSeal(_)
             | UpdateOneof::OrderEpochSeal(_)
             | UpdateOneof::OrderGap(_)
-            | UpdateOneof::OrderRejected(_) => None,
+            | UpdateOneof::OrderRejected(_)
+            // Tracked account history is a separate paired stream, not bank data.
+            | UpdateOneof::TrackedHistoryAck(_)
+            | UpdateOneof::TrackedAccountVersion(_)
+            | UpdateOneof::TrackedAccountBankSeal(_)
+            | UpdateOneof::TrackedHistoryEpochSeal(_)
+            | UpdateOneof::TrackedHistoryGap(_)
+            | UpdateOneof::TrackedHistoryRejected(_) => None,
         }
     }
 }
