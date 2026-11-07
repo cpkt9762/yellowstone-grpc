@@ -157,14 +157,10 @@ trivially_copy_pass_by_ref = "deny"
 collapsible_match = "allow"
 
 [patch.crates-io]
-agave-feature-set = { path = "../../feature-set" }
+# v17 consumes agave only through agave-geyser-plugin-interface (mirror types, no solana-entry /
+# solana-transaction-status in the ABI). The fork interface adds the pre-accounts variant and depends on
+# solana-svm, so it is taken from the sibling agave 4.4.1 tree (geyser-plugin/<this dir>/../../).
 agave-geyser-plugin-interface = { path = "../../geyser-plugin-interface" }
-agave-votor-messages = { path = "../../votor-messages" }
-solana-account-decoder = { path = "../../account-decoder" }
-solana-entry = { path = "../../entry" }
-solana-storage-proto = { path = "../../storage-proto" }
-solana-transaction-context = { path = "../../transaction-context" }
-solana-transaction-status = { path = "../../transaction-status" }
 
 [profile.release]
 lto = true
